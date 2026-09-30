@@ -1,431 +1,163 @@
-# 🛡️ DoH Cloudflare Worker
+# 🛡️ DoH — Cloudflare Worker
 
-A lightweight Cloudflare Worker that exposes a standards-compatible **DNS-over-HTTPS (DoH)** endpoint at `/dns-query`.
+A lightweight Cloudflare Worker that exposes a standard **DNS-over-HTTPS** endpoint, races three configured DoH upstreams in parallel, and keeps a two-level DNS cache:
 
-The current Worker is **v0.3.0** and provides:
-
-- DoH **GET** (`?dns=...`) and **POST** (`application/dns-message`)
-- Three configured DoH upstream resolvers raced in parallel
-- Validation of upstream DNS IDs, flags, questions, resource records, and trailing bytes
-- NXDOMAIN grace handling to reduce false-negative caching
-- Deterministic degraded-response fallback (`SERVFAIL` preferred)
-- Two-level DNS caching:
-  - **L1:** per-isolate in-memory LRU
-  - **L2:** Cloudflare Cache API, data-center-local
-- Request coalescing for identical concurrent cache misses
-- Native Cloudflare Rate Limiting binding with a per-isolate fallback
-- 4 KiB client DNS-message limit
-- 65,535-byte upstream DNS-response limit
-- DNS TTL-aware cache expiry and response TTL aging
-- Per-client transaction-ID restoration and QNAME case restoration
-- Public `/health` endpoint
-- Small configuration dashboard at `/`
-
-> **Current source of truth:** `Worker.js`, `wrangler.toml`, and `test.mjs`. This README describes the implementation in this ZIP.
-
----
-
-## Endpoints
-
-After deployment, the Worker exposes:
-
-```text
-https://YOUR-DOMAIN.example/
-https://YOUR-DOMAIN.example/dns-query
-https://YOUR-DOMAIN.example/health
+```txt
+L1: per-isolate memory cache
+L2: Cloudflare Cache API (data-center-local)
 ```
 
-### `/dns-query`
-
-The DoH resolver endpoint.
-
-### `/`
-
-A small setup dashboard showing the current `/dns-query` URL and browser/mobile configuration guidance.
-
-### `/health`
-
-Returns resolver scores/counters and bounded runtime state such as cache, in-flight, and rate-limit entry counts. It does not expose client IPs or DNS query contents.
-
----
-
-## Configured upstreams
-
-Every cold DNS lookup starts all three configured upstreams in parallel:
-
-| # | DoH upstream |
-|---:|---|
-| 1 | `https://freedns.koyeb.app/dns-query` |
-| 2 | `https://dns-pi.vercel.app/api/doh/dns-query` |
-| 3 | `https://dns.mydoh.workers.dev/dns-query` |
-
-The first valid `NOERROR` response wins. Losing requests are aborted when the runtime supports the abort signal correctly.
-
-If an upstream returns `NXDOMAIN`, the Worker holds that candidate for `NXDOMAIN_GRACE_MS` (currently **200 ms**) while waiting for a possible valid `NOERROR` from another upstream.
-
-If no `NOERROR` is available but a syntactically valid degraded response is available, the Worker returns the degraded response deterministically. `SERVFAIL` is preferred; otherwise resolver score and then latency are used.
-
-If every upstream fails or returns invalid DNS data, the Worker returns **HTTP 502**.
-
----
-
-## DNS validation and safety limits
-
-### Client requests
-
-- Only `GET` and `POST` are accepted.
-- GET requires the `dns` base64url query parameter.
-- POST requires `Content-Type: application/dns-message`.
-- Client DNS messages are limited to **4,096 bytes**.
-- GET DNS payloads are limited to **5,462 base64url characters**.
-- Chunked/unknown-length POST bodies are stream-limited instead of being buffered without a cap.
-- DNS queries must contain exactly one question and no answer/authority records.
-- Additional records are structurally parsed and arbitrary trailing bytes are rejected.
-
-### Upstream responses
-
-Each upstream response is checked for:
-
-- Minimum DNS message size
-- Matching transaction ID
-- DNS response bit
-- Opcode 0
-- Exactly one question
-- Matching QNAME, QTYPE, and QCLASS
-- Structurally valid resource records in answer/authority/additional sections
-- No trailing bytes
-- Compatible `Content-Type`, when supplied
-- Maximum buffered response size of **65,535 bytes**
-
-These checks prevent malformed or unrelated HTTP/DNS data from being accepted as resolver answers.
-
----
-
-## Cache architecture
-
-```text
-                 ┌─────────────────────┐
-DoH request ───► │ Rate limiter        │
-                 └─────────┬───────────┘
-                           │
-                           ▼
-                 ┌─────────────────────┐
-                 │ Parse + validate    │
-                 └─────────┬───────────┘
-                           │
-                           ▼
-                 ┌─────────────────────┐
-                 │ L1 isolate LRU      │
-                 │ max 512 entries     │
-                 └─────────┬───────────┘
-                           │ miss
-                           ▼
-                 ┌─────────────────────┐
-                 │ L2 Cache API        │
-                 │ data-center-local   │
-                 └─────────┬───────────┘
-                           │ miss
-                           ▼
-                 ┌─────────────────────┐
-                 │ 3-way DoH race      │
-                 └─────────────────────┘
+```txt
+https://freedns.koyeb.app/dns-query
+https://dns-pi.vercel.app/api/doh/dns-query
+https://dns.mydoh.workers.dev/dns-query
 ```
 
-### L1
+These are the three DNS-over-HTTPS upstreams configured by this project.
 
-The isolate-local cache contains up to **512 entries**. Local cache TTL is capped at **300 seconds**.
 
-### L2
+### Cloudflare limits and how this build uses them
 
-The Cloudflare Cache API can retain cacheable DNS responses for up to **86,400 seconds (24 hours)**, subject to the authoritative DNS TTL and Cloudflare cache behavior.
+Cloudflare's current Workers Free limits are 100,000 requests/day, 10 ms CPU time/invocation, 128 MB memory, 50 subrequests/invocation, and 6 simultaneous outgoing connections per invocation. Free requests reset at midnight UTC. Cache API calls are also counted against the subrequest quota, with 50 Cache API calls/request on Free. See the Cloudflare Workers Limits documentation.
 
-Cache API contents are **data-center-local**; they are not automatically replicated globally. Cloudflare currently documents Cache API operations as functional for Workers attached to custom domains/routes, while `workers.dev` deployments do not provide functional Cache API operations. Deploy on a custom domain or route if L2 caching is required. https://developers.cloudflare.com/workers/runtime-apis/cache/
+This Worker deliberately stays far below those ceilings on ordinary DNS traffic:
 
-The Worker intentionally performs the `/dns-query` rate-limit check **before** its Cache API lookup, so the L2 cache cannot bypass that application-level limiter.
+| Path | Cache API | configured DoH upstreams |
+|---|---:|---:|
+| L1 cache hit | 0 | 0 |
+| L2 cache hit | 1 | 0 |
+| Cold cache miss | 1 match + 1 async put | 3 in parallel |
+| Degraded upstream fallback | 1 match | 3 in parallel |
+| Total upstream failure | 1 match | 3 in parallel; returns 502 |
 
-### Cache key
+The resolver logic launches all three configured upstreams immediately on every cold-cache lookup. The first valid `NOERROR` response wins, and the other in-flight upstream requests are aborted. If the first usable answer is `NXDOMAIN`, the Worker keeps racing for a short grace period (`NXDOMAIN_GRACE_MS`, 200 ms) so a single stale or filtered upstream cannot cause false negatives. If every upstream returns a syntactically valid degraded response such as `SERVFAIL` or `REFUSED`, the best degraded response is returned deterministically (SERVFAIL preferred, then the highest-scored upstream, then the fastest); if all three requests fail or return invalid DNS data, the Worker returns `502`. In-flight duplicate work is bounded at 128 entries (new cold resolutions are rejected with 503 when the map is full; live jobs are never evicted, so request coalescing is never broken mid-flight), and upstream response buffering is capped at 65,535 bytes. Maximum concurrent upstream connections from this Worker are 3, below Cloudflare's documented limit of 6.
 
-The cache key is SHA-256-derived from the complete DNS wire query with:
+### Two-level DNS cache
 
-- Transaction ID normalized to zero
-- Uncompressed ASCII QNAME case normalized to lowercase
+The Worker intentionally does **not** enable the global Workers Cache feature in `wrangler.toml`. That feature can return a cached response without executing the Worker, which would put the cache in front of the `/dns-query` rate limiter. Instead, the Worker uses the Cache API after rate limiting, so every `/dns-query` request still reaches the rate-limit check.
 
-Therefore equivalent GET and POST DNS questions can share a cache entry.
+The Cache API is data-center-local and does not replicate entries automatically between data centers. It is also generally not effective on `*.workers.dev` hostnames, so deploy on a custom domain/route to get L2 hits; on `workers.dev` the Worker still works and simply relies on L1 plus upstream resolution. That is still useful for hot DNS traffic because repeated queries at the same edge location can avoid an upstream lookup entirely.
 
-When a cached response is returned, the Worker:
+Both DoH GET and POST requests use the SHA-256-derived DNS wire-query key, with only the transaction ID normalized. ASCII QNAME case is also normalized when the question name is uncompressed, so `example.com`, `EXAMPLE.com`, and mixed-case variants can share a cache entry. Therefore the same DNS question can share a cache entry across GET and POST. When a cached answer is served, the question section is rewritten to the exact letter case the requesting client sent, so DNS 0x20-style case randomization still validates.
 
-1. Restores the requesting transaction ID.
-2. Restores the requesting QNAME letter case when safely possible.
-3. Reduces DNS record TTLs by cache age.
+Only DNS answers that are safe to reuse are cached: `NOERROR` and `NXDOMAIN` responses that are not truncated (TC) and are at most 65,535 bytes. Negative answers (`NXDOMAIN`/`NODATA`) are cached only when they carry an SOA record, using `min(SOA TTL, SOA MINIMUM)` per RFC 2308. `SERVFAIL`, `REFUSED` and similar responses are relayed to the client (marked `x-dns-degraded: 1`) but never cached.
 
-### Cacheable responses
+Responses cached internally use DNS TTL-derived expiration. The response transaction ID is rewritten for each client, and cached DNS record TTLs are reduced by cache age before being returned. `Cache-Control: no-store` remains on the client-facing response so the Worker controls the DNS cache instead of creating an uncontrolled browser/HTTP cache layer.
 
-Only non-truncated `NOERROR` and `NXDOMAIN`/negative responses that satisfy the DNS TTL rules are cached.
+### Rate limiting
 
-- Positive answers use the minimum relevant answer TTL.
-- `NXDOMAIN` and NODATA require an SOA and use the RFC 2308-style minimum of SOA TTL and SOA MINIMUM.
-- `SERVFAIL`, `REFUSED`, malformed responses, and truncated responses are not cached.
-- EDNS OPT records are not treated as DNS answer TTLs.
+`/dns-query` is limited to **100 requests per 60 seconds per client IP** through the native `DNS_RATE_LIMITER` binding in `wrangler.toml`. A lightweight per-isolate fallback limiter is used when the binding is missing, throws, or returns an invalid response (the request is then limited locally rather than rejected or allowed unconditionally). Cloudflare documents the native Rate Limiting API as low-latency; its counters are scoped to the relevant Cloudflare location rather than being one globally exact counter.
 
----
+### Request-size protection
 
-## Request coalescing
+DoH DNS messages are normally tiny, so this Worker rejects client messages larger than 4 KiB. It checks `Content-Length` before reading a POST when available and also stream-limits chunked/unknown-length bodies. Upstream resolver responses are independently capped at **65,535 bytes** (the DNS wire-format maximum) and are stream-limited before buffering. These limits avoid spending memory/CPU on oversized abuse traffic while still allowing large legitimate DNSSEC/EDNS answers.
 
-Identical cold-cache requests are coalesced inside the Worker isolate so a burst of the same DNS query does not start multiple independent upstream races.
+## Deploy with Wrangler
 
-The in-flight map is bounded at **128 entries**. Live jobs are never evicted. When the bound is reached, a new cold resolution receives:
+The ZIP includes `wrangler.toml` with the service name `dns` and a `DNS_RATE_LIMITER` binding configured for **100 requests / 60 seconds**. With Wrangler, deploy from the folder containing `Worker.js` and `wrangler.toml` so the binding is created/used. Keep the rate-limit namespace unique if this service must not share counters with another deployment. If the Worker is uploaded through a method that does not apply the Wrangler binding, the script falls back to an in-memory per-isolate limiter.
 
-```text
-HTTP 503
-Retry-After: 1
-```
-
-A failed shared resolution is converted to the normal **HTTP 502** upstream-failure response for all waiting clients.
-
----
-
-## Rate limiting
-
-The preferred configuration is the native Cloudflare `DNS_RATE_LIMITER` binding:
-
-```toml
-[[ratelimits]]
-name = "DNS_RATE_LIMITER"
-namespace_id = "1001"
-
-[ratelimits.simple]
-limit = 100
-period = 60
-```
-
-The Worker calls the binding with the Cloudflare-provided `CF-Connecting-IP` as the key.
-
-If the binding is missing, throws, or returns an invalid result, the Worker falls back to an isolate-local fixed-window limiter of **100 requests per 60 seconds per client IP**.
-
-Cloudflare's current Rate Limiting API documentation specifies `namespace_id` as a string and allows a `simple.period` of 10 or 60 seconds. It also notes that using IP addresses can unintentionally group users behind shared networks. https://developers.cloudflare.com/workers/runtime-apis/bindings/rate-limit/
-
-For stronger network-wide abuse controls, a Cloudflare WAF rate-limiting rule can be added separately.
-
----
-
-## Cloudflare limits and this Worker
-
-Current Cloudflare Workers documentation lists these Workers Free limits:
-
-| Resource | Workers Free |
-|---|---:|
-| Requests | 100,000/day |
-| CPU time | 10 ms/request |
-| Memory | 128 MB/isolate |
-| Subrequests | 50/request |
-| Simultaneous open connections | 6/request |
-| Cache API calls | 50/request |
-
-This Worker normally starts **3 upstream fetches** for a cold lookup and performs at most one L2 `match()` plus one asynchronous L2 `put()` for a cacheable miss. Thus the configured upstream race stays below the documented six simultaneous open-connection limit. https://developers.cloudflare.com/workers/platform/limits/
-
-Cloudflare's limits can change by plan and over time; consult the current documentation before relying on a limit for capacity planning.
-
----
-
-## Deployment
-
-The included `wrangler.toml` currently defines:
-
-```toml
-name = "dns"
-main = "Worker.js"
-compatibility_date = "2026-09-26"
-```
-
-It also defines the `DNS_RATE_LIMITER` binding shown above.
-
-Deploy from the project directory:
+For strict network-wide abuse protection, a Cloudflare WAF Rate Limiting Rule can also be applied to `/dns-query`. Cloudflare notes that rate-limit counters are not globally shared across its entire network, so neither the native binding nor WAF should be treated as one globally exact counter.
 
 ```bash
 npx wrangler deploy
 ```
 
-The deployed Worker name is **`dns`**, not `secure-doh-worker`.
+## Endpoint
 
-### Recommended production endpoint
+After deployment:
 
-Use a custom domain or Worker route, for example:
-
-```text
-https://dns.example.com/dns-query
+```txt
+https://YOUR-DOMAIN.example/dns-query
 ```
 
-Cloudflare recommends custom domains or routes for production Workers rather than relying on `workers.dev`. https://developers.cloudflare.com/workers/configuration/routing/
+The Worker also serves a small dashboard at `/`.
 
----
-
-## DoH usage
+## DoH methods
 
 ### GET
 
-RFC 8484-style GET requests use the `dns` base64url query parameter:
+Standard RFC 8484-style GET requests use the `dns` base64url query parameter:
 
-```text
+```txt
 /dns-query?dns=BASE64URL_DNS_PACKET
-```
-
-Example shape:
-
-```bash
-curl 'https://YOUR-DOMAIN.example/dns-query?dns=BASE64URL_DNS_PACKET' \
-  -H 'Accept: application/dns-message'
 ```
 
 ### POST
 
-Send the raw DNS wire-format message:
+Send the raw DNS wire-format packet with:
 
-```bash
-curl --data-binary @query.bin \
-  -H 'Content-Type: application/dns-message' \
-  -H 'Accept: application/dns-message' \
-  'https://YOUR-DOMAIN.example/dns-query'
-```
-
-Successful DoH responses use:
-
-```text
-HTTP 200
+```txt
 Content-Type: application/dns-message
-Cache-Control: no-store
 ```
 
-The Worker deliberately uses `Cache-Control: no-store` on client-facing DNS responses because DNS caching is controlled by the Worker itself.
+## Cloudflare Worker notes
 
----
+The L1 cache is a per-isolate LRU (512 entries, TTL capped at 300 s). L2 Cache API entries can honor authoritative TTLs up to 24 hours, reducing unnecessary upstream resolutions for long-lived DNS records. Correctness never depends on the Cache API: if L2 is unavailable, misses, or fails, requests fall through to the upstream resolvers. Expired isolate-local cache and throttle entries are swept periodically so `/health` does not retain stale bounded state indefinitely.
 
-## Response headers
+For a production deployment, attach the Worker to a custom domain and use:
 
-Useful diagnostic headers include:
-
-```text
-x-cache: L1-HIT | L2-HIT | COALESCED | MISS
-x-edge-cache: HIT | MISS | SKIP | DISABLED
-x-upstreams: 0 | 1 | 2 | 3
-x-winner: <upstream-url>
-x-winner-lat: <latency>ms
-x-dns-degraded: 1
+```txt
+https://dns.yourdomain.com/dns-query
 ```
 
-`x-dns-degraded: 1` is present when a valid but degraded DNS response such as `SERVFAIL` or `REFUSED` is returned.
-
----
-
-## Health endpoint
-
-`GET /health` returns information such as:
-
-- Worker version
-- Configured upstream URLs
-- Resolver score, success/failure counters, and latency information
-- L1 cache entry count
-- In-flight resolution count
-- Local throttle entry count
-- Rate-limit configuration
-- Maximum upstream DNS message size
-- Cache strategy and TTL caps
-- Maximum simultaneous configured upstreams
-
-It is public and unauthenticated. If exposing resolver telemetry is undesirable, protect `/health` with an appropriate Cloudflare access/WAF rule.
-
----
+`/health` is public and unauthenticated. It exposes resolver scores and cache counters but no client data; restrict it with a WAF rule if you prefer not to publish it.
 
 ## Testing
 
-The repository contains both unit tests and mocked Worker-level integration tests.
-
-Run the complete test suite:
+Run the included unit tests and Worker-level integration tests from the project folder:
 
 ```bash
 node --test test.mjs
+node integration.mjs
 ```
 
-Syntax-check the Worker separately:
+The unit suite covers DNS wire parsing, response validation, TTL/cacheability rules, resolver scoring, and cache-key normalization. The integration suite exercises the real exported Worker `fetch()` handler for routing, GET/POST DoH, request validation, L1/L2 caching, transaction-ID restoration, request coalescing, native/local rate limiting, upstream failure handling, and size protections.
 
-```bash
-node --check Worker.js
+A healthy request should return:
+
+```txt
+HTTP 200
+Content-Type: application/dns-message
 ```
 
-The current suite covers **23 tests**, including:
+Useful response headers include:
 
-- DNS query parsing
-- DNS name compression and malformed-name handling
-- Upstream response validation
-- Transaction-ID and QNAME matching
-- Positive and negative DNS cache TTL calculation
-- Truncated/degraded response cache exclusion
-- Resolver scoring and degraded fallback selection
-- GET/POST cache-key equivalence
-- L1 cache hits and TTL aging
-- L2 Cache API hits
-- Parallel three-upstream racing
-- NXDOMAIN grace behavior
-- Upstream failure and HTTP 502 handling
-- Concurrent request coalescing and failed shared jobs
-- Native rate-limit binding behavior
-- Local fallback rate limiting
-- DoH method/content-type/size validation
-- `/`, `/health`, and 404 routing
-
-The test suite mocks upstream networking and the Cache API; it does **not** prove that the three public upstream services are currently reachable from Cloudflare's network. A real deployment smoke test should therefore query `/dns-query` after deployment.
-
-### Deployment smoke test
-
-After deployment, verify:
-
-```bash
-curl -i 'https://YOUR-DOMAIN.example/health'
+```txt
+x-cache: L1-HIT / L2-HIT / COALESCED / MISS
+x-edge-cache: HIT / MISS / SKIP
+x-upstreams: 0 / 1 / 2 / 3
+x-winner: <upstream-url>
+x-winner-lat: <latency>
+x-dns-degraded: 1   (only when the answer is SERVFAIL/REFUSED/etc.)
 ```
 
-Then issue a real DNS wire query through `/dns-query` using a DoH-capable client.
+The `/health` endpoint reports the three configured resolver scores, the parallel-race strategy, plus L1/L2 cache and in-flight state.
 
----
-
-## Dashboard
-
-The root dashboard is generated directly by `Worker.js` and currently supports:
-
-- English
-- Persian
-- Simplified Chinese
-- Copy-to-clipboard endpoint button
-- Chromium setup guidance
-- Firefox setup guidance
-- Android/iOS guidance
-
-The dashboard is informational; it does not change Worker resolver configuration.
-
----
 
 ## Important limitation
 
-This is **DNS encryption, not a VPN**.
-
-The Worker protects the DNS exchange between the client and the DoH endpoint. It does not by itself hide destination IP addresses or guarantee bypass of IP, SNI, TLS, QUIC, routing, or other network-level filtering.
-
----
-
-## Project files
-
-```text
-DOH-Endpoints-Cloudflare-Worker-main/
-├── Worker.js      # Cloudflare Worker implementation
-├── wrangler.toml  # Wrangler + rate-limit configuration
-├── test.mjs       # Unit + Worker-level mocked integration tests
-├── README.md      # Project documentation
-└── LICENSE        # MIT license
-```
-
----
+This is **DNS encryption**, not a VPN. It protects DNS traffic between the client and this Worker, but it does not hide destination IP addresses or guarantee bypass of IP, SNI, TLS, QUIC, or other network-level filtering.
 
 ## Credits
 
-Based on [Secure DNS over HTTPS Cloudflare Worker](https://github.com/TheGreatAzizi/Secure-DNS-over-HTTPS-Cloudflare-Worker) by M.M. Azizi (MIT).
+Based on [Secure DNS over HTTPS Cloudflare Worker](https://github.com/TheGreatAzizi/Secure-DNS-over-HTTPS-Cloudflare-Worker) by M.M.Azizi (MIT).
+
+## 🌐 Configured DNS-over-HTTPS Upstreams
+
+The Worker uses these three DoH endpoints simultaneously for each uncached DNS lookup:
+
+| # | DNS-over-HTTPS (DoH) upstream |
+| :---: | :--- |
+| 1 | `https://freedns.koyeb.app/dns-query` |
+| 2 | `https://dns-pi.vercel.app/api/doh/dns-query` |
+| 3 | `https://dns.mydoh.workers.dev/dns-query` |
+
+
+## Supporting the Project
+
+If you find this project useful, donations are appreciated:
+
+- **Bitcoin**: `1HntwKxyqGCfnSGvGLMUTRAqLnTvLarAQP`
 
 ## License
 

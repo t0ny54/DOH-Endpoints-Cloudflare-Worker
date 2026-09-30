@@ -167,12 +167,8 @@ async function handleDNS(req, url, ctx) {
   // traffic before the first response has reached either cache.
   const existing = APP_STATE.inflight.get(cacheKey);
   if (existing) {
-    try {
-      const shared = await awaitSharedResolution(existing);
-      return coalescedDNSResponse(shared, parsed, payload);
-    } catch (err) {
-      return upstreamFailureResponse(err, RESOLVER_NODES.length);
-    }
+    const shared = await awaitSharedResolution(existing);
+    return coalescedDNSResponse(shared, parsed, payload);
   }
 
   // L2: Cache API. This runs after the rate limiter, so enabling this cache
@@ -193,12 +189,8 @@ async function handleDNS(req, url, ctx) {
   // a new upstream job.
   const raced = APP_STATE.inflight.get(cacheKey);
   if (raced) {
-    try {
-      const shared = await awaitSharedResolution(raced);
-      return coalescedDNSResponse(shared, parsed, payload);
-    } catch (err) {
-      return upstreamFailureResponse(err, RESOLVER_NODES.length);
-    }
+    const shared = await awaitSharedResolution(raced);
+    return coalescedDNSResponse(shared, parsed, payload);
   }
 
   // Never evict unresolved jobs: trimming the in-flight map would break
