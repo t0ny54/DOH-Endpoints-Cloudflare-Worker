@@ -558,3 +558,14 @@ test('NXDOMAIN vs NOERROR race timing respects the grace window', async () => {
     dns.CONFIG.UPSTREAM_TIMEOUT_MS = previousTimeout;
   }
 });
+
+test('setCache honors an explicit expiry independent of storedAt (L2 -> L1 promotion)', () => {
+  dns.APP_STATE.cache.clear();
+  // Entry stored 1 h ago (old L2 entry): storedAt + TTL would already be in the past.
+  const storedAt = Date.now() - 3_600_000;
+  dns.setCache('promoted', new ArrayBuffer(1), 300, storedAt, Date.now() + 60_000);
+  const hit = dns.getCache('promoted');
+  assert.ok(hit, 'promoted entry must be served from L1');
+  assert.equal(hit.storedAt, storedAt);
+  dns.APP_STATE.cache.clear();
+});

@@ -1,10 +1,10 @@
 /**
- * VERSION: 0.3.0
+ * VERSION: 0.4.1
  * GITHUB: https://github.com/t0ny54/DOH-Endpoints-Cloudflare-Worker
  * Runtime: Cloudflare Workers Module Syntax
  */
 
-const VERSION = '0.4.0';
+const VERSION = '0.4.1';
 
 const CONFIG = {
   DNS_PATH: '/dns-query',
@@ -86,7 +86,6 @@ const APP_STATE = {
   cache: new Map(),
   throttle: new Map(),
   inflight: new Map(),
-  primaryCursor: 0,
   lastSweepAt: 0
 };
 
@@ -167,21 +166,23 @@ async function handleDNS(req, url, ctx) {
   // This prevents a burst of identical cold queries from multiplying upstream
   // traffic before the first response has reached either cache.
   const existing = APP_STATE.inflight.get(cacheKey);
-  if (existing) {
-    try {
-      const shared = await awaitSharedResolution(existing);
-      return coalescedDNSResponse(shared, parsed, payload);
-    } catch (err) {
-      return upstreamFailureResponse(err, RESOLVER_NODES.length);
-    }
-  }
+  if (existing) return joinInflight(existing, parsed, payload);
 
   // L2: Cache API. This runs after the rate limiter, so enabling this cache
   // does not bypass the per-IP /dns-query protection.
   if (CONFIG.EDGE_CACHE_ENABLED) {
     const edgeHit = await getEdgeCache(cacheKey, parsed.id, url.origin, payload);
     if (edgeHit) {
-      setCache(cacheKey, edgeHit.body, cappedTTL(edgeHit.ttlSeconds, CONFIG.LOCAL_CACHE_MAX_TTL_SECONDS), edgeHit.storedAt);
+      // Promote to L1 for at most the remaining DNS lifetime (and never longer
+      // than the L1 cap counted from now), so old L2 entries still warm L1.
+      const remaining = edgeHit.ttlSeconds - edgeHit.ageSeconds;
+      setCache(
+        cacheKey,
+        edgeHit.body,
+        cappedTTL(remaining, CONFIG.LOCAL_CACHE_MAX_TTL_SECONDS),
+        edgeHit.storedAt,
+        Date.now() + cappedTTL(remaining, CONFIG.LOCAL_CACHE_MAX_TTL_SECONDS) * 1000
+      );
       return dnsResponse(edgeHit.responseBody, {
         'x-cache': 'L2-HIT',
         'x-edge-cache': 'HIT',
@@ -193,14 +194,7 @@ async function handleDNS(req, url, ctx) {
   // A second in-flight check closes the race between the L2 lookup and creating
   // a new upstream job.
   const raced = APP_STATE.inflight.get(cacheKey);
-  if (raced) {
-    try {
-      const shared = await awaitSharedResolution(raced);
-      return coalescedDNSResponse(shared, parsed, payload);
-    } catch (err) {
-      return upstreamFailureResponse(err, RESOLVER_NODES.length);
-    }
-  }
+  if (raced) return joinInflight(raced, parsed, payload);
 
   // Never evict unresolved jobs: trimming the in-flight map would break
   // coalescing and multiply upstream traffic during bursts. When the map is
@@ -212,9 +206,8 @@ async function handleDNS(req, url, ctx) {
     });
   }
 
-  const resolvers = selectRacers(RESOLVER_NODES);
   const job = (async () => {
-    const result = await resolveWithParallelRace(resolvers, payload, parsed.id);
+    const result = await resolveWithParallelRace(RESOLVER_NODES, payload, parsed.id);
     const storedAt = Date.now();
     // getDNSCacheTTL returns 0 for anything that must not be cached (non
     // NOERROR/NXDOMAIN, truncated, malformed, oversized, or negative answers
@@ -269,24 +262,19 @@ async function handleDNS(req, url, ctx) {
 
     return dnsResponse(responseBody, headers);
   } catch (err) {
-    return upstreamFailureResponse(err, resolvers.length);
+    return upstreamFailureResponse(err, RESOLVER_NODES.length);
   } finally {
     if (APP_STATE.inflight.get(cacheKey) === job) APP_STATE.inflight.delete(cacheKey);
   }
 }
 
-async function awaitSharedResolution(job) {
+async function joinInflight(job, parsed, queryBytes) {
   try {
-    return await job;
+    const shared = await job;
+    return coalescedDNSResponse(shared, parsed, queryBytes);
   } catch (err) {
-    throw toUpstreamFailure(err);
+    return upstreamFailureResponse(err, RESOLVER_NODES.length);
   }
-}
-
-function toUpstreamFailure(err) {
-  const failure = new Error('Global resolving failed');
-  failure.attempts = err?.attempts || 0;
-  return failure;
 }
 
 function upstreamFailureResponse(err, fallbackAttempts = 0) {
@@ -471,7 +459,7 @@ function parseDNSQuestion(packet) {
 
   // Only the ID is needed by the resolver/cache hot path. EDNS options remain
   // part of the wire query and cache key.
-  return { ok: true, id, questionEnd };
+  return { ok: true, id };
 }
 
 function normalizeDNSResponseID(responseBuffer) {
@@ -481,27 +469,6 @@ function normalizeDNSResponseID(responseBuffer) {
   copy[0] = 0;
   copy[1] = 0;
   return copy.buffer;
-}
-
-function selectRacers(resolvers) {
-  const ranked = [...resolvers].sort((a, b) => {
-    if (b.score !== a.score) return b.score - a.score;
-    const al = a.ewmaLatencyMs ?? Number.MAX_SAFE_INTEGER;
-    const bl = b.ewmaLatencyMs ?? Number.MAX_SAFE_INTEGER;
-    if (al !== bl) return al - bl;
-    return a.order - b.order;
-  });
-
-  // Rotate only among similarly healthy endpoints so a healthy resolver does
-  // not become a permanent hot spot, while failed endpoints naturally fall
-  // behind and remain available as recovery targets.
-  const bestScore = ranked[0]?.score ?? 0;
-  const pool = ranked.filter((node) => node.score >= bestScore - 8);
-
-  if (pool.length <= 1) return ranked;
-
-  const chosen = pool[APP_STATE.primaryCursor++ % pool.length];
-  return [chosen, ...ranked.filter((node) => node !== chosen)];
 }
 
 async function resolveWithParallelRace(nodes, packet, expectedID) {
@@ -531,18 +498,21 @@ async function resolveWithParallelRace(nodes, packet, expectedID) {
 
   for (const node of nodes) startAttempt(node);
 
-  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  let graceTimer = null;
+  const clearGrace = () => { if (graceTimer !== null) { clearTimeout(graceTimer); graceTimer = null; } };
 
   try {
     while (active.size) {
       let result;
-      if (nxdomain && nxdomainDeadline > Date.now()) {
+      if (nxdomain) {
         // While holding an NXDOMAIN candidate, bound how long we keep waiting
         // for a possibly-valid NOERROR from a slower upstream.
-        result = await Promise.race([
-          ...active.values(),
-          sleep(nxdomainDeadline - Date.now())
-        ]);
+        const remainingMs = nxdomainDeadline - Date.now();
+        if (remainingMs <= 0) break;
+        clearGrace();
+        const grace = new Promise((resolve) => { graceTimer = setTimeout(resolve, remainingMs); });
+        result = await Promise.race([...active.values(), grace]);
+        clearGrace();
       } else {
         result = await Promise.race(active.values());
       }
@@ -606,6 +576,7 @@ async function resolveWithParallelRace(nodes, packet, expectedID) {
     err.attempts = attempts.length;
     throw err;
   } finally {
+    clearGrace();
     abortAttempts(controllers);
   }
 }
@@ -710,7 +681,6 @@ async function relay(node, packet, expectedID, signal) {
       degraded: !usable
     };
   } catch (err) {
-    const message = String(err && err.message ? err.message : err);
     // Losers are aborted with an explicit 'winner-selected' reason, so a race
     // abort is never misclassified as a timeout even when the timeout and
     // winner abort fire close together.
@@ -969,14 +939,14 @@ function getCache(key) {
   return item;
 }
 
-function setCache(key, body, ttlSeconds, storedAt = Date.now()) {
+function setCache(key, body, ttlSeconds, storedAt = Date.now(), expiresAtMs = null) {
   const ttl = Math.max(1, Math.floor(ttlSeconds));
   // Delete first so re-inserted keys move to the newest LRU position.
   APP_STATE.cache.delete(key);
   APP_STATE.cache.set(key, {
     body,
     storedAt,
-    expiresAt: storedAt + ttl * 1000
+    expiresAt: expiresAtMs ?? storedAt + ttl * 1000
   });
 
   trimMap(APP_STATE.cache, CONFIG.MAX_CACHE_ENTRIES);
@@ -1106,7 +1076,6 @@ function readResourceRecord(bytes, offset, context = null) {
 
   return {
     type,
-    classCode: rrClass,
     ttl,
     rdLength,
     rdataOffset,
@@ -1185,7 +1154,7 @@ function validateRData(bytes, type, rrClass, rdataOffset, rdEnd, context) {
   // RRSIG: covered type(2), algorithm(1), labels(1), original TTL(4),
   // signature expiration(4), inception(4), key tag(2), signer name, signature.
   if (type === 24 || type === 46) { // SIG / RRSIG
-    const fixed = type === 46 ? 18 : 18;
+    const fixed = 18; // type(2) alg(1) labels(1) ttl(4) exp(4) inc(4) tag(2)
     if (rdataOffset + fixed > rdEnd) return false;
     const signerStart = rdataOffset + fixed;
     const end = readName(signerStart);
@@ -1204,18 +1173,8 @@ function validateRData(bytes, type, rrClass, rdataOffset, rdEnd, context) {
 
   // NSEC: next domain name followed by one or more well-formed bitmap windows.
   if (type === 47) {
-    let pos = readName(rdataOffset);
-    if (pos < 0 || pos >= rdEnd) return false;
-    let previousWindow = -1;
-    while (pos < rdEnd) {
-      if (pos + 2 > rdEnd) return false;
-      const window = bytes[pos++];
-      const length = bytes[pos++];
-      if (window <= previousWindow || length < 1 || length > 32 || pos + length > rdEnd) return false;
-      previousWindow = window;
-      pos += length;
-    }
-    return pos === rdEnd;
+    const pos = readName(rdataOffset);
+    return pos >= 0 && pos < rdEnd && validateTypeBitmap(bytes, pos, rdEnd);
   }
 
   // NSEC3: hash algorithm, flags, iterations, salt length + salt,
@@ -1408,6 +1367,7 @@ async function getEdgeCache(key, queryID, origin, queryBytes) {
       body,
       storedAt,
       ttlSeconds,
+      ageSeconds,
       responseBody: patchDNSResponseForAge(body, queryID, ageSeconds, queryBytes)
     };
   } catch (_) {
@@ -1599,11 +1559,9 @@ export const __internals = {
   getDNSCacheTTL,
   patchDNSResponseForAge,
   localRateLimit,
-  selectRacers,
   resolveWithParallelRace,
   isBetterDegraded,
   relay,
-  resolveWithParallelRace,
   getCache,
   setCache,
   getEdgeCache,
