@@ -30,8 +30,48 @@ globalThis.caches = { default: {
 globalThis.fetch = async (url, opts={}) => {
   upstreamCalls++;
   const body = new Uint8Array(opts.body);
+
   if (mode === 'fail') throw new Error('upstream down');
+
+  if (mode === 'timeout') {
+    await new Promise((resolve, reject) => {
+      const timer = setTimeout(resolve, 5_000);
+      opts.signal?.addEventListener('abort', () => {
+        clearTimeout(timer);
+        reject(new DOMException('Aborted', 'AbortError'));
+      }, { once: true });
+    });
+  }
+
   if (mode === 'slow') await new Promise(r=>setTimeout(r,80));
+
+  if (mode === 'http-error') {
+    return new Response('upstream error page', {
+      status: 503,
+      headers: {'content-type':'text/plain; charset=utf-8'}
+    });
+  }
+
+  if (mode === 'bad-content-type') {
+    return new Response('<html>not dns</html>', {
+      status: 200,
+      headers: {'content-type':'text/html'}
+    });
+  }
+
+  if (mode === 'oversized-chunked') {
+    return new Response(
+      new ReadableStream({
+        start(controller) {
+          controller.enqueue(new Uint8Array(60_000));
+          controller.enqueue(new Uint8Array(6_000));
+          controller.close();
+        }
+      }),
+      {status:200, headers:{'content-type':'application/dns-message'}}
+    );
+  }
+
   const response = answerFor(body, '1.2.3.4', 60, mode === 'servfail' ? 2 : 0);
   return new Response(response, {status:200, headers:{'content-type':'application/dns-message'}});
 };
@@ -41,7 +81,7 @@ const req = (path, opts={}) => new Request('https://dns.example.test'+path, opts
 
 // Routing / health / methods
 let r = await worker.fetch(req('/')); assert.equal(r.status,200); assert.match(await r.text(), /DNS over HTTPS/);
-r = await worker.fetch(req('/health')); assert.equal(r.status,200); assert.equal((await r.json()).version,'0.3.0');
+r = await worker.fetch(req('/health')); assert.equal(r.status,200); assert.equal((await r.json()).version,'0.4.0');
 r = await worker.fetch(req('/missing')); assert.equal(r.status,404);
 r = await worker.fetch(req('/dns-query',{method:'PUT',headers:{'CF-Connecting-IP':'1'}}), rateOK); assert.equal(r.status,405);
 
@@ -117,3 +157,97 @@ assert.equal(er.status,200); assert.equal(er.headers.get('x-cache'),'L2-HIT'); a
 
 dns.CONFIG.MAX_CACHE_ENTRIES=512;
 console.log('EXTENDED INTEGRATION TESTS: PASS');
+
+
+// Upstream failure classes: HTTP status and content type must fail closed as 502.
+mode='http-error'; upstreamCalls=0;
+r=await worker.fetch(req('/dns-query',{method:'POST',headers:{'CF-Connecting-IP':'http-error','content-type':'application/dns-message'},body:query(0x7777,'http-error.example')}),rateOK);
+assert.equal(r.status,502); assert.equal(r.headers.get('x-upstreams'),'3');
+
+mode='bad-content-type'; upstreamCalls=0;
+r=await worker.fetch(req('/dns-query',{method:'POST',headers:{'CF-Connecting-IP':'content-type','content-type':'application/dns-message'},body:query(0x7778,'content-type.example')}),rateOK);
+assert.equal(r.status,502); assert.equal(r.headers.get('x-upstreams'),'3');
+
+// Chunked upstream bodies must be bounded before buffering.
+mode='oversized-chunked'; upstreamCalls=0;
+r=await worker.fetch(req('/dns-query',{method:'POST',headers:{'CF-Connecting-IP':'chunked-large','content-type':'application/dns-message'},body:query(0x7779,'chunked-large.example')}),rateOK);
+assert.equal(r.status,502); assert.equal(r.headers.get('x-upstreams'),'3');
+
+// Upstream timeouts are separately counted.
+const previousTimeout= dns.CONFIG.UPSTREAM_TIMEOUT_MS;
+dns.CONFIG.UPSTREAM_TIMEOUT_MS=25;
+mode='timeout'; upstreamCalls=0;
+r=await worker.fetch(req('/dns-query',{method:'POST',headers:{'CF-Connecting-IP':'timeout-class','content-type':'application/dns-message'},body:query(0x7780,'timeout-class.example')}),rateOK);
+assert.equal(r.status,502); assert.equal(r.headers.get('x-upstreams'),'3');
+assert.ok(dns.APP_STATE.inflight.size === 0);
+dns.CONFIG.UPSTREAM_TIMEOUT_MS=previousTimeout;
+
+// L2 expired entries must fall through instead of being returned.
+mode='ok'; dns.APP_STATE.cache.clear(); cacheStore.clear(); upstreamCalls=0;
+const expiredQuery=query(0x7781,'expired-l2.example');
+const expiredKey=await dns.makeCacheKey(expiredQuery);
+cacheStore.set(`https://dns.example.test/__doh-cache/v1/${expiredKey}`, new Response(
+  answerFor(expiredQuery,'8.8.8.8',60),
+  {
+    status:200,
+    headers:{
+      'content-type':'application/dns-message',
+      'x-doh-stored-at':String(Date.now()-120_000),
+      'x-doh-ttl':'30'
+    }
+  }
+));
+r=await worker.fetch(req('/dns-query',{method:'POST',headers:{'CF-Connecting-IP':'expired-l2','content-type':'application/dns-message'},body:expiredQuery}),rateOK);
+assert.equal(r.status,200); assert.notEqual(r.headers.get('x-cache'),'L2-HIT'); assert.equal(upstreamCalls,3);
+
+// Cache API failures must never take down resolution.
+const realCacheGlobal=globalThis.caches;
+globalThis.caches={default:{
+  async match(){throw new Error('Cache match failed');},
+  async put(){throw new Error('Cache put failed');}
+}};
+dns.APP_STATE.cache.clear(); upstreamCalls=0; mode='ok';
+const cacheFailQ=query(0x7782,'cache-failure.example');
+const cacheFailCtx={jobs:[],waitUntil(p){this.jobs.push(p)}};
+r=await worker.fetch(req('/dns-query',{method:'POST',headers:{'CF-Connecting-IP':'cache-failure','content-type':'application/dns-message'},body:cacheFailQ}),rateOK,cacheFailCtx);
+assert.equal(r.status,200); assert.equal(r.headers.get('x-cache'),'MISS');
+await Promise.all(cacheFailCtx.jobs);
+globalThis.caches=realCacheGlobal;
+
+// Rate limiter malformed-return and throw paths must use the local fallback.
+const previousRateMax=dns.CONFIG.RATE_LIMIT_MAX_REQUESTS;
+dns.CONFIG.RATE_LIMIT_MAX_REQUESTS=1;
+dns.APP_STATE.throttle.clear();
+
+const malformedLimiter={DNS_RATE_LIMITER:{limit:async()=>({})}};
+r=await worker.fetch(req('/dns-query',{method:'POST',headers:{'CF-Connecting-IP':'malformed-limiter','content-type':'application/dns-message'},body:query(0x7783,'limiter-malformed.example')}),malformedLimiter);
+assert.equal(r.status,200);
+r=await worker.fetch(req('/dns-query',{method:'POST',headers:{'CF-Connecting-IP':'malformed-limiter','content-type':'application/dns-message'},body:query(0x7784,'limiter-malformed.example')}),malformedLimiter);
+assert.equal(r.status,429);
+
+dns.APP_STATE.throttle.delete('throw-limiter');
+const throwingLimiter={DNS_RATE_LIMITER:{limit:async()=>{throw new Error('binding exploded')}}};
+r=await worker.fetch(req('/dns-query',{method:'POST',headers:{'CF-Connecting-IP':'throw-limiter','content-type':'application/dns-message'},body:query(0x7785,'limiter-throw.example')}),throwingLimiter);
+assert.equal(r.status,200);
+r=await worker.fetch(req('/dns-query',{method:'POST',headers:{'CF-Connecting-IP':'throw-limiter','content-type':'application/dns-message'},body:query(0x7786,'limiter-throw.example')}),throwingLimiter);
+assert.equal(r.status,429);
+
+dns.CONFIG.RATE_LIMIT_MAX_REQUESTS=previousRateMax;
+dns.APP_STATE.throttle.clear();
+
+// When MAX_INFLIGHT_ENTRIES is reached, live jobs stay intact and new cold keys get 503.
+const previousInflightMax=dns.CONFIG.MAX_INFLIGHT_ENTRIES;
+dns.CONFIG.MAX_INFLIGHT_ENTRIES=1;
+dns.APP_STATE.cache.clear(); cacheStore.clear(); upstreamCalls=0; mode='slow';
+const inflightQ=query(0x7787,'inflight-full-a.example');
+const firstP=worker.fetch(req('/dns-query',{method:'POST',headers:{'CF-Connecting-IP':'inflight-a','content-type':'application/dns-message'},body:inflightQ}),rateOK);
+for(let i=0;i<100 && dns.APP_STATE.inflight.size===0;i++) await new Promise(resolve=>setImmediate(resolve));
+assert.equal(dns.APP_STATE.inflight.size,1);
+r=await worker.fetch(req('/dns-query',{method:'POST',headers:{'CF-Connecting-IP':'inflight-b','content-type':'application/dns-message'},body:query(0x7788,'inflight-full-b.example')}),rateOK);
+assert.equal(r.status,503);
+const firstResult=await firstP;
+assert.equal(firstResult.status,200);
+assert.equal(dns.APP_STATE.inflight.size,0);
+dns.CONFIG.MAX_INFLIGHT_ENTRIES=previousInflightMax;
+
+console.log('HARDENING INTEGRATION TESTS: PASS');

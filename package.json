@@ -1,0 +1,13 @@
+{
+  "name": "doh-endpoints-cloudflare-worker",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test test.mjs && node integration.mjs",
+    "test:wrangler": "node wrangler-smoke.mjs",
+    "test:all": "npm test && npm run test:wrangler"
+  },
+  "devDependencies": {
+    "wrangler": "4.143.0"
+  }
+}

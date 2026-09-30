@@ -102,16 +102,33 @@ https://dns.yourdomain.com/dns-query
 
 `/health` is public and unauthenticated. It exposes resolver scores and cache counters but no client data; restrict it with a WAF rule if you prefer not to publish it.
 
+## Hardening coverage
+
+This build treats upstream DNS as untrusted input. Every resource-record owner name is parsed, and when a compression context is available, a pointer must target a previously observed label boundary rather than a forward/header offset. Expanded names are capped at the DNS 255-octet limit.
+
+Known name-bearing RDATA is validated within each RR's `RDLENGTH`. In particular, SOA requires both domain names plus exactly 20 octets of numeric fields, and the parser rejects SOA names that cross their RDATA boundary. Common DNSSEC and modern record formats (AAAA, DS, DNSKEY, RRSIG, NSEC, NSEC3, SVCB/HTTPS, MX, SRV, NAPTR and related name-bearing types) receive structural checks; unknown/private types remain opaque after their owner name and RDATA length have been proven valid.
+
+Upstream failure handling distinguishes timeout, HTTP-status, incompatible content-type, oversized-body, invalid-DNS, and generic/network failures for resolver scoring. A chunked upstream body is stream-limited before buffering, and timed-out resolvers are counted separately from ordinary failures.
+
+Cache behavior is defensive at both levels: expired L1 entries are removed before use, L1 is true LRU, live in-flight resolutions are never evicted, expired L2 entries fall through to resolution, and exceptions from `caches.default.match()` / `put()` or malformed/throwing rate-limit bindings do not break DNS resolution.
+
 ## Testing
 
-Run the included unit tests and Worker-level integration tests from the project folder:
+Run the included unit tests, Worker-level integration tests, and the optional real `wrangler dev` smoke test:
 
 ```bash
-node --test test.mjs
-node integration.mjs
+npm install
+npm test
+npm run test:wrangler
+# or:
+npm run test:all
 ```
 
-The unit suite covers DNS wire parsing, response validation, TTL/cacheability rules, resolver scoring, and cache-key normalization. The integration suite exercises the real exported Worker `fetch()` handler for routing, GET/POST DoH, request validation, L1/L2 caching, transaction-ID restoration, request coalescing, native/local rate limiting, upstream failure handling, and size protections.
+The unit suite covers DNS wire parsing, strict compression-pointer validation, all RR sections, name-bearing RDATA, SOA structure/compression boundaries, TTL/cacheability rules, IPv6/other RR types, DNSSEC-heavy responses, L1 expiration/LRU eviction, resolver scoring, NXDOMAIN-vs-NOERROR race timing, and cache-key normalization.
+
+The integration suite exercises the exported Worker `fetch()` handler for routing, GET/POST DoH, request validation, L1/L2 caching, expired L2 entries, transaction-ID restoration, request coalescing, the `MAX_INFLIGHT_ENTRIES` saturation path, native/local rate limiting, malformed/throwing rate-limit bindings, HTTP/content-type/timeout/oversized-chunked upstream failures, cache API failures, and size protections.
+
+`wrangler-smoke.mjs` starts the actual local Wrangler `dev` runtime (Cloudflare's `workerd` through Wrangler/Miniflare), then probes `/health`, `/`, an invalid DoH request, and an unsupported method without contacting the public DoH upstreams. The Rate Limiting binding is locally simulated during `wrangler dev`; it is not a test of production-wide Cloudflare counters. See the [Cloudflare local-development documentation](https://developers.cloudflare.com/workers/local-development/) and [Rate Limiting API documentation](https://developers.cloudflare.com/workers/runtime-apis/bindings/rate-limit/).
 
 A healthy request should return:
 

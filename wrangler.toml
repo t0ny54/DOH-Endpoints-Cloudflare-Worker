@@ -1,6 +1,6 @@
 name = "dns"
 main = "Worker.js"
-compatibility_date = "2026-09-26"
+compatibility_date = "2026-10-01"
 
 [[ratelimits]]
 name = "DNS_RATE_LIMITER"

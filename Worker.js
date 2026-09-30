@@ -4,7 +4,7 @@
  * Runtime: Cloudflare Workers Module Syntax
  */
 
-const VERSION = '0.3.0';
+const VERSION = '0.4.0';
 
 const CONFIG = {
   DNS_PATH: '/dns-query',
@@ -78,7 +78,8 @@ const RESOLVER_NODES = DOH_UPSTREAMS.map((url, order) => ({
   timeout: 0,
   lastLatencyMs: null,
   ewmaLatencyMs: null,
-  lastError: null
+  lastError: null,
+  lastErrorKind: null
 }));
 
 const APP_STATE = {
@@ -167,8 +168,12 @@ async function handleDNS(req, url, ctx) {
   // traffic before the first response has reached either cache.
   const existing = APP_STATE.inflight.get(cacheKey);
   if (existing) {
-    const shared = await awaitSharedResolution(existing);
-    return coalescedDNSResponse(shared, parsed, payload);
+    try {
+      const shared = await awaitSharedResolution(existing);
+      return coalescedDNSResponse(shared, parsed, payload);
+    } catch (err) {
+      return upstreamFailureResponse(err, RESOLVER_NODES.length);
+    }
   }
 
   // L2: Cache API. This runs after the rate limiter, so enabling this cache
@@ -189,8 +194,12 @@ async function handleDNS(req, url, ctx) {
   // a new upstream job.
   const raced = APP_STATE.inflight.get(cacheKey);
   if (raced) {
-    const shared = await awaitSharedResolution(raced);
-    return coalescedDNSResponse(shared, parsed, payload);
+    try {
+      const shared = await awaitSharedResolution(raced);
+      return coalescedDNSResponse(shared, parsed, payload);
+    } catch (err) {
+      return upstreamFailureResponse(err, RESOLVER_NODES.length);
+    }
   }
 
   // Never evict unresolved jobs: trimming the in-flight map would break
@@ -440,7 +449,8 @@ function parseDNSQuestion(packet) {
     return { ok: false, error: 'Invalid DNS query section counts' };
   }
 
-  const questionEnd = skipDNSName(bytes, 12);
+  const nameContext = createDNSNameContext();
+  const questionEnd = skipDNSName(bytes, 12, nameContext);
   if (questionEnd < 0 || questionEnd + 4 > bytes.length) {
     return { ok: false, error: 'Incomplete DNS question' };
   }
@@ -451,7 +461,7 @@ function parseDNSQuestion(packet) {
   // rejected instead of being forwarded upstream or baked into cache keys.
   let offset = questionEnd + 4;
   for (let i = 0; i < arcount; i++) {
-    const rr = readResourceRecord(bytes, offset);
+    const rr = readResourceRecord(bytes, offset, nameContext);
     if (!rr) return { ok: false, error: 'Malformed additional record in DNS query' };
     offset = rr.end;
   }
@@ -614,6 +624,12 @@ function abortAttempts(controllers, winnerNode) {
   }
 }
 
+function upstreamError(message, kind = 'network') {
+  const err = new Error(message);
+  err.kind = kind;
+  return err;
+}
+
 async function relay(node, packet, expectedID, signal) {
   const started = Date.now();
   const timeoutController = new AbortController();
@@ -635,7 +651,7 @@ async function relay(node, packet, expectedID, signal) {
 
     if (!res.ok) {
       discardBody(res);
-      throw new Error(`Upstream HTTP ${res.status}`);
+      throw upstreamError(`Upstream HTTP ${res.status}`, 'http');
     }
 
     // Require a compatible content type when the upstream sends one; a bare
@@ -643,7 +659,7 @@ async function relay(node, packet, expectedID, signal) {
     const contentType = res.headers.get('content-type') || '';
     if (contentType && !contentType.toLowerCase().startsWith('application/dns-message')) {
       discardBody(res);
-      throw new Error('Upstream returned an invalid content type');
+      throw upstreamError('Upstream returned an invalid content type', 'content-type');
     }
 
     const declaredLength = Number(res.headers.get('content-length'));
@@ -652,19 +668,27 @@ async function relay(node, packet, expectedID, signal) {
       && declaredLength > CONFIG.MAX_UPSTREAM_DNS_MESSAGE_BYTES
     ) {
       discardBody(res);
-      throw new Error('Upstream DNS response too large');
+      throw upstreamError('Upstream DNS response too large', 'response-too-large');
     }
 
-    const bodyBytes = await readCappedBody(
-      res,
-      CONFIG.MAX_UPSTREAM_DNS_MESSAGE_BYTES,
-      'Upstream DNS response too large'
-    );
+    let bodyBytes;
+    try {
+      bodyBytes = await readCappedBody(
+        res,
+        CONFIG.MAX_UPSTREAM_DNS_MESSAGE_BYTES,
+        'Upstream DNS response too large'
+      );
+    } catch (err) {
+      if (err?.status === 413) {
+        throw upstreamError('Upstream DNS response too large', 'response-too-large');
+      }
+      throw err;
+    }
     const body = bodyBytes.buffer;
     const validation = validateDNSResponse(body, expectedID, packet);
 
     if (!validation.ok) {
-      throw new Error(validation.error);
+      throw upstreamError(validation.error, 'dns-invalid');
     }
 
     const latencyMs = Date.now() - started;
@@ -691,16 +715,17 @@ async function relay(node, packet, expectedID, signal) {
     // abort is never misclassified as a timeout even when the timeout and
     // winner abort fire close together.
     const raceAbort = signal?.aborted && signal.reason === 'winner-selected';
-    const timeoutAbort = timeoutController.signal.aborted
-      || message.toLowerCase().includes('timeout');
+    const timeoutAbort = timeoutController.signal.aborted;
 
     if (raceAbort) throw err;
 
     if (timeoutAbort) {
       node.timeout += 1;
+      node.lastError = 'timeout';
+      node.lastErrorKind = 'timeout';
       penalize(node, CONFIG.SCORE_TIMEOUT_DELTA, 'timeout', false);
     } else {
-      penalize(node, CONFIG.SCORE_FAILURE_DELTA, message);
+      penalize(node, CONFIG.SCORE_FAILURE_DELTA, err);
     }
 
     throw err;
@@ -735,7 +760,8 @@ function validateDNSResponse(responseBuffer, expectedID, queryBytes) {
 
   if (qdcount !== 1) return { ok: false, error: 'Unexpected question count in upstream response' };
 
-  let offset = skipDNSName(bytes, 12);
+  const nameContext = createDNSNameContext();
+  let offset = skipDNSName(bytes, 12, nameContext);
   if (offset < 0 || offset + 4 > bytes.length) {
     return { ok: false, error: 'Malformed question in upstream response' };
   }
@@ -749,7 +775,7 @@ function validateDNSResponse(responseBuffer, expectedID, queryBytes) {
   // Every resource record in every section must parse within the packet.
   for (const count of [ancount, nscount, arcount]) {
     for (let i = 0; i < count; i++) {
-      const rr = readResourceRecord(bytes, offset);
+      const rr = readResourceRecord(bytes, offset, nameContext);
       if (!rr) return { ok: false, error: 'Malformed resource record in upstream response' };
       offset = rr.end;
     }
@@ -762,30 +788,59 @@ function validateDNSResponse(responseBuffer, expectedID, queryBytes) {
   return { ok: true, rcode };
 }
 
-// Expands a possibly-compressed DNS name into a lowercased dotted string.
-// Returns null on any malformation: out-of-bounds pointer, loop, or bad label.
-function readDNSName(bytes, offset) {
+// DNS name parsing is deliberately strict:
+// - labels are <= 63 octets;
+// - compressed pointers must point backward to a previously parsed label start;
+// - pointers may not target the 12-byte DNS header;
+// - pointer loops are rejected explicitly;
+// - expanded names are bounded to the 255-octet DNS wire limit.
+// When a nameContext is supplied, compression pointers are also required to
+// target a label boundary that has already been observed in this message.
+function createDNSNameContext() {
+  return { nameOffsets: new Set() };
+}
+
+function readDNSName(bytes, offset, context = null) {
   let pos = offset;
   let jumps = 0;
+  let expandedWireLength = 1; // root terminator
   let name = '';
+  const seenPointers = new Set();
 
   while (pos < bytes.length) {
     const len = bytes[pos];
 
-    if (len === 0) return name;
+    if (len === 0) {
+      if (context) context.nameOffsets.add(pos);
+      return expandedWireLength <= 255 ? name : null;
+    }
 
     if ((len & 0xc0) === 0xc0) {
       if (pos + 1 >= bytes.length) return null;
       const pointer = ((len & 0x3f) << 8) | bytes[pos + 1];
-      if (pointer >= bytes.length) return null;
-      if (++jumps > 127) return null; // loop / excessive indirection
+
+      // RFC 1035 compression replaces a repeated name with a pointer to a
+      // prior occurrence. In a real DNS message, header targets are rejected
+      // and the pointer must land on a previously observed name label boundary.
+      if (pointer >= pos || pointer >= bytes.length) return null;
+      if (context && (pointer < 12 || !context.nameOffsets.has(pointer))) return null;
+      if (seenPointers.has(pointer) || ++jumps > 127) return null;
+
+      seenPointers.add(pointer);
       pos = pointer;
       continue;
     }
 
-    if ((len & 0xc0) !== 0 || pos + 1 + len > bytes.length) return null;
+    if ((len & 0xc0) !== 0 || len > 63 || pos + 1 + len > bytes.length) {
+      return null;
+    }
 
-    for (let i = pos + 1; i <= pos + len; i++) {
+    if (expandedWireLength + len + 1 > 255) return null;
+    expandedWireLength += len + 1;
+
+    if (context) context.nameOffsets.add(pos);
+
+    for (let i = pos + 1; i < pos + 1 + len; i++) {
       let c = bytes[i];
       if (c >= 65 && c <= 90) c += 32;
       name += String.fromCharCode(c);
@@ -850,12 +905,16 @@ function reward(node, latencyMs) {
     ? latencyMs
     : Math.round(node.ewmaLatencyMs * 0.8 + latencyMs * 0.2);
   node.lastError = null;
+  node.lastErrorKind = null;
   node.score = clamp(node.score + CONFIG.SCORE_SUCCESS_DELTA, CONFIG.SCORE_MIN, CONFIG.SCORE_MAX);
 }
 
 function penalize(node, amount, error, countFailure = true) {
   if (countFailure) node.fail += 1;
-  node.lastError = String(error || 'unknown').slice(0, 80);
+  node.lastError = String(error?.message || error || 'unknown').slice(0, 80);
+  node.lastErrorKind = typeof error === 'object' && error?.kind
+    ? String(error.kind).slice(0, 32)
+    : (String(error || '').toLowerCase() === 'timeout' ? 'timeout' : null);
   node.score = clamp(node.score - amount, CONFIG.SCORE_MIN, CONFIG.SCORE_MAX);
 }
 
@@ -944,9 +1003,10 @@ function getDNSCacheTTL(responseBuffer) {
   const nscount = (bytes[8] << 8) | bytes[9];
   const arcount = (bytes[10] << 8) | bytes[11];
 
+  const nameContext = createDNSNameContext();
   let offset = 12;
   for (let i = 0; i < qdcount; i++) {
-    offset = skipDNSName(bytes, offset);
+    offset = skipDNSName(bytes, offset, nameContext);
     if (offset < 0 || offset + 4 > bytes.length) return 0;
     offset += 4;
   }
@@ -966,7 +1026,7 @@ function getDNSCacheTTL(responseBuffer) {
 
   for (const [section, count] of sections) {
     for (let i = 0; i < count; i++) {
-      const rr = readResourceRecord(bytes, offset);
+      const rr = readResourceRecord(bytes, offset, nameContext);
       if (!rr) return 0;
       offset = rr.end;
 
@@ -978,7 +1038,7 @@ function getDNSCacheTTL(responseBuffer) {
       } else if (section === 'authority') {
         authorityMin = Math.min(authorityMin, rr.ttl);
         if (rr.type === 6 && rr.rdLength >= 20) {
-          const minimumOffset = findSOAMinimumOffset(bytes, rr.rdataOffset, rr.rdEnd);
+          const minimumOffset = findSOAMinimumOffset(bytes, rr.rdataOffset, rr.rdEnd, nameContext);
           if (minimumOffset >= 0) {
             soaNegativeMin = Math.min(soaNegativeMin, readUint32(bytes, minimumOffset));
           }
@@ -1004,35 +1064,25 @@ function getDNSCacheTTL(responseBuffer) {
   );
 }
 
-function skipDNSName(bytes, offset) {
-  let pos = offset;
-  let jumps = 0;
-  let wireLength = 1; // Root terminator.
-  let endOffset = -1; // End of the name in the original sequence.
+function skipDNSName(bytes, offset, context = null) {
+  // readDNSName performs the strict semantic/compression validation. We then
+  // walk the original wire representation once to return the first octet
+  // after the encoded name (not the expanded target).
+  if (readDNSName(bytes, offset, context) === null) return -1;
 
+  let pos = offset;
   while (pos < bytes.length) {
     const len = bytes[pos];
 
-    if (len === 0) {
-      if (endOffset < 0) endOffset = pos + 1;
-      return endOffset;
-    }
+    if (len === 0) return pos + 1;
 
     if ((len & 0xc0) === 0xc0) {
-      if (pos + 1 >= bytes.length) return -1;
-      const pointer = ((len & 0x3f) << 8) | bytes[pos + 1];
-      if (pointer >= bytes.length) return -1;
-      if (endOffset < 0) endOffset = pos + 2;
-      // Follow the pointer to validate the target name, with loop detection.
-      if (++jumps > 127) return -1;
-      pos = pointer;
-      continue;
+      return pos + 2;
     }
 
-    if ((len & 0xc0) !== 0 || len > 63 || pos + 1 + len > bytes.length) return -1;
-
-    wireLength += len + 1;
-    if (wireLength > 255) return -1;
+    if ((len & 0xc0) !== 0 || len > 63 || pos + 1 + len > bytes.length) {
+      return -1;
+    }
 
     pos += 1 + len;
   }
@@ -1040,19 +1090,23 @@ function skipDNSName(bytes, offset) {
   return -1;
 }
 
-function readResourceRecord(bytes, offset) {
-  const nameEnd = skipDNSName(bytes, offset);
+function readResourceRecord(bytes, offset, context = null) {
+  const nameEnd = skipDNSName(bytes, offset, context);
   if (nameEnd < 0 || nameEnd + 10 > bytes.length) return null;
 
   const type = (bytes[nameEnd] << 8) | bytes[nameEnd + 1];
+  const rrClass = (bytes[nameEnd + 2] << 8) | bytes[nameEnd + 3];
   const ttl = readUint32(bytes, nameEnd + 4);
   const rdLength = (bytes[nameEnd + 8] << 8) | bytes[nameEnd + 9];
   const rdataOffset = nameEnd + 10;
   const rdEnd = rdataOffset + rdLength;
 
   if (rdEnd > bytes.length) return null;
+  if (!validateRData(bytes, type, rrClass, rdataOffset, rdEnd, context)) return null;
+
   return {
     type,
+    classCode: rrClass,
     ttl,
     rdLength,
     rdataOffset,
@@ -1061,11 +1115,192 @@ function readResourceRecord(bytes, offset) {
   };
 }
 
-function findSOAMinimumOffset(bytes, rdataOffset, rdEnd) {
-  let pos = skipDNSName(bytes, rdataOffset);
+function validateRData(bytes, type, rrClass, rdataOffset, rdEnd, context) {
+  const readName = (offset) => skipDNSName(bytes, offset, context);
+
+  // Fixed-size address records.
+  if (rrClass === 1 && type === 1) return rdEnd - rdataOffset === 4;   // A
+  if (rrClass === 1 && type === 28) return rdEnd - rdataOffset === 16; // AAAA
+
+  // One DNS name in RDATA.
+  if ([2, 3, 4, 5, 7, 8, 9, 12, 39].includes(type)) {
+    const end = readName(rdataOffset);
+    return end >= 0 && end === rdEnd;
+  }
+
+  // Two DNS names in RDATA.
+  if (type === 14 || type === 17) { // MINFO / RP
+    let pos = readName(rdataOffset);
+    if (pos < 0 || pos > rdEnd) return false;
+    pos = readName(pos);
+    return pos >= 0 && pos === rdEnd;
+  }
+
+  // SOA: MNAME + RNAME + SERIAL/REFRESH/RETRY/EXPIRE/MINIMUM.
+  if (type === 6) {
+    let pos = readName(rdataOffset);
+    if (pos < 0 || pos > rdEnd) return false;
+    pos = readName(pos);
+    return pos >= 0 && pos + 20 === rdEnd;
+  }
+
+  // Preference + target name.
+  if ([15, 18, 21, 36].includes(type)) { // MX / AFSDB / RT / KX
+    if (rdataOffset + 2 > rdEnd) return false;
+    const end = readName(rdataOffset + 2);
+    return end >= 0 && end === rdEnd;
+  }
+
+  // SRV: priority, weight, port, target.
+  if (type === 33) {
+    if (rdataOffset + 6 > rdEnd) return false;
+    const end = readName(rdataOffset + 6);
+    return end >= 0 && end === rdEnd;
+  }
+
+  // PX: preference + MAP822 + MAPX400.
+  if (type === 26) {
+    if (rdataOffset + 2 > rdEnd) return false;
+    let pos = readName(rdataOffset + 2);
+    if (pos < 0 || pos > rdEnd) return false;
+    pos = readName(pos);
+    return pos >= 0 && pos === rdEnd;
+  }
+
+  // NAPTR: order + preference + 3 character-strings + replacement name.
+  if (type === 35) {
+    let pos = rdataOffset;
+    if (pos + 4 > rdEnd) return false;
+    pos += 4;
+    for (let i = 0; i < 3; i++) {
+      if (pos >= rdEnd) return false;
+      const length = bytes[pos++];
+      if (pos + length > rdEnd) return false;
+      pos += length;
+    }
+    const end = readName(pos);
+    return end >= 0 && end === rdEnd;
+  }
+
+  // RRSIG: covered type(2), algorithm(1), labels(1), original TTL(4),
+  // signature expiration(4), inception(4), key tag(2), signer name, signature.
+  if (type === 24 || type === 46) { // SIG / RRSIG
+    const fixed = type === 46 ? 18 : 18;
+    if (rdataOffset + fixed > rdEnd) return false;
+    const signerStart = rdataOffset + fixed;
+    const end = readName(signerStart);
+    return end >= 0 && end < rdEnd;
+  }
+
+  // DNSKEY: flags(2), protocol(1), algorithm(1), public key.
+  if (type === 25 || type === 48) { // KEY / DNSKEY
+    return rdEnd - rdataOffset >= 4;
+  }
+
+  // DS: key tag(2), algorithm(1), digest type(1), digest.
+  if (type === 43) {
+    return rdEnd - rdataOffset >= 4;
+  }
+
+  // NSEC: next domain name followed by one or more well-formed bitmap windows.
+  if (type === 47) {
+    let pos = readName(rdataOffset);
+    if (pos < 0 || pos >= rdEnd) return false;
+    let previousWindow = -1;
+    while (pos < rdEnd) {
+      if (pos + 2 > rdEnd) return false;
+      const window = bytes[pos++];
+      const length = bytes[pos++];
+      if (window <= previousWindow || length < 1 || length > 32 || pos + length > rdEnd) return false;
+      previousWindow = window;
+      pos += length;
+    }
+    return pos === rdEnd;
+  }
+
+  // NSEC3: hash algorithm, flags, iterations, salt length + salt,
+  // next-hash length + next hash, then type bitmap.
+  if (type === 50) {
+    if (rdataOffset + 5 > rdEnd) return false;
+    let pos = rdataOffset + 5;
+    const saltLength = bytes[rdataOffset + 4];
+    if (pos + saltLength + 1 > rdEnd) return false;
+    pos += saltLength;
+    const hashLength = bytes[pos++];
+    if (pos + hashLength > rdEnd) return false;
+    pos += hashLength;
+    return pos < rdEnd
+      ? validateTypeBitmap(bytes, pos, rdEnd)
+      : true;
+  }
+
+  // NSEC3PARAM: hash algorithm, flags, iterations, salt length + salt.
+  if (type === 51) {
+    if (rdataOffset + 5 > rdEnd) return false;
+    const saltLength = bytes[rdataOffset + 4];
+    return rdataOffset + 5 + saltLength === rdEnd;
+  }
+
+  // SVCB / HTTPS: priority + target name + sorted key/value service params.
+  if (type === 64 || type === 65) {
+    if (rdataOffset + 2 > rdEnd) return false;
+    let pos = readName(rdataOffset + 2);
+    if (pos < 0 || pos > rdEnd) return false;
+
+    let lastKey = -1;
+    while (pos < rdEnd) {
+      if (pos + 4 > rdEnd) return false;
+      const key = (bytes[pos] << 8) | bytes[pos + 1];
+      const valueLength = (bytes[pos + 2] << 8) | bytes[pos + 3];
+      pos += 4;
+      if (key <= lastKey || pos + valueLength > rdEnd) return false;
+      lastKey = key;
+      pos += valueLength;
+    }
+    return true;
+  }
+
+  // CAA: flags(1), tag length(1), tag, value.
+  if (type === 257) {
+    if (rdataOffset + 2 > rdEnd) return false;
+    const tagLength = bytes[rdataOffset + 1];
+    return rdataOffset + 2 + tagLength <= rdEnd;
+  }
+
+  // TLSA / SMIMEA: usage(1), selector(1), matching type(1), association data.
+  if (type === 52 || type === 53) {
+    return rdEnd - rdataOffset >= 3;
+  }
+
+  // URI: priority(2), weight(2), target octets.
+  if (type === 256) {
+    return rdEnd - rdataOffset >= 4;
+  }
+
+  // Unknown/private RR types remain opaque, but the RR owner/name and RDLENGTH
+  // boundary are always validated by readResourceRecord.
+  return true;
+}
+
+function validateTypeBitmap(bytes, offset, end) {
+  let pos = offset;
+  let previousWindow = -1;
+  while (pos < end) {
+    if (pos + 2 > end) return false;
+    const window = bytes[pos++];
+    const length = bytes[pos++];
+    if (window <= previousWindow || length < 1 || length > 32 || pos + length > end) return false;
+    previousWindow = window;
+    pos += length;
+  }
+  return pos === end;
+}
+
+function findSOAMinimumOffset(bytes, rdataOffset, rdEnd, context = null) {
+  let pos = skipDNSName(bytes, rdataOffset, context);
   if (pos < 0 || pos >= rdEnd) return -1;
-  pos = skipDNSName(bytes, pos);
-  if (pos < 0 || pos + 20 > rdEnd) return -1;
+  pos = skipDNSName(bytes, pos, context);
+  if (pos < 0 || pos + 20 !== rdEnd) return -1;
   return rdEnd - 4;
 }
 
@@ -1114,9 +1349,10 @@ function patchDNSResponseForAge(responseBuffer, queryID, ageSeconds, queryBytes)
   const nscount = (copy[8] << 8) | copy[9];
   const arcount = (copy[10] << 8) | copy[11];
 
+  const nameContext = createDNSNameContext();
   let offset = 12;
   for (let i = 0; i < qdcount; i++) {
-    offset = skipDNSName(copy, offset);
+    offset = skipDNSName(copy, offset, nameContext);
     if (offset < 0 || offset + 4 > copy.length) return copy.buffer;
     offset += 4;
   }
@@ -1124,7 +1360,7 @@ function patchDNSResponseForAge(responseBuffer, queryID, ageSeconds, queryBytes)
   const counts = [ancount, nscount, arcount];
   for (const count of counts) {
     for (let i = 0; i < count; i++) {
-      const rr = readResourceRecord(copy, offset);
+      const rr = readResourceRecord(copy, offset, nameContext);
       if (!rr) return copy.buffer;
       // OPT (TYPE 41) uses its 32-bit field for extended RCODE/version/flags,
       // not a DNS TTL. Leave it untouched.
@@ -1365,7 +1601,15 @@ export const __internals = {
   localRateLimit,
   selectRacers,
   resolveWithParallelRace,
-  isBetterDegraded
+  isBetterDegraded,
+  relay,
+  resolveWithParallelRace,
+  getCache,
+  setCache,
+  getEdgeCache,
+  putEdgeCache,
+  allowDNSRequest,
+  APP_STATE
 };
 
 const UI_RESPONSE_CACHE = new Map();

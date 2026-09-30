@@ -80,8 +80,8 @@ test('parseDNSQuestion accepts a valid EDNS OPT record', () => {
   assert.equal(dns.parseDNSQuestion(buildQuery(1, 'example.com', 1, 1, optRecord())).ok, true);
 });
 
-test('skipDNSName follows pointers, rejects out-of-bounds pointers and loops', () => {
-  assert.equal(dns.skipDNSName(Uint8Array.from([1, 0x61, 0xc0, 0x04, 1, 0x62, 0x00]), 0), 4);
+test('skipDNSName follows backward pointers, rejects out-of-bounds pointers and loops', () => {
+  assert.equal(dns.skipDNSName(Uint8Array.from([0x00, 1, 0x61, 0x00, 0xc0, 0x00]), 4), 6);
   assert.equal(dns.skipDNSName(Uint8Array.from([1, 0x61, 0xc0, 0x3f, 1, 0x62, 0x00]), 0), -1);
   assert.equal(dns.skipDNSName(Uint8Array.from([0xc0, 0x00]), 0), -1);
   assert.equal(dns.skipDNSName(Uint8Array.from([1, 0x61, 0xc0, 0x02, 0x00]), 0), -1); // mutual loop
@@ -156,4 +156,405 @@ test('cache keys ignore case and transaction ID', async () => {
   const a = await dns.makeCacheKey(buildQuery(1, 'example.com'));
   const b = await dns.makeCacheKey(buildQuery(999, 'EXAMPLE.COM'));
   assert.equal(a, b);
+});
+
+
+function rr(owner, type, rdata, ttl = 60, rrClass = 1) {
+  return [
+    ...owner,
+    type >> 8, type & 0xff,
+    rrClass >> 8, rrClass & 0xff,
+    ttl >>> 24, (ttl >>> 16) & 0xff, (ttl >>> 8) & 0xff, ttl & 0xff,
+    rdata.length >> 8, rdata.length & 0xff,
+    ...rdata
+  ];
+}
+
+function compressedOwner() {
+  return [0xc0, 0x0c]; // points at the query QNAME
+}
+
+function aaaaRData() {
+  return [
+    0x20,0x01,0x0d,0xb8,0x00,0x00,0x00,0x00,
+    0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x01
+  ];
+}
+
+function rrsigRData() {
+  return [
+    0x00,0x01, // covered A
+    0x08,     // algorithm
+    0x03,     // labels
+    0x00,0x00,0x00,0x3c, // original TTL
+    0x65,0x53,0x12,0x34, // expiration
+    0x65,0x52,0x12,0x34, // inception
+    0x12,0x34, // key tag
+    0xc0,0x0c, // signer name
+    0xaa,0xbb // tiny synthetic signature
+  ];
+}
+
+function dnskeyRData() {
+  return [0x01,0x00,0x03,0x0d,0xaa,0xbb,0xcc,0xdd];
+}
+
+function dsRData() {
+  return [0x12,0x34,0x08,0x02,0xaa,0xbb,0xcc,0xdd];
+}
+
+function nsecRData() {
+  // Next name = example.com., then window 0, two-byte bitmap with A set.
+  return [0xc0,0x0c,0x00,0x02,0x40,0x00];
+}
+
+function mxRData() {
+  return [0x00,0x0a,0xc0,0x0c];
+}
+
+function srvRData() {
+  return [0x00,0x00,0x00,0x05,0x01,0xbb,0xc0,0x0c];
+}
+
+test('validateDNSResponse handles compressed owner names across answer, authority, and additional sections', () => {
+  const query = buildQuery(0x1010);
+  const owner = compressedOwner();
+  const a = rr(owner, 1, [1,2,3,4]);
+  const ns = rr(owner, 2, [0xc0,0x0c]);
+
+  const response = buildResponse(query, {
+    answers: [a],
+    authority: [ns],
+    additional: [rr(owner, 28, aaaaRData())]
+  });
+
+  const result = dns.validateDNSResponse(response.buffer, 0x1010, query);
+  assert.equal(result.ok, true);
+});
+
+test('validateDNSResponse rejects malformed compression pointers in every RR section', () => {
+  const query = buildQuery(0x1111);
+  const malformedOwner = [0xc0, 0xff]; // out of message bounds
+  const malformed = rr(malformedOwner, 1, [1,2,3,4]);
+
+  for (const section of ['answers', 'authority', 'additional']) {
+    const opts = { answers: [], authority: [], additional: [] };
+    opts[section] = [malformed];
+    const response = buildResponse(query, opts);
+    assert.equal(
+      dns.validateDNSResponse(response.buffer, 0x1111, query).ok,
+      false,
+      `malformed owner should fail in ${section}`
+    );
+  }
+});
+
+test('compression pointers must target prior parsed label boundaries', () => {
+  const query = buildQuery(0x1212);
+  const header = [
+    query[0], query[1], 0x81, 0x80,
+    0x00,0x01,0x00,0x01,0x00,0x00,0x00,0x00
+  ];
+
+  // Answer owner starts at offset 29. Pointer target 40 is inside the answer,
+  // is forward, and is therefore not a valid prior-name compression target.
+  const forwardOwner = [0xc0,0x28];
+  const response = Uint8Array.from([
+    ...header,
+    ...query.slice(12),
+    ...rr(forwardOwner, 1, [1,2,3,4])
+  ]);
+
+  assert.equal(dns.validateDNSResponse(response.buffer, 0x1212, query).ok, false);
+});
+
+test('malformed and boundary-crossing SOA records are rejected', () => {
+  const query = buildQuery(0x1313);
+
+  // Valid compressed SOA: both MNAME and RNAME point at the query QNAME.
+  const validSoa = rr(compressedOwner(), 6, [
+    0xc0,0x0c,
+    0xc0,0x0c,
+    0,0,0,1,  0,0,0,2,  0,0,0,3,  0,0,0,4,  0,0,0,30
+  ]);
+  assert.equal(dns.validateDNSResponse(
+    buildResponse(query, { rcode: 3, authority: [validSoa] }).buffer,
+    0x1313,
+    query
+  ).ok, true);
+
+  // RDLENGTH says the SOA stops before the final 20-byte numeric fields.
+  const truncatedSoa = rr(compressedOwner(), 6, [
+    0xc0,0x0c,
+    0xc0,0x0c,
+    0,0,0,1,  0,0,0,2, 0,0,0,3
+  ]);
+  assert.equal(dns.validateDNSResponse(
+    buildResponse(query, { rcode: 3, authority: [truncatedSoa] }).buffer,
+    0x1313,
+    query
+  ).ok, false);
+
+  // The second SOA name uses a forward/self boundary into its own RDATA.
+  const malformedSoa = rr(compressedOwner(), 6, [
+    0xc0,0x0c,
+    0xc0,0x4a,
+    ...new Array(20).fill(0)
+  ]);
+  assert.equal(dns.validateDNSResponse(
+    buildResponse(query, { rcode: 3, authority: [malformedSoa] }).buffer,
+    0x1313,
+    query
+  ).ok, false);
+});
+
+test('malformed compressed names inside name-bearing RDATA are rejected in every RR section', () => {
+  const query = buildQuery(0x1a1a);
+  const badCname = rr(compressedOwner(), 5, [0xc0,0xff]); // CNAME target OOB.
+
+  for (const section of ['answers', 'authority', 'additional']) {
+    const opts = { answers: [], authority: [], additional: [] };
+    opts[section] = [badCname];
+    const response = buildResponse(query, opts);
+    assert.equal(
+      dns.validateDNSResponse(response.buffer, 0x1a1a, query).ok,
+      false,
+      `malformed RDATA name should fail in ${section}`
+    );
+  }
+});
+
+test('DNSSEC-heavy and IPv6/other-type responses remain valid and cacheable', () => {
+  const query = buildQuery(0x1414, 'example.com', 28);
+  const owner = compressedOwner();
+
+  const response = buildResponse(query, {
+    answers: [
+      rr(owner, 28, aaaaRData(), 120),   // AAAA
+      rr(owner, 15, mxRData(), 180),      // MX
+      rr(owner, 33, srvRData(), 240),     // SRV
+      rr(owner, 43, dsRData(), 300),      // DS
+      rr(owner, 46, rrsigRData(), 300),   // RRSIG
+      rr(owner, 48, dnskeyRData(), 300),  // DNSKEY
+      rr(owner, 47, nsecRData(), 300)     // NSEC
+    ]
+  });
+
+  const validated = dns.validateDNSResponse(response.buffer, 0x1414, query);
+  assert.equal(validated.ok, true);
+  assert.equal(dns.getDNSCacheTTL(response.buffer), 120);
+});
+
+test('expanded compressed names are rejected when they exceed the DNS 255-octet name limit', () => {
+  const labels = new Array(4).fill(null).map(() => 'a'.repeat(63));
+  const longName = encodeName(labels.join('.'));
+  const bytes = Uint8Array.from(longName);
+  assert.equal(dns.readDNSName(bytes, 0), null);
+  assert.equal(dns.skipDNSName(bytes, 0), -1);
+});
+
+test('L1 cache expires entries and evicts the least-recently-used item', () => {
+  const previousMax = dns.CONFIG.MAX_CACHE_ENTRIES;
+  dns.CONFIG.MAX_CACHE_ENTRIES = 2;
+  dns.APP_STATE.cache.clear();
+
+  dns.setCache('expired', new ArrayBuffer(0), 10, Date.now() - 11_000);
+  assert.equal(dns.getCache('expired'), null);
+
+  dns.setCache('a', new ArrayBuffer(1), 60);
+  dns.setCache('b', new ArrayBuffer(1), 60);
+  assert.ok(dns.getCache('a')); // refresh A to MRU
+  dns.setCache('c', new ArrayBuffer(1), 60);
+
+  assert.ok(dns.getCache('a'));
+  assert.equal(dns.getCache('b'), null);
+  assert.ok(dns.getCache('c'));
+
+  dns.APP_STATE.cache.clear();
+  dns.CONFIG.MAX_CACHE_ENTRIES = previousMax;
+});
+
+test('timeout classification increments timeout without counting it as a generic failure', async () => {
+  const realFetch = globalThis.fetch;
+  const previousTimeout = dns.CONFIG.UPSTREAM_TIMEOUT_MS;
+  dns.CONFIG.UPSTREAM_TIMEOUT_MS = 20;
+
+  const node = {
+    url: 'https://timeout.test/dns-query',
+    order: 0,
+    score: 100,
+    ok: 0,
+    fail: 0,
+    timeout: 0,
+    lastLatencyMs: null,
+    ewmaLatencyMs: null,
+    lastError: null,
+    lastErrorKind: null
+  };
+
+  globalThis.fetch = async (_url, { signal } = {}) => {
+    await new Promise((resolve, reject) => {
+      const timer = setTimeout(resolve, 500);
+      signal?.addEventListener('abort', () => {
+        clearTimeout(timer);
+        reject(new DOMException('Aborted', 'AbortError'));
+      }, { once: true });
+    });
+    return new Response(new Uint8Array());
+  };
+
+  try {
+    await assert.rejects(
+      () => dns.relay(node, buildQuery(0x1515), 0x1515, new AbortController().signal)
+    );
+    assert.equal(node.timeout, 1);
+    assert.equal(node.fail, 0);
+    assert.equal(node.lastError, 'timeout');
+    assert.equal(node.lastErrorKind, 'timeout');
+  } finally {
+    globalThis.fetch = realFetch;
+    dns.CONFIG.UPSTREAM_TIMEOUT_MS = previousTimeout;
+  }
+});
+
+test('HTTP errors and content-type failures are classified distinctly from DNS-invalid payloads', async () => {
+  const realFetch = globalThis.fetch;
+  const makeNode = () => ({
+    url: 'https://failure.test/dns-query',
+    order: 0,
+    score: 100,
+    ok: 0,
+    fail: 0,
+    timeout: 0,
+    lastLatencyMs: null,
+    ewmaLatencyMs: null,
+    lastError: null,
+    lastErrorKind: null
+  });
+
+  try {
+    let node = makeNode();
+    globalThis.fetch = async () => new Response('bad gateway', { status: 503 });
+    await assert.rejects(() => dns.relay(node, buildQuery(0x1616), 0x1616, null));
+    assert.match(node.lastError, /^Upstream HTTP 503/);
+    assert.equal(node.lastErrorKind, 'http');
+
+    node = makeNode();
+    globalThis.fetch = async () => new Response('<html>oops</html>', {
+      status: 200,
+      headers: { 'content-type': 'text/html' }
+    });
+    await assert.rejects(() => dns.relay(node, buildQuery(0x1717), 0x1717, null));
+    assert.equal(node.lastError, 'Upstream returned an invalid content type');
+    assert.equal(node.lastErrorKind, 'content-type');
+
+    node = makeNode();
+    globalThis.fetch = async () => new Response(
+      new ReadableStream({
+        start(controller) {
+          controller.enqueue(new Uint8Array(60_000));
+          controller.enqueue(new Uint8Array(6_000));
+          controller.close();
+        }
+      }),
+      { status: 200, headers: { 'content-type': 'application/dns-message' } }
+    );
+    await assert.rejects(() => dns.relay(node, buildQuery(0x1818), 0x1818, null));
+    assert.equal(node.lastError, 'Upstream DNS response too large');
+    assert.equal(node.lastErrorKind, 'response-too-large');
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test('NXDOMAIN vs NOERROR race timing respects the grace window', async () => {
+  const realFetch = globalThis.fetch;
+  const previousGrace = dns.CONFIG.NXDOMAIN_GRACE_MS;
+  const previousTimeout = dns.CONFIG.UPSTREAM_TIMEOUT_MS;
+  dns.CONFIG.NXDOMAIN_GRACE_MS = 60;
+  dns.CONFIG.UPSTREAM_TIMEOUT_MS = 500;
+
+  const makeNode = (url, order) => ({
+    url, order,
+    score: 100,
+    ok: 0,
+    fail: 0,
+    timeout: 0,
+    lastLatencyMs: null,
+    ewmaLatencyMs: null,
+    lastError: null,
+    lastErrorKind: null
+  });
+
+  const nodes = [
+    makeNode('https://race/nxdomain', 0),
+    makeNode('https://race/noerror-fast', 1),
+    makeNode('https://race/noerror-slow', 2)
+  ];
+  const query = buildQuery(0x1919);
+
+  try {
+    globalThis.fetch = async (url, { signal } = {}) => {
+      const slow = String(url).endsWith('noerror-slow');
+      const nx = String(url).endsWith('nxdomain');
+      const delay = nx ? 0 : (slow ? 140 : 20);
+      await new Promise((resolve, reject) => {
+        const timer = setTimeout(resolve, delay);
+        signal?.addEventListener('abort', () => {
+          clearTimeout(timer);
+          reject(new DOMException('Aborted', 'AbortError'));
+        }, { once: true });
+      });
+
+      if (nx) {
+        const body = buildResponse(query, { rcode: 3 });
+        return new Response(body, {
+          status: 200,
+          headers: { 'content-type': 'application/dns-message' }
+        });
+      }
+
+      const body = buildResponse(query, { answers: [aRecord('1.2.3.4')] });
+      return new Response(body, {
+        status: 200,
+        headers: { 'content-type': 'application/dns-message' }
+      });
+    };
+
+    const early = await dns.resolveWithParallelRace(nodes, query, 0x1919);
+    assert.equal(early.rcode, 0);
+
+    const lateNodes = [
+      makeNode('https://race/nxdomain', 0),
+      makeNode('https://race/noerror-slow-a', 1),
+      makeNode('https://race/noerror-slow-b', 2)
+    ];
+
+    globalThis.fetch = async (url, { signal } = {}) => {
+      const nx = String(url).endsWith('nxdomain');
+      const delay = nx ? 0 : 140;
+      await new Promise((resolve, reject) => {
+        const timer = setTimeout(resolve, delay);
+        signal?.addEventListener('abort', () => {
+          clearTimeout(timer);
+          reject(new DOMException('Aborted', 'AbortError'));
+        }, { once: true });
+      });
+
+      const body = buildResponse(query, nx ? { rcode: 3 } : {
+        answers: [aRecord('9.9.9.9')]
+      });
+      return new Response(body, {
+        status: 200,
+        headers: { 'content-type': 'application/dns-message' }
+      });
+    };
+
+    const late = await dns.resolveWithParallelRace(lateNodes, query, 0x1919);
+    assert.equal(late.rcode, 3);
+  } finally {
+    globalThis.fetch = realFetch;
+    dns.CONFIG.NXDOMAIN_GRACE_MS = previousGrace;
+    dns.CONFIG.UPSTREAM_TIMEOUT_MS = previousTimeout;
+  }
 });
