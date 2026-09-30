@@ -1,10 +1,10 @@
 /**
- * VERSION: 0.2.2
- * GITHUB: https://github.com/anT0ny54/DOH-Cloudflare-Worker
+ * VERSION: 0.3.0
+ * GITHUB: https://github.com/t0ny54/DOH-Endpoints-Cloudflare-Worker
  * Runtime: Cloudflare Workers Module Syntax
  */
 
-const VERSION = '0.2.2';
+const VERSION = '0.3.0';
 
 const CONFIG = {
   DNS_PATH: '/dns-query',
@@ -21,8 +21,9 @@ const CONFIG = {
   EDGE_CACHE_MAX_TTL_SECONDS: 86_400,
   EDGE_CACHE_MIN_TTL_SECONDS: 1,
   MAX_CACHE_ENTRIES: 512,
-  // Bound duplicate-resolution state without allowing an attacker to retain
-  // hundreds of large promise/result objects during a burst.
+  // Bound duplicate-resolution state. When the map is full, new cold
+  // resolutions are rejected with 503 instead of evicting live jobs, so
+  // request coalescing is never broken mid-flight.
   MAX_INFLIGHT_ENTRIES: 128,
 
   // Preferred: Cloudflare's native Rate Limiting binding (100/60s per IP).
@@ -40,14 +41,14 @@ const CONFIG = {
   // Upstream DoH responses may legitimately be larger than client queries, but
   // they must still be bounded before being buffered by the Worker.
   MAX_UPSTREAM_DNS_MESSAGE_BYTES: 65_535,
-  // A DNS message cannot exceed 64 KiB, so anything larger is never cached.
-  // Keep the upstream buffer at the DNS wire-format maximum as well, avoiding
-  // a needlessly large per-request memory ceiling on the 128 MB isolate.
-  MAX_CACHEABLE_DNS_BYTES: 65_535,
 
   // All three configured upstreams are started in parallel for every cold
   // lookup; the first usable DNS response wins.
   UPSTREAM_TIMEOUT_MS: 1200,
+  // When the first usable answer is NXDOMAIN, keep racing this long for a
+  // possibly-valid NOERROR before settling, so one stale or filtered upstream
+  // cannot cause false negatives (which could then be cached).
+  NXDOMAIN_GRACE_MS: 200,
 
   SCORE_START: 100,
   SCORE_MIN: 0,
@@ -56,6 +57,11 @@ const CONFIG = {
   SCORE_FAILURE_DELTA: 12,
   SCORE_TIMEOUT_DELTA: 8
 };
+
+// A DNS message cannot exceed 64 KiB, and only responses within the upstream
+// buffering limit are ever cacheable. Derive the cacheable limit from the
+// upstream limit so the two settings can never drift apart.
+const MAX_CACHEABLE_DNS_BYTES = Math.min(CONFIG.MAX_UPSTREAM_DNS_MESSAGE_BYTES, 65_535);
 
 const DOH_UPSTREAMS = [
   'https://freedns.koyeb.app/dns-query',
@@ -187,6 +193,16 @@ async function handleDNS(req, url, ctx) {
     return coalescedDNSResponse(shared, parsed, payload);
   }
 
+  // Never evict unresolved jobs: trimming the in-flight map would break
+  // coalescing and multiply upstream traffic during bursts. When the map is
+  // full, reject the new resolution instead.
+  if (APP_STATE.inflight.size >= CONFIG.MAX_INFLIGHT_ENTRIES) {
+    return textResponse('Resolver busy, please retry', 503, {
+      'cache-control': 'no-store',
+      'retry-after': '1'
+    });
+  }
+
   const resolvers = selectRacers(RESOLVER_NODES);
   const job = (async () => {
     const result = await resolveWithParallelRace(resolvers, payload, parsed.id);
@@ -223,13 +239,11 @@ async function handleDNS(req, url, ctx) {
     return {
       ...result,
       body: normalizedBody,
-      ttlSeconds,
       storedAt
     };
   })();
 
   APP_STATE.inflight.set(cacheKey, job);
-  trimMap(APP_STATE.inflight, CONFIG.MAX_INFLIGHT_ENTRIES);
 
   try {
     const result = await job;
@@ -262,7 +276,6 @@ async function awaitSharedResolution(job) {
 
 function toUpstreamFailure(err) {
   const failure = new Error('Global resolving failed');
-  failure.status = 502;
   failure.attempts = err?.attempts || 0;
   return failure;
 }
@@ -413,6 +426,7 @@ function parseDNSQuestion(packet) {
   const qdcount = (bytes[4] << 8) | bytes[5];
   const ancount = (bytes[6] << 8) | bytes[7];
   const nscount = (bytes[8] << 8) | bytes[9];
+  const arcount = (bytes[10] << 8) | bytes[11];
 
   if ((flags & 0x8000) !== 0) {
     return { ok: false, error: 'DNS query expected, got response' };
@@ -431,8 +445,22 @@ function parseDNSQuestion(packet) {
     return { ok: false, error: 'Incomplete DNS question' };
   }
 
-  // Only the ID is needed by the resolver/cache hot path. Additional sections,
-  // including EDNS options, remain part of the wire query and cache key.
+  // Additional records (typically a single EDNS OPT record) are allowed, but
+  // every one must parse as a structurally valid resource record and the
+  // message must end exactly after the last one. Arbitrary trailing bytes are
+  // rejected instead of being forwarded upstream or baked into cache keys.
+  let offset = questionEnd + 4;
+  for (let i = 0; i < arcount; i++) {
+    const rr = readResourceRecord(bytes, offset);
+    if (!rr) return { ok: false, error: 'Malformed additional record in DNS query' };
+    offset = rr.end;
+  }
+  if (offset !== bytes.length) {
+    return { ok: false, error: 'Unexpected trailing data in DNS query' };
+  }
+
+  // Only the ID is needed by the resolver/cache hot path. EDNS options remain
+  // part of the wire query and cache key.
   return { ok: true, id, questionEnd };
 }
 
@@ -472,10 +500,13 @@ async function resolveWithParallelRace(nodes, packet, expectedID) {
   const controllers = new Map();
   const active = new Map();
   const attempts = [];
-  let fallback = null;
+  let fallback = null;       // best degraded (SERVFAIL/REFUSED/...) answer so far
+  let fallbackNode = null;
+  let nxdomain = null;       // held NXDOMAIN candidate awaiting a possible NOERROR
+  let nxdomainDeadline = 0;
 
-  // Start every configured upstream immediately. The first usable DNS response
-  // wins; in-flight losers are aborted to avoid unnecessary work.
+  // Start every configured upstream immediately. The first usable NOERROR
+  // response wins; in-flight losers are aborted to avoid unnecessary work.
   const startAttempt = (node) => {
     const controller = new AbortController();
     controllers.set(node, controller);
@@ -490,15 +521,34 @@ async function resolveWithParallelRace(nodes, packet, expectedID) {
 
   for (const node of nodes) startAttempt(node);
 
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
   try {
     while (active.size) {
-      const result = await Promise.race(active.values());
+      let result;
+      if (nxdomain && nxdomainDeadline > Date.now()) {
+        // While holding an NXDOMAIN candidate, bound how long we keep waiting
+        // for a possibly-valid NOERROR from a slower upstream.
+        result = await Promise.race([
+          ...active.values(),
+          sleep(nxdomainDeadline - Date.now())
+        ]);
+      } else {
+        result = await Promise.race(active.values());
+      }
+
+      if (!result || !result.node) {
+        // Grace timer expired: settle for the held NXDOMAIN. Remaining losers
+        // are aborted in the finally block.
+        break;
+      }
+
       active.delete(result.node);
 
       if (result.ok) {
         const value = result.value;
 
-        if (value.usable) {
+        if (value.usable && value.rcode === 0) {
           abortAttempts(controllers, result.node);
           return {
             ...value,
@@ -506,10 +556,33 @@ async function resolveWithParallelRace(nodes, packet, expectedID) {
           };
         }
 
-        // Keep a valid degraded DNS answer as the final fallback if every
+        if (value.usable && value.rcode === 3) {
+          // NXDOMAIN is only accepted after the grace period expires without
+          // a NOERROR, or once all upstreams have settled. The first NXDOMAIN
+          // is held; later duplicates do not replace it.
+          if (!nxdomain) {
+            nxdomain = value;
+            nxdomainDeadline = Date.now() + CONFIG.NXDOMAIN_GRACE_MS;
+          }
+          continue;
+        }
+
+        // Keep the best degraded DNS answer as the final fallback if every
         // upstream returns a non-usable RCODE such as SERVFAIL or REFUSED.
-        fallback = value;
+        // Selection is deterministic: SERVFAIL first, then the highest-scored
+        // upstream, then the fastest response.
+        if (!fallback || isBetterDegraded(value, result.node, fallback, fallbackNode)) {
+          fallback = value;
+          fallbackNode = result.node;
+        }
       }
+    }
+
+    if (nxdomain) {
+      return {
+        ...nxdomain,
+        attempts: attempts.length
+      };
     }
 
     if (fallback) {
@@ -527,6 +600,12 @@ async function resolveWithParallelRace(nodes, packet, expectedID) {
   }
 }
 
+function isBetterDegraded(value, node, bestValue, bestNode) {
+  if (value.rcode !== bestValue.rcode) return value.rcode === 2; // prefer SERVFAIL
+  if (node.score !== bestNode.score) return node.score > bestNode.score;
+  return value.latencyMs < bestValue.latencyMs;
+}
+
 function abortAttempts(controllers, winnerNode) {
   for (const [node, controller] of controllers) {
     if (!winnerNode || node !== winnerNode) {
@@ -539,7 +618,7 @@ async function relay(node, packet, expectedID, signal) {
   const started = Date.now();
   const timeoutController = new AbortController();
   const timeout = setTimeout(() => timeoutController.abort('timeout'), CONFIG.UPSTREAM_TIMEOUT_MS);
-  const combinedSignal = anySignal([signal, timeoutController.signal]);
+  const combinedSignal = combineSignals(signal, timeoutController.signal);
 
   try {
     const res = await fetch(node.url, {
@@ -559,6 +638,14 @@ async function relay(node, packet, expectedID, signal) {
       throw new Error(`Upstream HTTP ${res.status}`);
     }
 
+    // Require a compatible content type when the upstream sends one; a bare
+    // HTTP error page must never be interpreted as a DNS message.
+    const contentType = res.headers.get('content-type') || '';
+    if (contentType && !contentType.toLowerCase().startsWith('application/dns-message')) {
+      discardBody(res);
+      throw new Error('Upstream returned an invalid content type');
+    }
+
     const declaredLength = Number(res.headers.get('content-length'));
     if (
       Number.isFinite(declaredLength)
@@ -574,7 +661,7 @@ async function relay(node, packet, expectedID, signal) {
       'Upstream DNS response too large'
     );
     const body = bodyBytes.buffer;
-    const validation = validateDNSResponse(body, expectedID);
+    const validation = validateDNSResponse(body, expectedID, packet);
 
     if (!validation.ok) {
       throw new Error(validation.error);
@@ -600,7 +687,10 @@ async function relay(node, packet, expectedID, signal) {
     };
   } catch (err) {
     const message = String(err && err.message ? err.message : err);
-    const raceAbort = signal?.aborted && !timeoutController.signal.aborted;
+    // Losers are aborted with an explicit 'winner-selected' reason, so a race
+    // abort is never misclassified as a timeout even when the timeout and
+    // winner abort fire close together.
+    const raceAbort = signal?.aborted && signal.reason === 'winner-selected';
     const timeoutAbort = timeoutController.signal.aborted
       || message.toLowerCase().includes('timeout');
 
@@ -625,7 +715,7 @@ function discardBody(res) {
   try { res.body?.cancel().catch(() => {}); } catch (_) {}
 }
 
-function validateDNSResponse(responseBuffer, expectedID) {
+function validateDNSResponse(responseBuffer, expectedID, queryBytes) {
   const bytes = new Uint8Array(responseBuffer);
 
   if (bytes.length < 12) return { ok: false, error: 'Upstream returned short DNS response' };
@@ -636,8 +726,100 @@ function validateDNSResponse(responseBuffer, expectedID) {
 
   if (id !== expectedID) return { ok: false, error: 'Upstream response ID mismatch' };
   if ((flags & 0x8000) === 0) return { ok: false, error: 'Upstream returned a DNS query, not response' };
+  if ((flags & 0x7800) !== 0) return { ok: false, error: 'Unexpected DNS opcode in upstream response' };
+
+  const qdcount = (bytes[4] << 8) | bytes[5];
+  const ancount = (bytes[6] << 8) | bytes[7];
+  const nscount = (bytes[8] << 8) | bytes[9];
+  const arcount = (bytes[10] << 8) | bytes[11];
+
+  if (qdcount !== 1) return { ok: false, error: 'Unexpected question count in upstream response' };
+
+  let offset = skipDNSName(bytes, 12);
+  if (offset < 0 || offset + 4 > bytes.length) {
+    return { ok: false, error: 'Malformed question in upstream response' };
+  }
+
+  // The echoed question must match the original query (name, type, class).
+  if (!questionMatchesQuery(bytes, queryBytes)) {
+    return { ok: false, error: 'Upstream response question does not match the query' };
+  }
+  offset += 4;
+
+  // Every resource record in every section must parse within the packet.
+  for (const count of [ancount, nscount, arcount]) {
+    for (let i = 0; i < count; i++) {
+      const rr = readResourceRecord(bytes, offset);
+      if (!rr) return { ok: false, error: 'Malformed resource record in upstream response' };
+      offset = rr.end;
+    }
+  }
+
+  if (offset !== bytes.length) {
+    return { ok: false, error: 'Trailing bytes in upstream response' };
+  }
 
   return { ok: true, rcode };
+}
+
+// Expands a possibly-compressed DNS name into a lowercased dotted string.
+// Returns null on any malformation: out-of-bounds pointer, loop, or bad label.
+function readDNSName(bytes, offset) {
+  let pos = offset;
+  let jumps = 0;
+  let name = '';
+
+  while (pos < bytes.length) {
+    const len = bytes[pos];
+
+    if (len === 0) return name;
+
+    if ((len & 0xc0) === 0xc0) {
+      if (pos + 1 >= bytes.length) return null;
+      const pointer = ((len & 0x3f) << 8) | bytes[pos + 1];
+      if (pointer >= bytes.length) return null;
+      if (++jumps > 127) return null; // loop / excessive indirection
+      pos = pointer;
+      continue;
+    }
+
+    if ((len & 0xc0) !== 0 || pos + 1 + len > bytes.length) return null;
+
+    for (let i = pos + 1; i <= pos + len; i++) {
+      let c = bytes[i];
+      if (c >= 65 && c <= 90) c += 32;
+      name += String.fromCharCode(c);
+    }
+    name += '.';
+    pos += 1 + len;
+  }
+
+  return null;
+}
+
+function questionMatchesQuery(responseBytes, queryBytes) {
+  if (!queryBytes || queryBytes.byteLength < 12) return true; // nothing to compare
+
+  const rName = readDNSName(responseBytes, 12);
+  const qName = readDNSName(queryBytes, 12);
+  if (rName === null || qName === null || rName !== qName) return false;
+
+  const rEnd = skipDNSName(responseBytes, 12);
+  const qEnd = skipDNSName(queryBytes, 12);
+  if (rEnd < 0 || qEnd < 0 || rEnd + 4 > responseBytes.length || qEnd + 4 > queryBytes.length) {
+    return false;
+  }
+
+  for (let i = 0; i < 4; i++) {
+    if (responseBytes[rEnd + i] !== queryBytes[qEnd + i]) return false; // QTYPE + QCLASS
+  }
+  return true;
+}
+
+function combineSignals(signal, timeoutSignal) {
+  const signals = signal ? [signal, timeoutSignal] : [timeoutSignal];
+  if (typeof AbortSignal.any === 'function') return AbortSignal.any(signals);
+  return anySignal(signals);
 }
 
 function anySignal(signals) {
@@ -748,7 +930,7 @@ function cappedTTL(ttlSeconds, maxSeconds) {
 
 function getDNSCacheTTL(responseBuffer) {
   const bytes = new Uint8Array(responseBuffer);
-  if (bytes.length < 12 || bytes.length > CONFIG.MAX_CACHEABLE_DNS_BYTES) return 0;
+  if (bytes.length < 12 || bytes.length > MAX_CACHEABLE_DNS_BYTES) return 0;
 
   const flags = (bytes[2] << 8) | bytes[3];
   if ((flags & 0x8000) === 0) return 0;
@@ -826,14 +1008,25 @@ function skipDNSName(bytes, offset) {
   let pos = offset;
   let jumps = 0;
   let wireLength = 1; // Root terminator.
+  let endOffset = -1; // End of the name in the original sequence.
 
   while (pos < bytes.length) {
     const len = bytes[pos];
-    if (len === 0) return pos + 1;
+
+    if (len === 0) {
+      if (endOffset < 0) endOffset = pos + 1;
+      return endOffset;
+    }
 
     if ((len & 0xc0) === 0xc0) {
       if (pos + 1 >= bytes.length) return -1;
-      return pos + 2;
+      const pointer = ((len & 0x3f) << 8) | bytes[pos + 1];
+      if (pointer >= bytes.length) return -1;
+      if (endOffset < 0) endOffset = pos + 2;
+      // Follow the pointer to validate the target name, with loop detection.
+      if (++jumps > 127) return -1;
+      pos = pointer;
+      continue;
     }
 
     if ((len & 0xc0) !== 0 || len > 63 || pos + 1 + len > bytes.length) return -1;
@@ -842,7 +1035,6 @@ function skipDNSName(bytes, offset) {
     if (wireLength > 255) return -1;
 
     pos += 1 + len;
-    if (++jumps > 127) return -1;
   }
 
   return -1;
@@ -1162,20 +1354,31 @@ export const __internals = {
   CONFIG,
   parseDNSQuestion,
   validateDNSResponse,
+  skipDNSName,
+  readDNSName,
+  readResourceRecord,
   decodeBase64Url,
   makeCacheKey,
   normalizeDNSResponseID,
   getDNSCacheTTL,
   patchDNSResponseForAge,
   localRateLimit,
-  selectRacers
+  selectRacers,
+  resolveWithParallelRace,
+  isBetterDegraded
 };
 
+const UI_RESPONSE_CACHE = new Map();
+const UI_RESPONSE_CACHE_MAX_ENTRIES = 16;
+
 function renderUI(host) {
+  let html = UI_RESPONSE_CACHE.get(host);
+  if (html) return new Response(html, uiResponseInit());
+
   const safeHost = escapeHtml(host);
   const endpoint = `https://${safeHost}${CONFIG.DNS_PATH}`;
 
-  return new Response(`<!DOCTYPE html>
+  html = `<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
@@ -1286,7 +1489,7 @@ function renderUI(host) {
                 <p class="text-[9px] uppercase">Built with Edge-Computing Infrastructure</p>
             </div>
             <div class="flex gap-10 font-bold text-[10px] uppercase">
-                <a href="https://github.com/anT0ny54/DOH-Cloudflare-Worker" class="hover:text-cyan-400" target="_blank" rel="noreferrer">GitHub</a>
+                <a href="https://github.com/t0ny54/DOH-Endpoints-Cloudflare-Worker" class="hover:text-cyan-400" target="_blank" rel="noreferrer">GitHub</a>
             </div>
         </footer>
     </div>
@@ -1385,7 +1588,18 @@ function renderUI(host) {
         window.onload = () => changeLang(getStoredLanguage());
     </script>
 </body>
-</html>`, {
+</html>`;
+
+  UI_RESPONSE_CACHE.set(host, html);
+  if (UI_RESPONSE_CACHE.size > UI_RESPONSE_CACHE_MAX_ENTRIES) {
+    UI_RESPONSE_CACHE.delete(UI_RESPONSE_CACHE.keys().next().value);
+  }
+
+  return new Response(html, uiResponseInit());
+}
+
+function uiResponseInit() {
+  return {
     status: 200,
     headers: {
       'content-type': 'text/html; charset=utf-8',
@@ -1394,5 +1608,5 @@ function renderUI(host) {
       'referrer-policy': 'no-referrer',
       'content-security-policy': "default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'none';",
     }
-  });
+  };
 }
