@@ -170,7 +170,7 @@ async function handleDNS(req, url, ctx) {
   if (CONFIG.EDGE_CACHE_ENABLED) {
     const edgeHit = await getEdgeCache(cacheKey, parsed.id, url.origin, payload);
     if (edgeHit) {
-      setCache(cacheKey, edgeHit.body, Math.min(edgeHit.ttlSeconds, CONFIG.LOCAL_CACHE_MAX_TTL_SECONDS), edgeHit.storedAt);
+      setCache(cacheKey, edgeHit.body, cappedTTL(edgeHit.ttlSeconds, CONFIG.LOCAL_CACHE_MAX_TTL_SECONDS), edgeHit.storedAt);
       return dnsResponse(edgeHit.responseBody, {
         'x-cache': 'L2-HIT',
         'x-edge-cache': 'HIT',
@@ -199,10 +199,11 @@ async function handleDNS(req, url, ctx) {
 
     if (ttlSeconds > 0) {
       normalizedBody = normalizeDNSResponseID(result.body);
+      const localTTL = cappedTTL(ttlSeconds, CONFIG.LOCAL_CACHE_MAX_TTL_SECONDS);
       setCache(
         cacheKey,
         normalizedBody,
-        Math.min(ttlSeconds, CONFIG.LOCAL_CACHE_MAX_TTL_SECONDS),
+        localTTL,
         storedAt
       );
       if (CONFIG.EDGE_CACHE_ENABLED) {
@@ -211,7 +212,7 @@ async function handleDNS(req, url, ctx) {
           ctx?.waitUntil?.(putEdgeCache(
             cacheKey,
             normalizedBody,
-            Math.min(ttlSeconds, CONFIG.EDGE_CACHE_MAX_TTL_SECONDS),
+            cappedTTL(ttlSeconds, CONFIG.EDGE_CACHE_MAX_TTL_SECONDS),
             storedAt,
             url.origin
           ));
@@ -432,7 +433,7 @@ function parseDNSQuestion(packet) {
 
   // Only the ID is needed by the resolver/cache hot path. Additional sections,
   // including EDNS options, remain part of the wire query and cache key.
-  return { ok: true, id };
+  return { ok: true, id, questionEnd };
 }
 
 function normalizeDNSResponseID(responseBuffer) {
@@ -740,6 +741,11 @@ function setCache(key, body, ttlSeconds, storedAt = Date.now()) {
   trimMap(APP_STATE.cache, CONFIG.MAX_CACHE_ENTRIES);
 }
 
+function cappedTTL(ttlSeconds, maxSeconds) {
+  if (!Number.isFinite(ttlSeconds)) return 0;
+  return clamp(Math.max(1, Math.floor(ttlSeconds)), CONFIG.EDGE_CACHE_MIN_TTL_SECONDS, maxSeconds);
+}
+
 function getDNSCacheTTL(responseBuffer) {
   const bytes = new Uint8Array(responseBuffer);
   if (bytes.length < 12 || bytes.length > CONFIG.MAX_CACHEABLE_DNS_BYTES) return 0;
@@ -880,16 +886,20 @@ function restoreQuestionCase(target, query) {
   // another client's letter case. Copy this client's exact case back into the
   // question section (only when both names match case-insensitively).
   const lower = (v) => (v >= 65 && v <= 90 ? v + 32 : v);
+  const maxLen = Math.min(query.length, target.length);
   let offset = 12;
 
-  while (offset < query.length && offset < target.length) {
+  while (offset < maxLen) {
     const len = query[offset];
     if (len === 0) return;
     if ((len & 0xc0) !== 0 || target[offset] !== len) return;
-    if (offset + 1 + len > query.length || offset + 1 + len > target.length) return;
+    if (offset + 1 + len > maxLen) return;
 
     for (let i = offset + 1; i <= offset + len; i++) {
-      if (lower(query[i]) !== lower(target[i])) return;
+      const qv = query[i];
+      const tv = target[i];
+      if (typeof qv !== 'number' || typeof tv !== 'number') return;
+      if (lower(qv) !== lower(tv)) return;
     }
     for (let i = offset + 1; i <= offset + len; i++) target[i] = query[i];
 
@@ -928,10 +938,12 @@ function patchDNSResponseForAge(responseBuffer, queryID, ageSeconds, queryBytes)
       // not a DNS TTL. Leave it untouched.
       if (rr.type !== 41) {
         const remaining = Math.max(0, rr.ttl - ageSeconds);
-        copy[rr.rdataOffset - 6] = (remaining >>> 24) & 0xff;
-        copy[rr.rdataOffset - 5] = (remaining >>> 16) & 0xff;
-        copy[rr.rdataOffset - 4] = (remaining >>> 8) & 0xff;
-        copy[rr.rdataOffset - 3] = remaining & 0xff;
+        if (rr.rdataOffset - 6 >= 0 && rr.rdataOffset - 3 < copy.length) {
+          copy[rr.rdataOffset - 6] = (remaining >>> 24) & 0xff;
+          copy[rr.rdataOffset - 5] = (remaining >>> 16) & 0xff;
+          copy[rr.rdataOffset - 4] = (remaining >>> 8) & 0xff;
+          copy[rr.rdataOffset - 3] = remaining & 0xff;
+        }
       }
       offset = rr.end;
     }
@@ -954,8 +966,8 @@ async function getEdgeCache(key, queryID, origin, queryBytes) {
     const body = await hit.arrayBuffer();
     const storedHeader = hit.headers.get('x-doh-stored-at');
     const ttlHeader = hit.headers.get('x-doh-ttl');
-    const storedAt = Number(storedHeader);
-    const ttlSeconds = Number(ttlHeader);
+    const storedAt = storedHeader ? Number(storedHeader) : NaN;
+    const ttlSeconds = ttlHeader ? Number(ttlHeader) : NaN;
 
     if (!Number.isFinite(storedAt) || !Number.isFinite(ttlSeconds) || ttlSeconds <= 0) {
       return null;
@@ -1186,7 +1198,7 @@ function renderUI(host) {
 
     <!-- LANGUAGE SWITCHER -->
     <div class="fixed top-6 right-6 z-50">
-        <button onclick="document.getElementById('langMenu').classList.toggle('hidden')" class="cyber-glass px-6 py-3 rounded-2xl flex items-center gap-4 text-xs font-bold border-cyan-500/20 hover:scale-105 transition-all shadow-2xl">
+        <button onclick="document.getElementById('langMenu').classList.toggle('hidden')" class="cyber-glass px-6 py-3 rounded-2xl flex items-center gap-4 text-xs font-bold border-cyan-500/20 hover:scale-[1.02] transition-transform">
             🌐 <span id="currentLang">LANGUAGE</span>
         </button>
         <div id="langMenu" class="hidden absolute right-0 mt-3 cyber-glass p-2 rounded-2xl w-44 shadow-2xl border-slate-800">
@@ -1205,7 +1217,7 @@ function renderUI(host) {
         <section class="cyber-glass rounded-[3rem] p-8 md:p-14 mb-10 text-center">
             <div class="mb-6">
                 <span class="text-[11px] font-black text-cyan-500 tracking-widest uppercase mb-4 block" id="labelUrl">Endpoint URL</span>
-                <input id="linkInp" value="${endpoint}" readonly class="w-full bg-black/40 border border-slate-800 p-5 rounded-2xl text-cyan-300 font-mono text-center text-sm outline-none focus:border-cyan-500/50 shadow-inner">
+                <input id="linkInp" value="${endpoint}" readonly class="w-full bg-black/40 border border-slate-800 p-5 rounded-2xl text-cyan-300 font-mono text-center text-sm outline-none focus:border-cyan-500/60">
             </div>
             <button onclick="copyURL()" class="bg-cyan-600 hover:bg-cyan-400 text-black font-black px-12 py-5 rounded-2xl transition-all shadow-xl active:scale-95">
                 <span id="txtCopy">COPY ENDPOINT</span>
@@ -1262,9 +1274,9 @@ function renderUI(host) {
                 ⭐ <span id="whyH">Why ONLY Browser-level DOH? (Crucial Tip)</span>
             </h4>
             <div class="space-y-6 text-[13px] md:text-[14px] text-slate-400 leading-loose" id="whyT">
-                <p>Most operating systems (Windows settings, Android "Private DNS", or Apple Profiles) natively expect <b>DNS-over-TLS (DoT)</b> which runs on Port 853. Since this worker is built on <b>Cloudflare Edge (Serverless)</b>, it strictly provides <b>DNS-over-HTTPS (DoH)</b> running on Port 443.</p>
-                <p><b>The Issue:</b> You <u>cannot</u> paste an <code>https://</code> link into many native DNS settings. It will usually result in an "Invalid Hostname" error. Systems there expect a simple domain, but this service requires the full path for HTTPS resolution.</p>
-                <p><b>The Solution:</b> Browsers (Chrome, Edge, Firefox) have their own independent DoH clients. They are compatible with Port 443 workers and provide browser-level encrypted DNS. DoH encrypts DNS queries between your browser and this endpoint, but it does not hide destination IPs or guarantee bypass on every network.</p>
+                <p>Most operating systems (Windows settings, Android "Private DNS", or Apple Profiles) natively expect <b>DNS-over-TLS (DoT)</b> which runs on Port 853. Since this worker is built on <code>https://</code> and Port 443, it is not directly usable in these native settings.</p>
+                <p><b>The Issue:</b> You <u>cannot</u> paste an <code>https://</code> link into many native DNS settings. It will usually result in an "Invalid Hostname" error. Systems there expect a hostname or DoT endpoint, not a full HTTPS resolver URL.</p>
+                <p><b>The Solution:</b> Browsers (Chrome, Edge, Firefox) have their own independent DoH clients. They are compatible with Port 443 workers and provide browser-level encrypted DNS. DoH is therefore best configured directly in the browser.</p>
             </div>
         </div>
 
@@ -1284,34 +1296,34 @@ function renderUI(host) {
             en: {
                 main: 'Secure DNS over HTTPS', sub: 'Edge Resolve Network • Parallel DoH Resolution',
                 urlL: 'Endpoint URL', cpT: 'COPY ENDPOINT', copied: 'LINK CAPTURED!', tabC: 'Chrome / Brave / Edge', tabF: 'Firefox', tabM: 'Android / iOS',
-                cH: 'Chromium Browser Settings', cL: '<li>1. Open Browser <b>Settings</b> and find <b>Privacy & Security</b>.</li><li>2. Scroll to <b>"Use Secure DNS"</b>.</li><li>3. Select <b>"With Custom"</b>.</li><li>4. Paste your DoH endpoint URL provided above.</li>',
-                fH: 'Firefox Network Options', fL: '<li>1. In Firefox <code>Settings</code>, search for "DNS over HTTPS".</li><li>2. Select <b>Custom</b> from the providers dropdown.</li><li>3. Paste this DoH endpoint URL and save.</li>',
+                cH: 'Chromium Browser Settings', cL: '<li>1. Open Browser <b>Settings</b> and find <b>Privacy & Security</b>.</li><li>2. Scroll to <b>"Use Secure DNS"</b>.</li><li>3. Select <b>"With Custom"</b>.</li><li>4. Paste the worker URL into the provider field.</li><li>5. Verify with a blocked site or your own DNS test.</li>',
+                fH: 'Firefox Network Options', fL: '<li>1. In Firefox <code>Settings</code>, search for "DNS over HTTPS".</li><li>2. Select <b>Custom</b> from the providers dropdown.</li><li>3. Paste your DoH server address and confirm.</li><li>4. Switch to <b>Max Protection</b> for stronger privacy.</li>',
                 mH: 'Mobile Setup Strategy', mD: 'Smartphones often prioritize DoT hostnames in system settings. To use this Worker DoH endpoint:',
-                mL: '<li><b>In Browsers:</b> Setting it directly in Chrome or Firefox for Mobile is the easiest path.</li><li><b>For Apps:</b> Use <b>Intra</b> or <b>RethinkDNS</b> apps and set DoH server to this link.</li>',
+                mL: '<li><b>In Browsers:</b> Setting it directly in Chrome or Firefox for Mobile is the easiest path.</li><li><b>For Apps:</b> Use <b>Intra</b> or <b>RethinkDNS</b> apps and set DoH as the resolver.</li>',
                 whyH: 'Why Browser-Level ONLY? (The Technical Reality)',
-                whyT: '<p>Operating systems like Windows/Android often expect <b>DoT (Port 853)</b> or native resolver formats and may not accept a full <code>https://</code> DoH URL. Workers on Cloudflare run on <b>HTTPS (Port 443)</b>.</p><p><b>Result:</b> Modern browsers include their own DoH engine which works well on Port 443. DoH encrypts DNS queries between your browser and this Worker, but it does not hide destination IPs or guarantee bypass on every network.</p>',
+                whyT: '<p>Operating systems like Windows/Android often expect <b>DoT (Port 853)</b> or native resolver formats and may not accept a full <code>https://</code> DoH URL. Workers on Cloudflare listen on <b>Port 443</b>, which fits browsers and not native system resolvers.</p><p>Browsers are the intended place to use this service.</p>',
                 curL: 'ENGLISH'
             },
             fa: {
                 main: 'سرویس امن DNS بر روی HTTPS', sub: 'پاسخگویی همزمان با سه سرور DNS و انتخاب اولین پاسخ معتبر',
-                urlL: 'آدرس مستقیم سرور شما (DoH)', cpT: 'کپی آدرس هوشمند', copied: 'لینک کپی شد!', tabC: 'خانواده کروم', tabF: 'فایرفاکس', tabM: 'اندروید و آیفون',
-                cH: 'تنظیمات در کروم، اج و بریو', cL: '<li>۱. در تنظیمات مرورگر کلمه DNS را جستجو کنید.</li><li>۲. وارد بخش Security شوید و Use Secure DNS را پیدا کنید.</li><li>۳. آن را روی حالت <b>With Custom</b> قرار دهید.</li><li>۴. آدرس کپی شده از بالای این صفحه را در کادر قرار دهید.</li>',
-                fH: 'تنظیمات در مرورگر فایرفاکس', fL: '<li>۱. در فایرفاکس وارد Settings شوید و DNS over HTTPS را جستجو کنید.</li><li>۲. آن را روی حالت Custom بگذارید.</li><li>۳. لینک اختصاصی خود را وارد و ذخیره کنید.</li>',
-                mH: 'استراتژی راه‌اندازی در موبایل', mD: 'گوشی‌ها معمولاً در تنظیمات سیستمی به دنبال hostname برای DoT هستند؛ برای استفاده از سرویس DoH ما:',
-                mL: '<li><b>داخل مرورگر:</b> بهترین راه تنظیم مستقیم در بخش Secure DNS خودِ کروم یا فایرفاکسِ گوشی است.</li><li><b>برای تمام برنامه‌ها:</b> از اپلیکیشن‌های <b>RethinkDNS</b> یا <b>Intra</b> استفاده کنید و لینک DoH را در آن‌ها ست کنید.</li>',
-                whyH: 'چرا نمی‌توان در خیلی از تنظیمات سیستمی ست کرد؟',
-                whyT: '<p>بسیاری از تنظیمات سیستمی ویندوز یا Private DNS اندروید، معمولاً <b>DoT (پورت ۸۵۳)</b> یا فرمت hostname می‌خواهند و اجازه نمی‌دهند آدرس کامل <code>https://</code> وارد کنید. این Worker روی <b>HTTPS (پورت ۴۴۳)</b> اجرا می‌شود.</p><p><b>راه حل:</b> مرورگرهای مدرن مثل کروم، اج و فایرفاکس موتور داخلی DoH دارند و با این Endpoint سازگارند. DoH درخواست‌های DNS بین مرورگر و این Worker را رمزنگاری می‌کند، اما IP مقصد را مخفی نمی‌کند و تضمین عبور در همه شبکه‌ها نیست.</p>',
+                urlL: 'آدرس مستقیم سرور شما (DoH)', cpT: 'کپی آدرس هوشمند', copied: 'لینک کپی شد!', tabC: 'خانواده کروم', tabF: 'فایرفاکس', tabM: 'اندروید / آیفون',
+                cH: 'تنظیمات در کروم، اج و بریو', cL: '<li>۱. در تنظیمات مرورگر کلمه DNS را جستجو کنید.</li><li>۲. وارد بخش Security شوید.</li><li>۳. گزینه «Use Secure DNS» را انتخاب کنید.</li><li>۴. آدرس سرور را در فیلد Custom وارد کنید.</li><li>۵. با جستجوی یک سایت محدود، نتیجه را تست کنید.</li>',
+                fH: 'تنظیمات در مرورگر فایرفاکس', fL: '<li>۱. در فایرفاکس وارد Settings شوید و DNS over HTTPS را جستجو کنید.</li><li>۲. گزینه Custom را انتخاب کنید.</li><li>۳. URL سرویس DoH را وارد کنید.</li><li>۴. برای حداکثر محافظت، گزینه Max Protection را فعال کنید.</li>',
+                mH: 'استراتژی راه‌اندازی در موبایل', mD: 'گوشی‌ها معمولاً در تنظیمات سیستمی به دنبال hostname برای DoT هستند؛ برای این سرویس DoH، بهترین روش در مرورگر است:',
+                mL: '<li><b>داخل مرورگر:</b> بهترین راه تنظیم مستقیم در بخش Secure DNSِ کروم یا فایرفاکس است.</li><li><b>برای اپ‌ها:</b> از اپ‌های <b>Intra</b> یا <b>RethinkDNS</b> کمک بگیرید و نوع DNS را DoH تنظیم کنید.</li>',
+                whyH: 'چرا معمولاً فقط در مرورگر؟',
+                whyT: '<p>بسیاری از تنظیمات سیستمی ویندوز یا اندروید، معمولاً <b>DoT (پورت ۸۵۳)</b> یا فرمت hostname را می‌خواهند و URL کامل HTTPS را نمی‌پذیرند.</p><p>این سرویس برای مرورگرها و Port 443 طراحی شده است و بهترین مکان استفاده از آن در داخل مرورگر است.</p>',
                 curL: 'فارسی (FA)'
             },
             zh: {
                 main: 'Secure DoH 安全加密中心', sub: '基于边缘节点的三路并行 DNS 解析',
                 urlL: 'DoH 配置终端', cpT: '复制配置地址', copied: '已复制!', tabC: 'Chromium 引擎', tabF: 'Firefox 火狐', tabM: '安卓与 iOS',
-                cH: 'Chromium 浏览器设置', cL: '<li>1. 进入浏览器“设置”，搜索“安全 DNS”。</li><li>2. 将服务提供商设置为“自定义 (Custom)”。</li><li>3. 粘贴本页面的 DoH 链接，然后重启浏览器生效。</li>',
-                fH: '火狐浏览器配置指南', fL: '<li>1. 在火狐“设置”中搜索 DNS over HTTPS。</li><li>2. 选择自定义提供商。</li><li>3. 输入 DoH 服务器地址并确认保存。</li>',
+                cH: 'Chromium 浏览器设置', cL: '<li>1. 进入浏览器“设置”，搜索“安全 DNS”。</li><li>2. 进入“使用安全 DNS”选项。</li><li>3. 选择“自定义 (Custom)”。</li><li>4. 把当前 Worker 的 URL 粘贴进去。</li><li>5. 访问被拦截的网站做功能验证。</li>',
+                fH: '火狐浏览器配置指南', fL: '<li>1. 在火狐“设置”中搜索 DNS over HTTPS。</li><li>2. 选择“自定义提供商”。</li><li>3. 输入 DoH 服务地址。</li><li>4. 选择“Max Protection”提升增强隐私。</li>',
                 mH: '移动端解析说明', mD: '移动操作系统通常默认系统级 DoT 格式；若要使用此 DoH 服务器:',
-                mL: '<li><b>浏览器设置:</b> 直接在安卓或苹果手机的浏览器（Chrome/Firefox）内按上述桌面步骤配置即可。</li><li><b>全系统生效:</b> 建议安装 <b>RethinkDNS</b> 或 <b>Intra</b> App，并在软件中设置本页面地址。</li>',
-                whyH: '为什么通常建议在浏览器配置? (技术架构说明)',
-                whyT: '<p>Windows 或安卓系统的 Private DNS 设置项通常需要 <b>DoT / 853 端口</b> 或主机名格式，而不一定接受完整 HTTPS URL。本项目基于 <b>Port 443</b> 的 Cloudflare Worker 环境构建。</p><p><b>建议:</b> 浏览器自带独立 DoH 解析器，可直接使用此 Endpoint。DoH 会加密浏览器与此 Worker 之间的 DNS 查询，但不会隐藏目标 IP，也不能保证在所有网络中绕过限制。</p>',
+                mL: '<li><b>浏览器设置:</b> 直接在安卓或苹果手机的浏览器中配置最稳定。</li><li><b>应用设置:</b> 推荐使用 <b>Intra</b> 或 <b>RethinkDNS</b>，并将 DNS 类型切换为 DoH。</li>',
+                whyH: '为什么通常建议在浏览器配置?',
+                whyT: '<p>Windows 或安卓系统的 Private DNS 设置项通常需要 <b>DoT / 853 端口</b> 或主机名格式，而不一定接受完整 HTTPS URL。</p><p>本项目基于 <b>Port 443</b> 的 Worker 架构，因此浏览器端配置最符合实际运行方式。</p>',
                 curL: '简体中文'
             }
         };
@@ -1380,7 +1392,7 @@ function renderUI(host) {
       'cache-control': 'public, max-age=300',
       'x-content-type-options': 'nosniff',
       'referrer-policy': 'no-referrer',
-      'content-security-policy': "default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'"
+      'content-security-policy': "default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'none';",
     }
   });
 }
