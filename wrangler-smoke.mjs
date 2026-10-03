@@ -48,7 +48,7 @@ try {
   await waitForServer();
 
   const health = await (await fetch(`${BASE}/health`)).json();
-  assert.equal(health.version, '0.4.1');
+  assert.equal(health.version, '0.4.2');
   assert.equal(health.maxSimultaneousUpstreams, 3);
   assert.equal(health.upstreamStrategy, 'parallel-race');
 

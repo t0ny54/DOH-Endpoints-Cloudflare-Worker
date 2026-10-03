@@ -569,3 +569,39 @@ test('setCache honors an explicit expiry independent of storedAt (L2 -> L1 promo
   assert.equal(hit.storedAt, storedAt);
   dns.APP_STATE.cache.clear();
 });
+
+test('scanDNSName returns the encoded end offset and the lower-cased name in one pass', () => {
+  const query = buildQuery(1, 'ExAmPle.COM');
+  const out = { name: '' };
+  const end = dns.scanDNSName(query, 12, null, out);
+  assert.equal(out.name, 'example.com.');
+  assert.equal(end, 12 + 1 + 7 + 1 + 3 + 1);
+  assert.equal(dns.skipDNSName(query, 12), end);
+  assert.equal(dns.readDNSName(query, 12), 'example.com.');
+});
+
+test('scanDNSName rejects pointer loops and forward pointers without a visited-set', () => {
+  // Label "a" at 12, then a pointer at 14 back to 12 -> infinite loop if unchecked.
+  const loop = Uint8Array.from([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0x61, 0xc0, 0x0c, 0, 0]);
+  assert.equal(dns.scanDNSName(loop, 12), -1);
+  const forward = Uint8Array.from([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xc0, 0x20, 0, 0]);
+  assert.equal(dns.scanDNSName(forward, 12), -1);
+});
+
+test('localRateLimit evicts the least recently used IP, not an actively limited one', () => {
+  const previousMax = dns.CONFIG.MAX_THROTTLE_ENTRIES;
+  dns.APP_STATE.throttle.clear();
+  dns.CONFIG.MAX_THROTTLE_ENTRIES = 2;
+  try {
+    dns.localRateLimit('busy');
+    dns.localRateLimit('idle');
+    dns.localRateLimit('busy');   // refresh recency of "busy"
+    dns.localRateLimit('newcomer'); // forces one eviction
+    assert.ok(dns.APP_STATE.throttle.has('busy'), 'active IP must keep its counter');
+    assert.equal(dns.APP_STATE.throttle.get('busy').count, 2);
+    assert.ok(!dns.APP_STATE.throttle.has('idle'));
+  } finally {
+    dns.CONFIG.MAX_THROTTLE_ENTRIES = previousMax;
+    dns.APP_STATE.throttle.clear();
+  }
+});

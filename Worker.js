@@ -1,10 +1,10 @@
 /**
- * VERSION: 0.4.1
+ * VERSION: 0.4.2
  * GITHUB: https://github.com/t0ny54/DOH-Endpoints-Cloudflare-Worker
  * Runtime: Cloudflare Workers Module Syntax
  */
 
-const VERSION = '0.4.1';
+const VERSION = '0.4.2';
 
 const CONFIG = {
   DNS_PATH: '/dns-query',
@@ -135,12 +135,10 @@ async function handleDNS(req, url, ctx) {
     });
   }
 
-  if (!payload || payload.byteLength === 0) {
+  // Size limits are already enforced while the payload is read/decoded
+  // (readDNSPayload / decodeBase64Url), so only emptiness is checked here.
+  if (payload.byteLength === 0) {
     return textResponse('Empty DNS query', 400, { 'cache-control': 'no-store' });
-  }
-
-  if (payload.byteLength > CONFIG.MAX_DNS_MESSAGE_BYTES) {
-    return textResponse('DNS message too large', 413, { 'cache-control': 'no-store' });
   }
 
   const parsed = parseDNSQuestion(payload);
@@ -175,13 +173,21 @@ async function handleDNS(req, url, ctx) {
     if (edgeHit) {
       // Promote to L1 for at most the remaining DNS lifetime (and never longer
       // than the L1 cap counted from now), so old L2 entries still warm L1.
-      const remaining = edgeHit.ttlSeconds - edgeHit.ageSeconds;
+      const promotedTTL = cappedTTL(
+        edgeHit.ttlSeconds - edgeHit.ageSeconds,
+        CONFIG.LOCAL_CACHE_MAX_TTL_SECONDS
+      );
+      // Never outlive the true DNS expiry (age is floored to whole seconds, so
+      // "now + remaining" could overshoot it by up to a second).
       setCache(
         cacheKey,
         edgeHit.body,
-        cappedTTL(remaining, CONFIG.LOCAL_CACHE_MAX_TTL_SECONDS),
+        promotedTTL,
         edgeHit.storedAt,
-        Date.now() + cappedTTL(remaining, CONFIG.LOCAL_CACHE_MAX_TTL_SECONDS) * 1000
+        Math.min(
+          edgeHit.storedAt + edgeHit.ttlSeconds * 1000,
+          Date.now() + promotedTTL * 1000
+        )
       );
       return dnsResponse(edgeHit.responseBody, {
         'x-cache': 'L2-HIT',
@@ -770,70 +776,82 @@ function createDNSNameContext() {
   return { nameOffsets: new Set() };
 }
 
-function readDNSName(bytes, offset, context = null) {
+// Single-pass name scanner. Validates the name (see rules above) and returns
+// the offset of the first octet after the name as encoded at `offset` (i.e. after
+// the terminator or the first compression pointer), or -1 if invalid. When
+// `out` is supplied, the lower-cased dotted name is stored in `out.name`.
+// Pointer loops cannot run unbounded: every label consumes part of the
+// 255-octet budget and pointer jumps are capped, so no visited-set is needed.
+function scanDNSName(bytes, offset, context = null, out = null) {
   let pos = offset;
+  let end = -1;
   let jumps = 0;
   let expandedWireLength = 1; // root terminator
-  let name = '';
-  const seenPointers = new Set();
+  let name = out ? '' : null;
 
   while (pos < bytes.length) {
     const len = bytes[pos];
 
     if (len === 0) {
       if (context) context.nameOffsets.add(pos);
-      return expandedWireLength <= 255 ? name : null;
+      if (end < 0) end = pos + 1;
+      if (out) out.name = name;
+      return end;
     }
 
     if ((len & 0xc0) === 0xc0) {
-      if (pos + 1 >= bytes.length) return null;
+      if (pos + 1 >= bytes.length) return -1;
       const pointer = ((len & 0x3f) << 8) | bytes[pos + 1];
 
       // RFC 1035 compression replaces a repeated name with a pointer to a
       // prior occurrence. In a real DNS message, header targets are rejected
       // and the pointer must land on a previously observed name label boundary.
-      if (pointer >= pos || pointer >= bytes.length) return null;
-      if (context && (pointer < 12 || !context.nameOffsets.has(pointer))) return null;
-      if (seenPointers.has(pointer) || ++jumps > 127) return null;
+      if (pointer >= pos || pointer >= bytes.length) return -1;
+      if (context && (pointer < 12 || !context.nameOffsets.has(pointer))) return -1;
+      if (++jumps > 127) return -1;
 
-      seenPointers.add(pointer);
+      if (end < 0) end = pos + 2;
       pos = pointer;
       continue;
     }
 
     if ((len & 0xc0) !== 0 || len > 63 || pos + 1 + len > bytes.length) {
-      return null;
+      return -1;
     }
 
-    if (expandedWireLength + len + 1 > 255) return null;
+    if (expandedWireLength + len + 1 > 255) return -1;
     expandedWireLength += len + 1;
 
     if (context) context.nameOffsets.add(pos);
 
-    for (let i = pos + 1; i < pos + 1 + len; i++) {
-      let c = bytes[i];
-      if (c >= 65 && c <= 90) c += 32;
-      name += String.fromCharCode(c);
+    if (out) {
+      for (let i = pos + 1; i < pos + 1 + len; i++) {
+        let c = bytes[i];
+        if (c >= 65 && c <= 90) c += 32;
+        name += String.fromCharCode(c);
+      }
+      name += '.';
     }
-    name += '.';
     pos += 1 + len;
   }
 
-  return null;
+  return -1;
+}
+
+function readDNSName(bytes, offset, context = null) {
+  const out = { name: '' };
+  return scanDNSName(bytes, offset, context, out) < 0 ? null : out.name;
 }
 
 function questionMatchesQuery(responseBytes, queryBytes) {
   if (!queryBytes || queryBytes.byteLength < 12) return true; // nothing to compare
 
-  const rName = readDNSName(responseBytes, 12);
-  const qName = readDNSName(queryBytes, 12);
-  if (rName === null || qName === null || rName !== qName) return false;
-
-  const rEnd = skipDNSName(responseBytes, 12);
-  const qEnd = skipDNSName(queryBytes, 12);
-  if (rEnd < 0 || qEnd < 0 || rEnd + 4 > responseBytes.length || qEnd + 4 > queryBytes.length) {
-    return false;
-  }
+  const rOut = { name: '' };
+  const qOut = { name: '' };
+  const rEnd = scanDNSName(responseBytes, 12, null, rOut);
+  const qEnd = scanDNSName(queryBytes, 12, null, qOut);
+  if (rEnd < 0 || qEnd < 0 || rOut.name !== qOut.name) return false;
+  if (rEnd + 4 > responseBytes.length || qEnd + 4 > queryBytes.length) return false;
 
   for (let i = 0; i < 4; i++) {
     if (responseBytes[rEnd + i] !== queryBytes[qEnd + i]) return false; // QTYPE + QCLASS
@@ -1035,29 +1053,7 @@ function getDNSCacheTTL(responseBuffer) {
 }
 
 function skipDNSName(bytes, offset, context = null) {
-  // readDNSName performs the strict semantic/compression validation. We then
-  // walk the original wire representation once to return the first octet
-  // after the encoded name (not the expanded target).
-  if (readDNSName(bytes, offset, context) === null) return -1;
-
-  let pos = offset;
-  while (pos < bytes.length) {
-    const len = bytes[pos];
-
-    if (len === 0) return pos + 1;
-
-    if ((len & 0xc0) === 0xc0) {
-      return pos + 2;
-    }
-
-    if ((len & 0xc0) !== 0 || len > 63 || pos + 1 + len > bytes.length) {
-      return -1;
-    }
-
-    pos += 1 + len;
-  }
-
-  return -1;
+  return scanDNSName(bytes, offset, context);
 }
 
 function readResourceRecord(bytes, offset, context = null) {
@@ -1084,6 +1080,10 @@ function readResourceRecord(bytes, offset, context = null) {
   };
 }
 
+// RDATA layouts validated by type; hoisted so no array is built per record.
+const SINGLE_NAME_TYPES = new Set([2, 3, 4, 5, 7, 8, 9, 12, 39]);
+const PREF_NAME_TYPES = new Set([15, 18, 21, 36]); // MX / AFSDB / RT / KX
+
 function validateRData(bytes, type, rrClass, rdataOffset, rdEnd, context) {
   const readName = (offset) => skipDNSName(bytes, offset, context);
 
@@ -1092,7 +1092,7 @@ function validateRData(bytes, type, rrClass, rdataOffset, rdEnd, context) {
   if (rrClass === 1 && type === 28) return rdEnd - rdataOffset === 16; // AAAA
 
   // One DNS name in RDATA.
-  if ([2, 3, 4, 5, 7, 8, 9, 12, 39].includes(type)) {
+  if (SINGLE_NAME_TYPES.has(type)) {
     const end = readName(rdataOffset);
     return end >= 0 && end === rdEnd;
   }
@@ -1114,7 +1114,7 @@ function validateRData(bytes, type, rrClass, rdataOffset, rdEnd, context) {
   }
 
   // Preference + target name.
-  if ([15, 18, 21, 36].includes(type)) { // MX / AFSDB / RT / KX
+  if (PREF_NAME_TYPES.has(type)) {
     if (rdataOffset + 2 > rdEnd) return false;
     const end = readName(rdataOffset + 2);
     return end >= 0 && end === rdEnd;
@@ -1436,6 +1436,9 @@ function localRateLimit(ip) {
   }
 
   stats.count += 1;
+  // Re-insert so Map order is recency order: trimMap() then evicts the idlest
+  // IP, never an actively limited one (which would silently reset its count).
+  if (current) APP_STATE.throttle.delete(ip);
   APP_STATE.throttle.set(ip, stats);
 
   trimMap(APP_STATE.throttle, CONFIG.MAX_THROTTLE_ENTRIES);
@@ -1552,6 +1555,7 @@ export const __internals = {
   validateDNSResponse,
   skipDNSName,
   readDNSName,
+  scanDNSName,
   readResourceRecord,
   decodeBase64Url,
   makeCacheKey,
@@ -1701,10 +1705,10 @@ function renderUI(host) {
             en: {
                 main: 'Secure DNS over HTTPS', sub: 'Edge Resolve Network • Parallel DoH Resolution',
                 urlL: 'Endpoint URL', cpT: 'COPY ENDPOINT', copied: 'LINK CAPTURED!', tabC: 'Chrome / Brave / Edge', tabF: 'Firefox', tabM: 'Android / iOS',
-                cH: 'Chromium Browser Settings', cL: '<li>1. Open Browser <b>Settings</b> and find <b>Privacy & Security</b>.</li><li>2. Scroll to <b>"Use Secure DNS"</b>.</li><li>3. Select <b>"With Custom"</b>.</li><li>4. Paste the worker URL into the provider field.</li><li>5. Verify with a blocked site or your own DNS test.</li>',
-                fH: 'Firefox Network Options', fL: '<li>1. In Firefox <code>Settings</code>, search for "DNS over HTTPS".</li><li>2. Select <b>Custom</b> from the providers dropdown.</li><li>3. Paste your DoH server address and confirm.</li><li>4. Switch to <b>Max Protection</b> for stronger privacy.</li>',
+                cH: 'Chromium Browser Settings', cL: '<p>1. Open Browser <b>Settings</b> and find <b>Privacy & Security</b>.</p><p>2. Scroll to <b>"Use Secure DNS"</b>.</p><p>3. Select <b>"With Custom"</b>.</p><p>4. Paste the worker URL into the provider field.</p><p>5. Verify with a blocked site or your own DNS test.</p>',
+                fH: 'Firefox Network Options', fL: '<p>1. In Firefox <code>Settings</code>, search for "DNS over HTTPS".</p><p>2. Select <b>Custom</b> from the providers dropdown.</p><p>3. Paste your DoH server address and confirm.</p><p>4. Switch to <b>Max Protection</b> for stronger privacy.</p>',
                 mH: 'Mobile Setup Strategy', mD: 'Smartphones often prioritize DoT hostnames in system settings. To use this Worker DoH endpoint:',
-                mL: '<li><b>In Browsers:</b> Setting it directly in Chrome or Firefox for Mobile is the easiest path.</li><li><b>For Apps:</b> Use <b>Intra</b> or <b>RethinkDNS</b> apps and set DoH as the resolver.</li>',
+                mL: '<p><b>In Browsers:</b> Setting it directly in Chrome or Firefox for Mobile is the easiest path.</p><p><b>For Apps:</b> Use <b>Intra</b> or <b>RethinkDNS</b> apps and set DoH as the resolver.</p>',
                 whyH: 'Why Browser-Level ONLY? (The Technical Reality)',
                 whyT: '<p>Operating systems like Windows/Android often expect <b>DoT (Port 853)</b> or native resolver formats and may not accept a full <code>https://</code> DoH URL. Workers on Cloudflare listen on <b>Port 443</b>, which fits browsers and not native system resolvers.</p><p>Browsers are the intended place to use this service.</p>',
                 curL: 'ENGLISH'
@@ -1712,10 +1716,10 @@ function renderUI(host) {
             fa: {
                 main: 'سرویس امن DNS بر روی HTTPS', sub: 'پاسخگویی همزمان با سه سرور DNS و انتخاب اولین پاسخ معتبر',
                 urlL: 'آدرس مستقیم سرور شما (DoH)', cpT: 'کپی آدرس هوشمند', copied: 'لینک کپی شد!', tabC: 'خانواده کروم', tabF: 'فایرفاکس', tabM: 'اندروید / آیفون',
-                cH: 'تنظیمات در کروم، اج و بریو', cL: '<li>۱. در تنظیمات مرورگر کلمه DNS را جستجو کنید.</li><li>۲. وارد بخش Security شوید.</li><li>۳. گزینه «Use Secure DNS» را انتخاب کنید.</li><li>۴. آدرس سرور را در فیلد Custom وارد کنید.</li><li>۵. با جستجوی یک سایت محدود، نتیجه را تست کنید.</li>',
-                fH: 'تنظیمات در مرورگر فایرفاکس', fL: '<li>۱. در فایرفاکس وارد Settings شوید و DNS over HTTPS را جستجو کنید.</li><li>۲. گزینه Custom را انتخاب کنید.</li><li>۳. URL سرویس DoH را وارد کنید.</li><li>۴. برای حداکثر محافظت، گزینه Max Protection را فعال کنید.</li>',
+                cH: 'تنظیمات در کروم، اج و بریو', cL: '<p>۱. در تنظیمات مرورگر کلمه DNS را جستجو کنید.</p><p>۲. وارد بخش Security شوید.</p><p>۳. گزینه «Use Secure DNS» را انتخاب کنید.</p><p>۴. آدرس سرور را در فیلد Custom وارد کنید.</p><p>۵. با جستجوی یک سایت محدود، نتیجه را تست کنید.</p>',
+                fH: 'تنظیمات در مرورگر فایرفاکس', fL: '<p>۱. در فایرفاکس وارد Settings شوید و DNS over HTTPS را جستجو کنید.</p><p>۲. گزینه Custom را انتخاب کنید.</p><p>۳. URL سرویس DoH را وارد کنید.</p><p>۴. برای حداکثر محافظت، گزینه Max Protection را فعال کنید.</p>',
                 mH: 'استراتژی راه‌اندازی در موبایل', mD: 'گوشی‌ها معمولاً در تنظیمات سیستمی به دنبال hostname برای DoT هستند؛ برای این سرویس DoH، بهترین روش در مرورگر است:',
-                mL: '<li><b>داخل مرورگر:</b> بهترین راه تنظیم مستقیم در بخش Secure DNSِ کروم یا فایرفاکس است.</li><li><b>برای اپ‌ها:</b> از اپ‌های <b>Intra</b> یا <b>RethinkDNS</b> کمک بگیرید و نوع DNS را DoH تنظیم کنید.</li>',
+                mL: '<p><b>داخل مرورگر:</b> بهترین راه تنظیم مستقیم در بخش Secure DNSِ کروم یا فایرفاکس است.</p><p><b>برای اپ‌ها:</b> از اپ‌های <b>Intra</b> یا <b>RethinkDNS</b> کمک بگیرید و نوع DNS را DoH تنظیم کنید.</p>',
                 whyH: 'چرا معمولاً فقط در مرورگر؟',
                 whyT: '<p>بسیاری از تنظیمات سیستمی ویندوز یا اندروید، معمولاً <b>DoT (پورت ۸۵۳)</b> یا فرمت hostname را می‌خواهند و URL کامل HTTPS را نمی‌پذیرند.</p><p>این سرویس برای مرورگرها و Port 443 طراحی شده است و بهترین مکان استفاده از آن در داخل مرورگر است.</p>',
                 curL: 'فارسی (FA)'
@@ -1723,10 +1727,10 @@ function renderUI(host) {
             zh: {
                 main: 'Secure DoH 安全加密中心', sub: '基于边缘节点的三路并行 DNS 解析',
                 urlL: 'DoH 配置终端', cpT: '复制配置地址', copied: '已复制!', tabC: 'Chromium 引擎', tabF: 'Firefox 火狐', tabM: '安卓与 iOS',
-                cH: 'Chromium 浏览器设置', cL: '<li>1. 进入浏览器“设置”，搜索“安全 DNS”。</li><li>2. 进入“使用安全 DNS”选项。</li><li>3. 选择“自定义 (Custom)”。</li><li>4. 把当前 Worker 的 URL 粘贴进去。</li><li>5. 访问被拦截的网站做功能验证。</li>',
-                fH: '火狐浏览器配置指南', fL: '<li>1. 在火狐“设置”中搜索 DNS over HTTPS。</li><li>2. 选择“自定义提供商”。</li><li>3. 输入 DoH 服务地址。</li><li>4. 选择“Max Protection”提升增强隐私。</li>',
+                cH: 'Chromium 浏览器设置', cL: '<p>1. 进入浏览器“设置”，搜索“安全 DNS”。</p><p>2. 进入“使用安全 DNS”选项。</p><p>3. 选择“自定义 (Custom)”。</p><p>4. 把当前 Worker 的 URL 粘贴进去。</p><p>5. 访问被拦截的网站做功能验证。</p>',
+                fH: '火狐浏览器配置指南', fL: '<p>1. 在火狐“设置”中搜索 DNS over HTTPS。</p><p>2. 选择“自定义提供商”。</p><p>3. 输入 DoH 服务地址。</p><p>4. 选择“Max Protection”提升增强隐私。</p>',
                 mH: '移动端解析说明', mD: '移动操作系统通常默认系统级 DoT 格式；若要使用此 DoH 服务器:',
-                mL: '<li><b>浏览器设置:</b> 直接在安卓或苹果手机的浏览器中配置最稳定。</li><li><b>应用设置:</b> 推荐使用 <b>Intra</b> 或 <b>RethinkDNS</b>，并将 DNS 类型切换为 DoH。</li>',
+                mL: '<p><b>浏览器设置:</b> 直接在安卓或苹果手机的浏览器中配置最稳定。</p><p><b>应用设置:</b> 推荐使用 <b>Intra</b> 或 <b>RethinkDNS</b>，并将 DNS 类型切换为 DoH。</p>',
                 whyH: '为什么通常建议在浏览器配置?',
                 whyT: '<p>Windows 或安卓系统的 Private DNS 设置项通常需要 <b>DoT / 853 端口</b> 或主机名格式，而不一定接受完整 HTTPS URL。</p><p>本项目基于 <b>Port 443</b> 的 Worker 架构，因此浏览器端配置最符合实际运行方式。</p>',
                 curL: '简体中文'

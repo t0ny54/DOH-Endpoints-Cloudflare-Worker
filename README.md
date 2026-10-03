@@ -1,6 +1,6 @@
 # 🛡️ DoH — Cloudflare Worker
 
-**Version 0.4.1** · see [`CHANGELOG.md`](CHANGELOG.md)
+**Version 0.4.2** · see [`CHANGELOG.md`](CHANGELOG.md)
 
 A lightweight Cloudflare Worker that exposes a standard **DNS-over-HTTPS** endpoint, races three configured DoH upstreams in parallel, and keeps a two-level DNS cache:
 
@@ -42,7 +42,7 @@ Responses cached internally use DNS TTL-derived expiration. The response transac
 
 ### Rate limiting
 
-`/dns-query` is limited to **100 requests per 60 seconds per client IP** through the native `DNS_RATE_LIMITER` binding in `wrangler.toml`. A lightweight per-isolate fallback limiter is used when the binding is missing, throws, or returns an invalid response (the request is then limited locally rather than rejected or allowed unconditionally). Cloudflare documents the native Rate Limiting API as low-latency; its counters are scoped to the relevant Cloudflare location rather than being one globally exact counter.
+`/dns-query` is limited to **100 requests per 60 seconds per client IP** through the native `DNS_RATE_LIMITER` binding in `wrangler.toml`. A lightweight per-isolate fallback limiter (bounded to 2048 IPs, evicting the least recently seen) is used when the binding is missing, throws, or returns an invalid response (the request is then limited locally rather than rejected or allowed unconditionally). Cloudflare documents the native Rate Limiting API as low-latency; its counters are scoped to the relevant Cloudflare location rather than being one globally exact counter.
 
 ### Request-size protection
 
@@ -50,7 +50,7 @@ DoH DNS messages are normally tiny, so this Worker rejects client messages large
 
 ## Deploy with Wrangler
 
-The repository includes `wrangler.toml` with the service name `dns`, `compatibility_date = "2026-10-01"` and a `DNS_RATE_LIMITER` binding configured for **100 requests / 60 seconds**. With Wrangler, deploy from the folder containing `Worker.js` and `wrangler.toml` so the binding is created/used. Keep the rate-limit namespace unique if this service must not share counters with another deployment. If the Worker is uploaded through a method that does not apply the Wrangler binding, the script falls back to an in-memory per-isolate limiter.
+The repository includes `wrangler.toml` with the service name `dns`, `compatibility_date = "2026-09-01"` and a `DNS_RATE_LIMITER` binding configured for **100 requests / 60 seconds**. With Wrangler, deploy from the folder containing `Worker.js` and `wrangler.toml` so the binding is created/used. Keep the rate-limit namespace unique if this service must not share counters with another deployment. If the Worker is uploaded through a method that does not apply the Wrangler binding, the script falls back to an in-memory per-isolate limiter.
 
 For strict network-wide abuse protection, a Cloudflare WAF Rate Limiting Rule can also be applied to `/dns-query`. Cloudflare notes that rate-limit counters are not globally shared across its entire network, so neither the native binding nor WAF should be treated as one globally exact counter.
 
@@ -88,7 +88,7 @@ Content-Type: application/dns-message
 
 ## Cloudflare Worker notes
 
-The L1 cache is a per-isolate LRU (512 entries, TTL capped at 300 s). L2 Cache API entries can honor authoritative TTLs up to 24 hours, reducing unnecessary upstream resolutions for long-lived DNS records. An L2 hit is promoted to L1 for at most its remaining DNS lifetime (capped at 300 s from the moment of promotion), so old L2 entries still warm L1. Correctness never depends on the Cache API: if L2 is unavailable, misses, or fails, requests fall through to the upstream resolvers. Expired isolate-local cache and throttle entries are swept periodically so `/health` does not retain stale bounded state indefinitely.
+The L1 cache is a per-isolate LRU (512 entries, TTL capped at 300 s). L2 Cache API entries can honor authoritative TTLs up to 24 hours, reducing unnecessary upstream resolutions for long-lived DNS records. An L2 hit is promoted to L1 for at most its remaining DNS lifetime (capped at 300 s from the moment of promotion, and never beyond the entry's true DNS expiry), so old L2 entries still warm L1. Correctness never depends on the Cache API: if L2 is unavailable, misses, or fails, requests fall through to the upstream resolvers. Expired isolate-local cache and throttle entries are swept periodically so `/health` does not retain stale bounded state indefinitely.
 
 For a production deployment, attach the Worker to a custom domain and use:
 
@@ -120,7 +120,7 @@ npm run test:wrangler
 npm run test:all
 ```
 
-The unit suite (25 tests) covers DNS wire parsing, strict compression-pointer validation, all RR sections, name-bearing RDATA, SOA structure/compression boundaries, TTL/cacheability rules, IPv6/other RR types, DNSSEC-heavy responses, L1 expiration/LRU eviction, resolver scoring, NXDOMAIN-vs-NOERROR race timing, L2-to-L1 promotion expiry, and cache-key normalization.
+The unit suite (28 tests) covers DNS wire parsing, strict compression-pointer validation, all RR sections, name-bearing RDATA, SOA structure/compression boundaries, TTL/cacheability rules, IPv6/other RR types, DNSSEC-heavy responses, L1 expiration/LRU eviction, resolver scoring, NXDOMAIN-vs-NOERROR race timing, L2-to-L1 promotion expiry, single-pass DNS name scanning (pointer loops/forward pointers), local rate-limiter LRU eviction, and cache-key normalization.
 
 The integration suite exercises the exported Worker `fetch()` handler for routing, GET/POST DoH, request validation, L1/L2 caching, expired L2 entries, transaction-ID restoration, request coalescing, the `MAX_INFLIGHT_ENTRIES` saturation path, native/local rate limiting, malformed/throwing rate-limit bindings, HTTP/content-type/timeout/oversized-chunked upstream failures, cache API failures, and size protections.
 

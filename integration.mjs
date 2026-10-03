@@ -81,7 +81,7 @@ const req = (path, opts={}) => new Request('https://dns.example.test'+path, opts
 
 // Routing / health / methods
 let r = await worker.fetch(req('/')); assert.equal(r.status,200); assert.match(await r.text(), /DNS over HTTPS/);
-r = await worker.fetch(req('/health')); assert.equal(r.status,200); assert.equal((await r.json()).version,'0.4.1');
+r = await worker.fetch(req('/health')); assert.equal(r.status,200); assert.equal((await r.json()).version,'0.4.2');
 r = await worker.fetch(req('/missing')); assert.equal(r.status,404);
 r = await worker.fetch(req('/dns-query',{method:'PUT',headers:{'CF-Connecting-IP':'1'}}), rateOK); assert.equal(r.status,405);
 
