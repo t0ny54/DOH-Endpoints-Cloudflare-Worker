@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 const PKG_VERSION = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8')).version;
@@ -24,12 +24,16 @@ const child = spawn(npx, [
   detached: process.platform !== 'win32'
 });
 let logs = '';
+let earlyExit = null;
 child.stdout.on('data', (chunk) => { logs += chunk.toString(); });
 child.stderr.on('data', (chunk) => { logs += chunk.toString(); });
+child.on('error', (err) => { earlyExit = `could not start Wrangler: ${err.message}`; });
+child.on('exit', (code, signal) => { earlyExit = `Wrangler exited early (code ${code}, signal ${signal})`; });
 async function waitForServer(timeoutMs = 20_000) {
   const deadline = Date.now() + timeoutMs;
   let lastError = null;
   while (Date.now() < deadline) {
+    if (earlyExit) throw new Error(`${earlyExit}\n${logs}`);
     try {
       const res = await fetch(`${BASE}/health`);
       if (res.ok) return res;
@@ -40,6 +44,17 @@ async function waitForServer(timeoutMs = 20_000) {
     await new Promise((resolve) => setTimeout(resolve, 250));
   }
   throw new Error(`Wrangler dev server did not become ready: ${lastError?.message || 'unknown error'}\n${logs}`);
+}
+function stopWrangler() {
+  if (!child.pid) return;
+  try {
+    if (process.platform === 'win32') {
+      // child.kill() would only stop the cmd.exe shell and leave node/workerd running.
+      spawnSync('taskkill', ['/pid', String(child.pid), '/T', '/F'], { stdio: 'ignore' });
+    } else {
+      process.kill(-child.pid, 'SIGTERM');
+    }
+  } catch (_) {}
 }
 try {
   await waitForServer();
@@ -61,8 +76,5 @@ try {
   assert.equal(wrongMethod.status, 405);
   console.log('WRANGLER DEV SMOKE TEST: PASS');
 } finally {
-  try {
-    if (process.platform === 'win32') child.kill();
-    else process.kill(-child.pid, 'SIGTERM');
-  } catch (_) {}
+  stopWrangler();
 }

@@ -76,12 +76,6 @@ test('skipDNSName follows backward pointers, rejects out-of-bounds pointers and 
   assert.equal(dns.skipDNSName(Uint8Array.from([0xc0, 0x00]), 0), -1);
   assert.equal(dns.skipDNSName(Uint8Array.from([1, 0x61, 0xc0, 0x02, 0x00]), 0), -1); 
 });
-test('readDNSName expands and lowercases names, returns null on malformed input', () => {
-  const bytes = Uint8Array.from([7, ...Buffer.from('ExAmPlE'), 3, 0x63, 0x6f, 0x6d, 0x00]);
-  assert.equal(dns.readDNSName(bytes, 0), 'example.com.');
-  assert.equal(dns.readDNSName(Uint8Array.from([0xc0, 0x00]), 0), null);
-  assert.equal(dns.readDNSName(Uint8Array.from([0xc0, 0x2a]), 0), null);
-});
 test('validateDNSResponse rejects matching-ID fakes and mismatched questions', () => {
   const query = buildQuery(0x1234);
   const fake = Uint8Array.from([0x12, 0x34, 0x80, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff]);
@@ -111,12 +105,50 @@ test('getDNSCacheTTL honors min answer TTL', () => {
   const res = buildResponse(query, { answers: [aRecord('1.2.3.4', 120)] });
   assert.equal(dns.getDNSCacheTTL(res.buffer), 120);
 });
-test('getDNSCacheTTL caches NXDOMAIN only with SOA (RFC 2308), uses min(SOA TTL, MINIMUM)', () => {
+test('getDNSCacheTTL caches NXDOMAIN only with SOA, using the lowest authority TTL capped by SOA MINIMUM', () => {
   const query = buildQuery(7);
   const bare = buildResponse(query, { rcode: 3 });
   assert.equal(dns.getDNSCacheTTL(bare.buffer), 0);
   const withSoa = buildResponse(query, { rcode: 3, authority: [soaRecord(60, 30)] });
   assert.equal(dns.getDNSCacheTTL(withSoa.buffer), 30);
+  const shortSoaTTL = buildResponse(query, { rcode: 3, authority: [soaRecord(20, 500)] });
+  assert.equal(dns.getDNSCacheTTL(shortSoaTTL.buffer), 20);
+  const shortOtherAuthority = buildResponse(query, {
+    rcode: 3,
+    authority: [soaRecord(60, 30), [0xc0, 0x0c, 0x00, 0x2f, 0x00, 0x01, 0x00, 0x00, 0x00, 0x0a,
+      0x00, 0x06, 0xc0, 0x0c, 0x00, 0x02, 0x40, 0x00]]
+  });
+  assert.equal(dns.getDNSCacheTTL(shortOtherAuthority.buffer), 10);
+});
+test('getDNSCacheTTL treats TTLs with the top bit set as zero (RFC 2181 section 8)', () => {
+  const query = buildQuery(7);
+  assert.equal(dns.getDNSCacheTTL(buildResponse(query, { answers: [aRecord('1.2.3.4', 0x7fffffff)] }).buffer), 86_400);
+  assert.equal(dns.getDNSCacheTTL(buildResponse(query, { answers: [aRecord('1.2.3.4', 0x80000000)] }).buffer), 0);
+  assert.equal(dns.getDNSCacheTTL(buildResponse(query, { answers: [aRecord('1.2.3.4', 0xffffffff)] }).buffer), 0);
+  const badMinimum = buildResponse(query, { rcode: 3, authority: [soaRecord(60, 0x80000000)] });
+  assert.equal(dns.getDNSCacheTTL(badMinimum.buffer), 0);
+});
+test('patchDNSResponseForAge rewrites the ID, ages record TTLs, restores question case and leaves OPT alone', () => {
+  const stored = buildResponse(buildQuery(0, 'example.com'), {
+    answers: [aRecord('1.2.3.4', 300)],
+    additional: [optRecord()]
+  });
+  const clientQuery = buildQuery(0xbeef, 'ExAmPlE.CoM');
+  const aged = new Uint8Array(dns.patchDNSResponseForAge(stored.buffer, 0xbeef, 100, clientQuery));
+  assert.equal((aged[0] << 8) | aged[1], 0xbeef);
+  assert.deepEqual([...aged.slice(12, 12 + 13)], [...clientQuery.slice(12, 12 + 13)]);
+  const ttlAt = (bytes) => {
+    const end = dns.skipDNSName(bytes, 12) + 4;
+    const record = dns.readResourceRecord(bytes, end);
+    return (bytes[record.rdataOffset - 6] * 0x1000000) + (bytes[record.rdataOffset - 5] << 16)
+      + (bytes[record.rdataOffset - 4] << 8) + bytes[record.rdataOffset - 3];
+  };
+  assert.equal(ttlAt(aged), 200);
+  const expired = new Uint8Array(dns.patchDNSResponseForAge(stored.buffer, 1, 10_000, clientQuery));
+  assert.equal(ttlAt(expired), 0);
+  assert.deepEqual([...aged.slice(-11)], optRecord());
+  const fresh = new Uint8Array(dns.patchDNSResponseForAge(stored.buffer, 1, 0, null));
+  assert.equal(ttlAt(fresh), 300);
 });
 test('getDNSCacheTTL refuses to cache SERVFAIL and truncated answers', () => {
   const query = buildQuery(7);
@@ -296,7 +328,6 @@ test('expanded compressed names are rejected when they exceed the DNS 255-octet 
   const labels = new Array(4).fill(null).map(() => 'a'.repeat(63));
   const longName = encodeName(labels.join('.'));
   const bytes = Uint8Array.from(longName);
-  assert.equal(dns.readDNSName(bytes, 0), null);
   assert.equal(dns.skipDNSName(bytes, 0), -1);
 });
 test('L1 cache expires entries and evicts the least-recently-used item', () => {
@@ -490,20 +521,17 @@ test('setCache honors an explicit expiry independent of storedAt (L2 -> L1 promo
   assert.equal(hit.storedAt, storedAt);
   dns.APP_STATE.cache.clear();
 });
-test('scanDNSName returns the encoded end offset and the lower-cased name in one pass', () => {
+test('skipDNSName returns the end offset of a mixed-case name, with or without a compression context', () => {
   const query = buildQuery(1, 'ExAmPle.COM');
-  const out = { name: '' };
-  const end = dns.scanDNSName(query, 12, null, out);
-  assert.equal(out.name, 'example.com.');
-  assert.equal(end, 12 + 1 + 7 + 1 + 3 + 1);
+  const end = 12 + 1 + 7 + 1 + 3 + 1;
   assert.equal(dns.skipDNSName(query, 12), end);
-  assert.equal(dns.readDNSName(query, 12), 'example.com.');
+  assert.equal(dns.skipDNSName(query, 12, { nameOffsets: new Set() }), end);
 });
-test('scanDNSName rejects pointer loops and forward pointers without a visited-set', () => {
+test('skipDNSName rejects pointer loops and forward pointers without a visited-set', () => {
   const loop = Uint8Array.from([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0x61, 0xc0, 0x0c, 0, 0]);
-  assert.equal(dns.scanDNSName(loop, 12), -1);
+  assert.equal(dns.skipDNSName(loop, 12), -1);
   const forward = Uint8Array.from([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xc0, 0x20, 0, 0]);
-  assert.equal(dns.scanDNSName(forward, 12), -1);
+  assert.equal(dns.skipDNSName(forward, 12), -1);
 });
 test('localRateLimit evicts the least recently used IP, not an actively limited one', () => {
   const previousMax = dns.CONFIG.MAX_THROTTLE_ENTRIES;

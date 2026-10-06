@@ -1,6 +1,6 @@
 # 🛡️ DoH — Cloudflare Worker
 
-**Version 0.4.3** · see [`CHANGELOG.md`](CHANGELOG.md)
+**Version 0.4.4** · see [`CHANGELOG.md`](CHANGELOG.md)
 
 A lightweight Cloudflare Worker that exposes a standard **DNS-over-HTTPS** endpoint, races three configured DoH upstreams in parallel, and keeps a two-level DNS cache:
 
@@ -36,7 +36,7 @@ The Cache API is data-center-local and does not replicate entries automatically 
 
 Both DoH GET and POST requests use the SHA-256-derived DNS wire-query key, with only the transaction ID normalized. ASCII QNAME case is also normalized when the question name is uncompressed, so `example.com`, `EXAMPLE.com`, and mixed-case variants can share a cache entry. Therefore the same DNS question can share a cache entry across GET and POST. When a cached answer is served, the question section is rewritten to the exact letter case the requesting client sent, so DNS 0x20-style case randomization still validates.
 
-Only DNS answers that are safe to reuse are cached: `NOERROR` and `NXDOMAIN` responses that are not truncated (TC) and are at most 65,535 bytes. Negative answers (`NXDOMAIN`/`NODATA`) are cached only when they carry an SOA record. The cache TTL is the lowest TTL in the authority section, capped by the SOA `MINIMUM` field, so it is never longer than the RFC 2308 value `min(SOA TTL, SOA MINIMUM)`. `SERVFAIL`, `REFUSED` and similar responses are relayed to the client (marked `x-dns-degraded: 1`) but never cached.
+Only DNS answers that are safe to reuse are cached: `NOERROR` and `NXDOMAIN` responses that are not truncated (TC) and are at most 65,535 bytes. Negative answers (`NXDOMAIN`/`NODATA`) are cached only when they carry an SOA record. The cache TTL is the lowest TTL in the authority section, capped by the SOA `MINIMUM` field, so it is never longer than the RFC 2308 value `min(SOA TTL, SOA MINIMUM)`. Following RFC 2181 §8, a TTL with the most significant bit set (above 2,147,483,647) is treated as 0, so an answer carrying one is relayed but not cached. `SERVFAIL`, `REFUSED` and similar responses are relayed to the client (marked `x-dns-degraded: 1`) but never cached.
 
 Responses cached internally use DNS TTL-derived expiration. The response transaction ID is rewritten for each client, and cached DNS record TTLs are reduced by cache age before being returned. `Cache-Control: no-store` remains on the client-facing response so the Worker controls the DNS cache instead of creating an uncontrolled browser/HTTP cache layer.
 
@@ -72,7 +72,7 @@ The Worker also serves a small English/Persian/Chinese setup dashboard at `/` (a
 
 ### GET
 
-Standard RFC 8484-style GET requests use the `dns` base64url query parameter:
+Standard RFC 8484-style GET requests use the `dns` base64url query parameter. The value must be unpadded (no trailing `=`) and at most 5,462 characters; padded or otherwise invalid values are rejected with `400`, oversized ones with `413`:
 
 ```txt
 /dns-query?dns=BASE64URL_DNS_PACKET
@@ -124,11 +124,11 @@ npm run test:all
 
 The integration and smoke tests read the expected version from `package.json` and compare it with `/health`, so a release only needs `package.json` and the `VERSION` constant in `Worker.js` to be bumped together.
 
-The unit suite (30 tests) covers DNS wire parsing, strict compression-pointer validation, all RR sections, name-bearing RDATA, SOA structure/compression boundaries, TTL/cacheability rules, IPv6/other RR types, DNSSEC-heavy responses, L1 expiration/LRU eviction, resolver scoring, NXDOMAIN-vs-NOERROR race timing, L2-to-L1 promotion expiry, single-pass DNS name scanning (pointer loops/forward pointers), local rate-limiter LRU eviction, wire-level question matching (case-insensitive, label structure must match), degraded-answer ranking (SERVFAIL, then score, then latency), and cache-key normalization.
+The unit suite (31 tests) covers DNS wire parsing, strict compression-pointer validation, all RR sections, name-bearing RDATA, SOA structure/compression boundaries, TTL/cacheability rules (including the negative-cache TTL of lowest authority TTL capped by SOA `MINIMUM`, and RFC 2181 top-bit TTLs), response patching (transaction ID, TTL aging, question-case restoration), IPv6/other RR types, DNSSEC-heavy responses, L1 expiration/LRU eviction, resolver scoring, NXDOMAIN-vs-NOERROR race timing, L2-to-L1 promotion expiry, DNS name scanning (pointer loops/forward pointers), local rate-limiter LRU eviction, wire-level question matching (case-insensitive, label structure must match), degraded-answer ranking (SERVFAIL, then score, then latency), and cache-key normalization.
 
-The integration suite exercises the exported Worker `fetch()` handler for routing, GET/POST DoH, request validation, L1/L2 caching, expired L2 entries, transaction-ID restoration, request coalescing, the `MAX_INFLIGHT_ENTRIES` saturation path, native/local rate limiting, malformed/throwing rate-limit bindings, HTTP/content-type/timeout/oversized-chunked upstream failures, cache API failures, and size protections.
+The integration suite exercises the exported Worker `fetch()` handler for routing, GET/POST DoH, request validation, L1/L2 caching, expired L2 entries, transaction-ID restoration, request coalescing, the `MAX_INFLIGHT_ENTRIES` saturation path, native/local rate limiting, malformed/throwing rate-limit bindings, degraded `SERVFAIL` answers (relayed with `x-dns-degraded: 1` and never cached), HTTP/content-type/timeout/oversized-chunked upstream failures, cache API failures, and size protections.
 
-`wrangler-smoke.mjs` starts the actual local Wrangler `dev` runtime (Cloudflare's `workerd` through Wrangler/Miniflare), then probes `/health`, `/`, an invalid DoH request, and an unsupported method without contacting the public DoH upstreams. It also runs on Windows and stops the whole Wrangler process group when it finishes, so no `workerd` process is left behind. The Rate Limiting binding is locally simulated during `wrangler dev`; it is not a test of production-wide Cloudflare counters. See the [Cloudflare local-development documentation](https://developers.cloudflare.com/workers/local-development/) and [Rate Limiting API documentation](https://developers.cloudflare.com/workers/runtime-apis/bindings/rate-limit/).
+`wrangler-smoke.mjs` starts the actual local Wrangler `dev` runtime (Cloudflare's `workerd` through Wrangler/Miniflare), then probes `/health`, `/`, an invalid DoH request, and an unsupported method without contacting the public DoH upstreams. On Linux/macOS it stops the whole Wrangler process group when it finishes; on Windows it runs through a shell and ends the whole process tree with `taskkill /T /F`, so no `workerd` process is left behind. If Wrangler cannot start or exits early, the script fails immediately and prints Wrangler's output instead of waiting for the 20-second startup timeout. The Rate Limiting binding is locally simulated during `wrangler dev`; it is not a test of production-wide Cloudflare counters. See the [Cloudflare local-development documentation](https://developers.cloudflare.com/workers/local-development/) and [Rate Limiting API documentation](https://developers.cloudflare.com/workers/runtime-apis/bindings/rate-limit/).
 
 A healthy request should return:
 

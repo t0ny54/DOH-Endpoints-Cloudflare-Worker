@@ -1,4 +1,4 @@
-const VERSION = '0.4.3';
+const VERSION = '0.4.4';
 const CONFIG = {
   DNS_PATH: '/dns-query',
   EDGE_CACHE_ENABLED: true,
@@ -24,7 +24,6 @@ const CONFIG = {
   SCORE_FAILURE_DELTA: 12,
   SCORE_TIMEOUT_DELTA: 8
 };
-const MAX_CACHEABLE_DNS_BYTES = Math.min(CONFIG.MAX_UPSTREAM_DNS_MESSAGE_BYTES, 65_535);
 const DOH_UPSTREAMS = [
   'https://freedns.koyeb.app/dns-query',
   'https://dns-pi.vercel.app/api/doh/dns-query',
@@ -573,19 +572,16 @@ function validateDNSResponse(responseBuffer, expectedID, queryBytes) {
 function createDNSNameContext() {
   return { nameOffsets: new Set() };
 }
-function scanDNSName(bytes, offset, context = null, out = null) {
+function skipDNSName(bytes, offset, context = null) {
   let pos = offset;
   let end = -1;
   let jumps = 0;
-  let expandedWireLength = 1; 
-  let name = out ? '' : null;
+  let expandedWireLength = 1;
   while (pos < bytes.length) {
     const len = bytes[pos];
     if (len === 0) {
       if (context) context.nameOffsets.add(pos);
-      if (end < 0) end = pos + 1;
-      if (out) out.name = name;
-      return end;
+      return end < 0 ? pos + 1 : end;
     }
     if ((len & 0xc0) === 0xc0) {
       if (pos + 1 >= bytes.length) return -1;
@@ -603,25 +599,13 @@ function scanDNSName(bytes, offset, context = null, out = null) {
     if (expandedWireLength + len + 1 > 255) return -1;
     expandedWireLength += len + 1;
     if (context) context.nameOffsets.add(pos);
-    if (out) {
-      for (let i = pos + 1; i < pos + 1 + len; i++) {
-        let c = bytes[i];
-        if (c >= 65 && c <= 90) c += 32;
-        name += String.fromCharCode(c);
-      }
-      name += '.';
-    }
     pos += 1 + len;
   }
   return -1;
 }
-function readDNSName(bytes, offset, context = null) {
-  const out = { name: '' };
-  return scanDNSName(bytes, offset, context, out) < 0 ? null : out.name;
-}
 function questionMatchesQuery(responseBytes, responseNameEnd, queryBytes) {
   if (!queryBytes || queryBytes.byteLength < 12) return true;
-  const queryNameEnd = scanDNSName(queryBytes, 12);
+  const queryNameEnd = skipDNSName(queryBytes, 12);
   if (queryNameEnd < 0 || queryNameEnd !== responseNameEnd) return false;
   if (queryNameEnd + 4 > queryBytes.length || responseNameEnd + 4 > responseBytes.length) return false;
   for (let i = 12; i < responseNameEnd; i++) {
@@ -729,7 +713,7 @@ function cappedTTL(ttlSeconds, maxSeconds) {
 }
 function getDNSCacheTTL(responseBuffer) {
   const bytes = new Uint8Array(responseBuffer);
-  if (bytes.length < 12 || bytes.length > MAX_CACHEABLE_DNS_BYTES) return 0;
+  if (bytes.length < 12 || bytes.length > CONFIG.MAX_UPSTREAM_DNS_MESSAGE_BYTES) return 0;
   const flags = (bytes[2] << 8) | bytes[3];
   if ((flags & 0x8000) === 0) return 0;
   if ((flags & 0x0200) !== 0) return 0; 
@@ -749,26 +733,23 @@ function getDNSCacheTTL(responseBuffer) {
   let answerMin = Infinity;
   let authorityMin = Infinity;
   let soaNegativeMin = Infinity;
-  const sections = [
-    ['answer', ancount],
-    ['authority', nscount],
-    ['additional', arcount]
-  ];
-  for (const [section, count] of sections) {
-    for (let i = 0; i < count; i++) {
-      const rr = readResourceRecord(bytes, offset, nameContext);
-      if (!rr) return 0;
-      offset = rr.end;
-      if (rr.type === 41) continue;
-      if (section === 'answer') {
-        answerMin = Math.min(answerMin, rr.ttl);
-      } else if (section === 'authority') {
-        authorityMin = Math.min(authorityMin, rr.ttl);
-        if (rr.type === 6 && rr.rdLength >= 20) {
-          const minimumOffset = findSOAMinimumOffset(bytes, rr.rdataOffset, rr.rdEnd, nameContext);
-          if (minimumOffset >= 0) {
-            soaNegativeMin = Math.min(soaNegativeMin, readUint32(bytes, minimumOffset));
-          }
+  const answerEnd = ancount;
+  const authorityEnd = ancount + nscount;
+  const rrTotal = authorityEnd + arcount;
+  for (let i = 0; i < rrTotal; i++) {
+    const rr = readResourceRecord(bytes, offset, nameContext);
+    if (!rr) return 0;
+    offset = rr.end;
+    if (rr.type === 41 || i >= authorityEnd) continue;
+    const rrTTL = effectiveTTL(rr.ttl);
+    if (i < answerEnd) {
+      answerMin = Math.min(answerMin, rrTTL);
+    } else {
+      authorityMin = Math.min(authorityMin, rrTTL);
+      if (rr.type === 6 && rr.rdLength >= 20) {
+        const minimumOffset = findSOAMinimumOffset(bytes, rr.rdataOffset, rr.rdEnd, nameContext);
+        if (minimumOffset >= 0) {
+          soaNegativeMin = Math.min(soaNegativeMin, effectiveTTL(readUint32(bytes, minimumOffset)));
         }
       }
     }
@@ -785,9 +766,6 @@ function getDNSCacheTTL(responseBuffer) {
     CONFIG.EDGE_CACHE_MIN_TTL_SECONDS,
     CONFIG.EDGE_CACHE_MAX_TTL_SECONDS
   );
-}
-function skipDNSName(bytes, offset, context = null) {
-  return scanDNSName(bytes, offset, context);
 }
 function readResourceRecord(bytes, offset, context = null) {
   const nameEnd = skipDNSName(bytes, offset, context);
@@ -944,6 +922,9 @@ function findSOAMinimumOffset(bytes, rdataOffset, rdEnd, context = null) {
   pos = skipDNSName(bytes, pos, context);
   if (pos < 0 || pos + 20 !== rdEnd) return -1;
   return rdEnd - 4;
+}
+function effectiveTTL(ttl) {
+  return ttl > 0x7fffffff ? 0 : ttl;
 }
 function readUint32(bytes, offset) {
   return (((bytes[offset] * 0x100 + bytes[offset + 1]) * 0x100 + bytes[offset + 2]) * 0x100 + bytes[offset + 3]) >>> 0;
@@ -1181,8 +1162,6 @@ export const __internals = {
   parseDNSQuestion,
   validateDNSResponse,
   skipDNSName,
-  readDNSName,
-  scanDNSName,
   readResourceRecord,
   decodeBase64Url,
   makeCacheKey,

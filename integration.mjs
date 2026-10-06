@@ -2,9 +2,6 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import worker, { __internals as dns } from './Worker.js';
 const PKG_VERSION = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8')).version;
-const realFetch = globalThis.fetch;
-const realCaches = globalThis.caches;
-const realCrypto = globalThis.crypto;
 function encodeName(name) {
   return [...name.split('.').flatMap(x => [x.length, ...Buffer.from(x)]), 0];
 }
@@ -13,8 +10,8 @@ function query(id, name='example.com', type=1, cls=1) {
 }
 function answerFor(q, ip='1.2.3.4', ttl=60, rcode=0) {
   const b = [...q];
-  b[0]=q[0]; b[1]=q[1]; b[2]=0x81; b[3]=rcode;
-  b[6]=rcode===0?0:0; b[7]=rcode===0?1:0;
+  b[2]=0x81; b[3]=rcode;
+  b[7]=rcode===0?1:0;
   if (rcode===0) b.push(0xc0,0x0c,0,1,0,1,(ttl>>>24)&255,(ttl>>>16)&255,(ttl>>>8)&255,ttl&255,0,4,...ip.split('.').map(Number));
   return Uint8Array.from(b);
 }
@@ -98,7 +95,6 @@ mode='fail';
 r=await worker.fetch(req('/dns-query',{method:'POST',headers:{'CF-Connecting-IP':'fail1','content-type':'application/dns-message'},body:query(0x2222,'failure.example')})); assert.equal(r.status,502); assert.equal(r.headers.get('x-upstreams'),'3');
 const huge='A'.repeat(5463); r=await worker.fetch(req('/dns-query?dns='+huge,{method:'GET',headers:{'CF-Connecting-IP':'huge'}}), rateOK); assert.equal(r.status,413);
 r=await worker.fetch(req('/dns-query?dns=%%%',{method:'GET',headers:{'CF-Connecting-IP':'badb64'}}), rateOK); assert.equal(r.status,400);
-console.log('INTEGRATION TESTS: PASS');
 dns.CONFIG.MAX_CACHE_ENTRIES = 512;
 mode='slow'; upstreamCalls=0;
 const coalesceQ=query(0x3333,'coalesce.example');
@@ -120,7 +116,6 @@ const beforeL2=upstreamCalls;
 er=await worker.fetch(req('/dns-query',{method:'POST',headers:{'CF-Connecting-IP':'e3','content-type':'application/dns-message'},body:query(0x6666,'evict.example')}),rateOK);
 assert.equal(er.status,200); assert.equal(er.headers.get('x-cache'),'L2-HIT'); assert.equal(upstreamCalls,beforeL2);
 dns.CONFIG.MAX_CACHE_ENTRIES=512;
-console.log('EXTENDED INTEGRATION TESTS: PASS');
 mode='http-error'; upstreamCalls=0;
 r=await worker.fetch(req('/dns-query',{method:'POST',headers:{'CF-Connecting-IP':'http-error','content-type':'application/dns-message'},body:query(0x7777,'http-error.example')}),rateOK);
 assert.equal(r.status,502); assert.equal(r.headers.get('x-upstreams'),'3');
@@ -173,7 +168,6 @@ r=await worker.fetch(req('/dns-query',{method:'POST',headers:{'CF-Connecting-IP'
 assert.equal(r.status,200);
 r=await worker.fetch(req('/dns-query',{method:'POST',headers:{'CF-Connecting-IP':'malformed-limiter','content-type':'application/dns-message'},body:query(0x7784,'limiter-malformed.example')}),malformedLimiter);
 assert.equal(r.status,429);
-dns.APP_STATE.throttle.delete('throw-limiter');
 const throwingLimiter={DNS_RATE_LIMITER:{limit:async()=>{throw new Error('binding exploded')}}};
 r=await worker.fetch(req('/dns-query',{method:'POST',headers:{'CF-Connecting-IP':'throw-limiter','content-type':'application/dns-message'},body:query(0x7785,'limiter-throw.example')}),throwingLimiter);
 assert.equal(r.status,200);
@@ -194,4 +188,23 @@ const firstResult=await firstP;
 assert.equal(firstResult.status,200);
 assert.equal(dns.APP_STATE.inflight.size,0);
 dns.CONFIG.MAX_INFLIGHT_ENTRIES=previousInflightMax;
-console.log('HARDENING INTEGRATION TESTS: PASS');
+dns.APP_STATE.cache.clear(); cacheStore.clear(); upstreamCalls=0; mode='servfail';
+const degradedQ=query(0x7789,'degraded.example');
+for (const run of [1,2]) {
+  const degradedCtx={jobs:[],waitUntil(p){this.jobs.push(p)}};
+  r=await worker.fetch(req('/dns-query',{method:'POST',headers:{'CF-Connecting-IP':'degraded','content-type':'application/dns-message'},body:degradedQ}),rateOK,degradedCtx);
+  await Promise.all(degradedCtx.jobs);
+  assert.equal(r.status,200);
+  assert.equal(r.headers.get('x-dns-degraded'),'1');
+  assert.equal(r.headers.get('x-cache'),'MISS');
+  assert.equal(r.headers.get('x-upstreams'),'3');
+  out=new Uint8Array(await r.arrayBuffer());
+  assert.equal((out[0]<<8)|out[1],0x7789);
+  assert.equal(out[3]&0x0f,2);
+  assert.equal(upstreamCalls,3*run);
+}
+assert.equal(dns.APP_STATE.cache.size,0);
+assert.equal(cacheStore.size,0);
+assert.equal(dns.APP_STATE.inflight.size,0);
+mode='ok';
+console.log('INTEGRATION TESTS: PASS');
