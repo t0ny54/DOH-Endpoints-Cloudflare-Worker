@@ -352,7 +352,6 @@ test('timeout classification increments timeout without counting it as a generic
   dns.CONFIG.UPSTREAM_TIMEOUT_MS = 20;
   const node = {
     url: 'https://timeout.test/dns-query',
-    order: 0,
     score: 100,
     ok: 0,
     fail: 0,
@@ -389,7 +388,6 @@ test('HTTP errors and content-type failures are classified distinctly from DNS-i
   const realFetch = globalThis.fetch;
   const makeNode = () => ({
     url: 'https://failure.test/dns-query',
-    order: 0,
     score: 100,
     ok: 0,
     fail: 0,
@@ -437,8 +435,8 @@ test('NXDOMAIN vs NOERROR race timing respects the grace window', async () => {
   const previousTimeout = dns.CONFIG.UPSTREAM_TIMEOUT_MS;
   dns.CONFIG.NXDOMAIN_GRACE_MS = 60;
   dns.CONFIG.UPSTREAM_TIMEOUT_MS = 500;
-  const makeNode = (url, order) => ({
-    url, order,
+  const makeNode = (url) => ({
+    url,
     score: 100,
     ok: 0,
     fail: 0,
@@ -449,9 +447,9 @@ test('NXDOMAIN vs NOERROR race timing respects the grace window', async () => {
     lastErrorKind: null
   });
   const nodes = [
-    makeNode('https://race/nxdomain', 0),
-    makeNode('https://race/noerror-fast', 1),
-    makeNode('https://race/noerror-slow', 2)
+    makeNode('https://race/nxdomain'),
+    makeNode('https://race/noerror-fast'),
+    makeNode('https://race/noerror-slow')
   ];
   const query = buildQuery(0x1919);
   try {
@@ -482,9 +480,9 @@ test('NXDOMAIN vs NOERROR race timing respects the grace window', async () => {
     const early = await dns.resolveWithParallelRace(nodes, query, 0x1919);
     assert.equal(early.rcode, 0);
     const lateNodes = [
-      makeNode('https://race/nxdomain', 0),
-      makeNode('https://race/noerror-slow-a', 1),
-      makeNode('https://race/noerror-slow-b', 2)
+      makeNode('https://race/nxdomain'),
+      makeNode('https://race/noerror-slow-a'),
+      makeNode('https://race/noerror-slow-b')
     ];
     globalThis.fetch = async (url, { signal } = {}) => {
       const nx = String(url).endsWith('nxdomain');
@@ -570,4 +568,38 @@ test('isBetterDegraded falls back to score when rcodes differ and neither is SER
   assert.equal(dns.isBetterDegraded(mk(5, 10), B, mk(4, 50), A), false);
   assert.equal(dns.isBetterDegraded(mk(2, 500), B, mk(4, 10), A), true);
   assert.equal(dns.isBetterDegraded(mk(4, 10), A, mk(2, 500), B), false);
+});
+test('patchDNSResponseForAge treats top-bit TTLs as zero instead of aging them from ~136 years (RFC 2181 section 8)', () => {
+  const query = buildQuery(0, 'example.com');
+  const topBitCname = [0xc0, 0x0c, 0x00, 0x05, 0x00, 0x01, 0xff, 0xff, 0xff, 0xff, 0x00, 0x02, 0xc0, 0x0c];
+  const stored = buildResponse(query, { rcode: 3, answers: [topBitCname], authority: [soaRecord(60, 30)] });
+  assert.equal(dns.getDNSCacheTTL(stored.buffer), 30);
+  const aged = new Uint8Array(dns.patchDNSResponseForAge(stored.buffer, 1, 10, query));
+  const record = dns.readResourceRecord(aged, dns.skipDNSName(aged, 12) + 4);
+  assert.deepEqual([...aged.slice(record.rdataOffset - 6, record.rdataOffset - 2)], [0, 0, 0, 0]);
+});
+test('connection-level fetch failures are classified as network failures and count as failures', async () => {
+  const realFetch = globalThis.fetch;
+  const node = {
+    url: 'https://network.test/dns-query',
+    score: 100,
+    ok: 0,
+    fail: 0,
+    timeout: 0,
+    lastLatencyMs: null,
+    ewmaLatencyMs: null,
+    lastError: null,
+    lastErrorKind: null
+  };
+  globalThis.fetch = async () => { throw new TypeError('fetch failed'); };
+  try {
+    await assert.rejects(() => dns.relay(node, buildQuery(0x2121), 0x2121, null));
+    assert.equal(node.lastErrorKind, 'network');
+    assert.equal(node.lastError, 'fetch failed');
+    assert.equal(node.fail, 1);
+    assert.equal(node.timeout, 0);
+    assert.equal(node.score, 88);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
 });

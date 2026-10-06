@@ -1,4 +1,4 @@
-const VERSION = '0.4.4';
+const VERSION = '0.4.5';
 const CONFIG = {
   DNS_PATH: '/dns-query',
   EDGE_CACHE_ENABLED: true,
@@ -29,9 +29,8 @@ const DOH_UPSTREAMS = [
   'https://dns-pi.vercel.app/api/doh/dns-query',
   'https://dns.mydoh.workers.dev/dns-query'
 ];
-const RESOLVER_NODES = DOH_UPSTREAMS.map((url, order) => ({
+const RESOLVER_NODES = DOH_UPSTREAMS.map((url) => ({
   url,
-  order,
   score: CONFIG.SCORE_START,
   ok: 0,
   fail: 0,
@@ -334,7 +333,7 @@ function parseDNSQuestion(packet) {
   for (let i = 0; i < arcount; i++) {
     const rr = readResourceRecord(bytes, offset, nameContext);
     if (!rr) return { ok: false, error: 'Malformed additional record in DNS query' };
-    offset = rr.end;
+    offset = rr.rdEnd;
   }
   if (offset !== bytes.length) {
     return { ok: false, error: 'Unexpected trailing data in DNS query' };
@@ -444,7 +443,7 @@ function abortAttempts(controllers, winnerNode) {
     }
   }
 }
-function upstreamError(message, kind = 'network') {
+function upstreamError(message, kind) {
   const err = new Error(message);
   err.kind = kind;
   return err;
@@ -525,6 +524,7 @@ async function relay(node, packet, expectedID, signal) {
       node.lastErrorKind = 'timeout';
       penalize(node, CONFIG.SCORE_TIMEOUT_DELTA, 'timeout', false);
     } else {
+      if (err && typeof err === 'object' && !err.kind) err.kind = 'network';
       penalize(node, CONFIG.SCORE_FAILURE_DELTA, err);
     }
     throw err;
@@ -562,7 +562,7 @@ function validateDNSResponse(responseBuffer, expectedID, queryBytes) {
   for (let i = 0; i < rrTotal; i++) {
     const rr = readResourceRecord(bytes, offset, nameContext);
     if (!rr) return { ok: false, error: 'Malformed resource record in upstream response' };
-    offset = rr.end;
+    offset = rr.rdEnd;
   }
   if (offset !== bytes.length) {
     return { ok: false, error: 'Trailing bytes in upstream response' };
@@ -739,18 +739,16 @@ function getDNSCacheTTL(responseBuffer) {
   for (let i = 0; i < rrTotal; i++) {
     const rr = readResourceRecord(bytes, offset, nameContext);
     if (!rr) return 0;
-    offset = rr.end;
+    offset = rr.rdEnd;
     if (rr.type === 41 || i >= authorityEnd) continue;
     const rrTTL = effectiveTTL(rr.ttl);
     if (i < answerEnd) {
       answerMin = Math.min(answerMin, rrTTL);
     } else {
       authorityMin = Math.min(authorityMin, rrTTL);
-      if (rr.type === 6 && rr.rdLength >= 20) {
-        const minimumOffset = findSOAMinimumOffset(bytes, rr.rdataOffset, rr.rdEnd, nameContext);
-        if (minimumOffset >= 0) {
-          soaNegativeMin = Math.min(soaNegativeMin, effectiveTTL(readUint32(bytes, minimumOffset)));
-        }
+      if (rr.type === 6) {
+        // readResourceRecord() already proved the SOA RDATA ends with its 20 numeric octets.
+        soaNegativeMin = Math.min(soaNegativeMin, effectiveTTL(readUint32(bytes, rr.rdEnd - 4)));
       }
     }
   }
@@ -778,14 +776,7 @@ function readResourceRecord(bytes, offset, context = null) {
   const rdEnd = rdataOffset + rdLength;
   if (rdEnd > bytes.length) return null;
   if (!validateRData(bytes, type, rrClass, rdataOffset, rdEnd, context)) return null;
-  return {
-    type,
-    ttl,
-    rdLength,
-    rdataOffset,
-    rdEnd,
-    end: rdEnd
-  };
+  return { type, ttl, rdataOffset, rdEnd };
 }
 const SINGLE_NAME_TYPES = new Set([2, 3, 4, 5, 7, 8, 9, 12, 39]);
 const PREF_NAME_TYPES = new Set([15, 18, 21, 36]); 
@@ -846,10 +837,7 @@ function validateRData(bytes, type, rrClass, rdataOffset, rdEnd, context) {
     const end = readName(signerStart);
     return end >= 0 && end < rdEnd;
   }
-  if (type === 25 || type === 48) { 
-    return rdEnd - rdataOffset >= 4;
-  }
-  if (type === 43) {
+  if (type === 25 || type === 43 || type === 48) { 
     return rdEnd - rdataOffset >= 4;
   }
   if (type === 47) {
@@ -916,13 +904,6 @@ function validateTypeBitmap(bytes, offset, end) {
   }
   return pos === end;
 }
-function findSOAMinimumOffset(bytes, rdataOffset, rdEnd, context = null) {
-  let pos = skipDNSName(bytes, rdataOffset, context);
-  if (pos < 0 || pos >= rdEnd) return -1;
-  pos = skipDNSName(bytes, pos, context);
-  if (pos < 0 || pos + 20 !== rdEnd) return -1;
-  return rdEnd - 4;
-}
 function effectiveTTL(ttl) {
   return ttl > 0x7fffffff ? 0 : ttl;
 }
@@ -972,14 +953,14 @@ function patchDNSResponseForAge(responseBuffer, queryID, ageSeconds, queryBytes)
     const rr = readResourceRecord(copy, offset, nameContext);
     if (!rr) return copy.buffer;
     if (rr.type !== 41) {
-      const remaining = Math.max(0, rr.ttl - ageSeconds);
+      const remaining = Math.max(0, effectiveTTL(rr.ttl) - ageSeconds);
       const ttlOffset = rr.rdataOffset - 6;
       copy[ttlOffset] = (remaining >>> 24) & 0xff;
       copy[ttlOffset + 1] = (remaining >>> 16) & 0xff;
       copy[ttlOffset + 2] = (remaining >>> 8) & 0xff;
       copy[ttlOffset + 3] = remaining & 0xff;
     }
-    offset = rr.end;
+    offset = rr.rdEnd;
   }
   return copy.buffer;
 }
@@ -1085,7 +1066,8 @@ function getHealthSnapshot() {
       timeout: node.timeout,
       ewmaLatencyMs: node.ewmaLatencyMs,
       lastLatencyMs: node.lastLatencyMs,
-      lastError: node.lastError
+      lastError: node.lastError,
+      lastErrorKind: node.lastErrorKind
     })),
     cacheEntries: APP_STATE.cache.size,
     inflightEntries: APP_STATE.inflight.size,
@@ -1163,9 +1145,7 @@ export const __internals = {
   validateDNSResponse,
   skipDNSName,
   readResourceRecord,
-  decodeBase64Url,
   makeCacheKey,
-  normalizeDNSResponseID,
   getDNSCacheTTL,
   patchDNSResponseForAge,
   localRateLimit,
@@ -1174,9 +1154,6 @@ export const __internals = {
   relay,
   getCache,
   setCache,
-  getEdgeCache,
-  putEdgeCache,
-  allowDNSRequest,
   APP_STATE
 };
 const UI_RESPONSE_CACHE = new Map();

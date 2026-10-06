@@ -11,15 +11,17 @@ function query(id, name='example.com', type=1, cls=1) {
 function answerFor(q, ip='1.2.3.4', ttl=60, rcode=0) {
   const b = [...q];
   b[2]=0x81; b[3]=rcode;
-  b[7]=rcode===0?1:0;
-  if (rcode===0) b.push(0xc0,0x0c,0,1,0,1,(ttl>>>24)&255,(ttl>>>16)&255,(ttl>>>8)&255,ttl&255,0,4,...ip.split('.').map(Number));
+  if (rcode===0) {
+    b[7]=1;
+    b.push(0xc0,0x0c,0,1,0,1,(ttl>>>24)&255,(ttl>>>16)&255,(ttl>>>8)&255,ttl&255,0,4,...ip.split('.').map(Number));
+  }
   return Uint8Array.from(b);
 }
 let upstreamCalls = 0;
 let mode = 'ok';
 const cacheStore = new Map();
 globalThis.caches = { default: {
-  async match(req) { return cacheStore.get(req.url) || undefined; },
+  async match(req) { return cacheStore.get(req.url)?.clone(); },
   async put(req, res) { cacheStore.set(req.url, res.clone()); }
 }};
 globalThis.fetch = async (url, opts={}) => {
@@ -93,6 +95,8 @@ assert.equal(saw429,true);
 r=await worker.fetch(req('/dns-query',{method:'POST',headers:{'CF-Connecting-IP':'native','content-type':'application/dns-message'},body:q1}),{DNS_RATE_LIMITER:{limit:async()=>({success:false})}}); assert.equal(r.status,429);
 mode='fail';
 r=await worker.fetch(req('/dns-query',{method:'POST',headers:{'CF-Connecting-IP':'fail1','content-type':'application/dns-message'},body:query(0x2222,'failure.example')})); assert.equal(r.status,502); assert.equal(r.headers.get('x-upstreams'),'3');
+const healthAfterFail=await (await worker.fetch(req('/health'))).json();
+assert.ok(healthAfterFail.upstreams.every(u=>u.lastErrorKind==='network'));
 const huge='A'.repeat(5463); r=await worker.fetch(req('/dns-query?dns='+huge,{method:'GET',headers:{'CF-Connecting-IP':'huge'}}), rateOK); assert.equal(r.status,413);
 r=await worker.fetch(req('/dns-query?dns=%%%',{method:'GET',headers:{'CF-Connecting-IP':'badb64'}}), rateOK); assert.equal(r.status,400);
 dns.CONFIG.MAX_CACHE_ENTRIES = 512;
@@ -119,6 +123,8 @@ dns.CONFIG.MAX_CACHE_ENTRIES=512;
 mode='http-error'; upstreamCalls=0;
 r=await worker.fetch(req('/dns-query',{method:'POST',headers:{'CF-Connecting-IP':'http-error','content-type':'application/dns-message'},body:query(0x7777,'http-error.example')}),rateOK);
 assert.equal(r.status,502); assert.equal(r.headers.get('x-upstreams'),'3');
+const healthAfterHttp=await (await worker.fetch(req('/health'))).json();
+assert.ok(healthAfterHttp.upstreams.every(u=>u.lastErrorKind==='http'));
 mode='bad-content-type'; upstreamCalls=0;
 r=await worker.fetch(req('/dns-query',{method:'POST',headers:{'CF-Connecting-IP':'content-type','content-type':'application/dns-message'},body:query(0x7778,'content-type.example')}),rateOK);
 assert.equal(r.status,502); assert.equal(r.headers.get('x-upstreams'),'3');
