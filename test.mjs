@@ -573,7 +573,6 @@ test('patchDNSResponseForAge treats top-bit TTLs as zero instead of aging them f
   const query = buildQuery(0, 'example.com');
   const topBitCname = [0xc0, 0x0c, 0x00, 0x05, 0x00, 0x01, 0xff, 0xff, 0xff, 0xff, 0x00, 0x02, 0xc0, 0x0c];
   const stored = buildResponse(query, { rcode: 3, answers: [topBitCname], authority: [soaRecord(60, 30)] });
-  assert.equal(dns.getDNSCacheTTL(stored.buffer), 30);
   const aged = new Uint8Array(dns.patchDNSResponseForAge(stored.buffer, 1, 10, query));
   const record = dns.readResourceRecord(aged, dns.skipDNSName(aged, 12) + 4);
   assert.deepEqual([...aged.slice(record.rdataOffset - 6, record.rdataOffset - 2)], [0, 0, 0, 0]);
@@ -599,6 +598,64 @@ test('connection-level fetch failures are classified as network failures and cou
     assert.equal(node.fail, 1);
     assert.equal(node.timeout, 0);
     assert.equal(node.score, 88);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+test('getDNSCacheTTL bounds a negative answer by its answer-section CNAME chain as well as the SOA', () => {
+  const query = buildQuery(0, 'example.com');
+  const cname = (ttl) => [0xc0, 0x0c, 0x00, 0x05, 0x00, 0x01,
+    ttl >>> 24, (ttl >>> 16) & 0xff, (ttl >>> 8) & 0xff, ttl & 0xff, 0x00, 0x02, 0xc0, 0x0c];
+  const shortCname = buildResponse(query, { rcode: 3, answers: [cname(10)], authority: [soaRecord(60, 30)] });
+  assert.equal(dns.getDNSCacheTTL(shortCname.buffer), 10);
+  const longCname = buildResponse(query, { rcode: 3, answers: [cname(900)], authority: [soaRecord(60, 30)] });
+  assert.equal(dns.getDNSCacheTTL(longCname.buffer), 30);
+  const topBitCname = buildResponse(query, { rcode: 3, answers: [cname(0xffffffff)], authority: [soaRecord(60, 30)] });
+  assert.equal(dns.getDNSCacheTTL(topBitCname.buffer), 0);
+  const cnameToNodata = buildResponse(query, { answers: [cname(10)], authority: [soaRecord(60, 30)] });
+  assert.equal(dns.getDNSCacheTTL(cnameToNodata.buffer), 10);
+  const cnameToNodataShortSoa = buildResponse(query, { answers: [cname(900)], authority: [soaRecord(60, 30)] });
+  assert.equal(dns.getDNSCacheTTL(cnameToNodataShortSoa.buffer), 30);
+});
+test('a timeout records lastError and lastErrorKind through penalize() alone and scores 8 points', async () => {
+  const realFetch = globalThis.fetch;
+  const previousTimeout = dns.CONFIG.UPSTREAM_TIMEOUT_MS;
+  dns.CONFIG.UPSTREAM_TIMEOUT_MS = 15;
+  const node = { url: 'https://timeout2.test/dns-query', score: 100, ok: 0, fail: 0, timeout: 0,
+    lastLatencyMs: null, ewmaLatencyMs: null, lastError: null, lastErrorKind: null };
+  globalThis.fetch = (_url, { signal } = {}) => new Promise((_resolve, reject) => {
+    signal?.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), { once: true });
+  });
+  try {
+    await assert.rejects(() => dns.relay(node, buildQuery(0x2222), 0x2222, null));
+    assert.deepEqual([node.timeout, node.fail, node.score], [1, 0, 92]);
+    assert.deepEqual([node.lastError, node.lastErrorKind], ['timeout', 'timeout']);
+  } finally {
+    globalThis.fetch = realFetch;
+    dns.CONFIG.UPSTREAM_TIMEOUT_MS = previousTimeout;
+  }
+});
+test('a cold-miss race reports one attempt per upstream, and a winner does not penalize aborted losers', async () => {
+  const realFetch = globalThis.fetch;
+  const query = buildQuery(0x2323);
+  const mk = (url) => ({ url, score: 100, ok: 0, fail: 0, timeout: 0, lastLatencyMs: null,
+    ewmaLatencyMs: null, lastError: null, lastErrorKind: null });
+  const nodes = [mk('https://w/fast'), mk('https://w/slow-a'), mk('https://w/slow-b')];
+  globalThis.fetch = (url, { signal } = {}) => new Promise((resolve, reject) => {
+    const fast = String(url).endsWith('fast');
+    const timer = setTimeout(() => resolve(new Response(buildResponse(query, { answers: [aRecord('1.2.3.4')] }), {
+      status: 200, headers: { 'content-type': 'application/dns-message' } })), fast ? 0 : 300);
+    signal?.addEventListener('abort', () => { clearTimeout(timer); reject(new DOMException('Aborted', 'AbortError')); }, { once: true });
+  });
+  try {
+    const result = await dns.resolveWithParallelRace(nodes, query, 0x2323);
+    assert.equal(result.attempts, 3);
+    assert.equal(result.url, 'https://w/fast');
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    for (const slow of nodes.slice(1)) {
+      assert.deepEqual([slow.fail, slow.timeout, slow.score, slow.lastError], [0, 0, 100, null]);
+    }
+    await assert.rejects(() => dns.resolveWithParallelRace([], query, 0x2323), /No upstreams configured/);
   } finally {
     globalThis.fetch = realFetch;
   }

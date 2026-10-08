@@ -1,4 +1,4 @@
-const VERSION = '0.4.5';
+const VERSION = '0.4.6';
 const CONFIG = {
   DNS_PATH: '/dns-query',
   EDGE_CACHE_ENABLED: true,
@@ -138,9 +138,10 @@ async function handleDNS(req, url, ctx) {
     const result = await resolveWithParallelRace(RESOLVER_NODES, payload, parsed.id);
     const storedAt = Date.now();
     const ttlSeconds = getDNSCacheTTL(result.body);
-    let normalizedBody = result.body;
+    const normalizedBody = result.body;
     if (ttlSeconds > 0) {
-      normalizedBody = normalizeDNSResponseID(result.body);
+      // The buffer is private to this job (fresh from relay()), so zero the ID in place.
+      new Uint8Array(normalizedBody).fill(0, 0, 2);
       const localTTL = cappedTTL(ttlSeconds, CONFIG.LOCAL_CACHE_MAX_TTL_SECONDS);
       setCache(
         cacheKey,
@@ -340,22 +341,13 @@ function parseDNSQuestion(packet) {
   }
   return { ok: true, id };
 }
-function normalizeDNSResponseID(responseBuffer) {
-  const bytes = new Uint8Array(responseBuffer);
-  const copy = new Uint8Array(bytes.length);
-  copy.set(bytes);
-  copy[0] = 0;
-  copy[1] = 0;
-  return copy.buffer;
-}
 async function resolveWithParallelRace(nodes, packet, expectedID) {
   if (!nodes.length) throw new Error('No upstreams configured');
   const controllers = new Map();
   const active = new Map();
-  const attempts = [];
-  let fallback = null;       
+  let fallback = null;
   let fallbackNode = null;
-  let nxdomain = null;       
+  let nxdomain = null;
   let nxdomainDeadline = 0;
   const startAttempt = (node) => {
     const controller = new AbortController();
@@ -364,7 +356,6 @@ async function resolveWithParallelRace(nodes, packet, expectedID) {
       .then((value) => ({ ok: true, node, value }))
       .catch((error) => ({ ok: false, node, error }));
     active.set(node, promise);
-    attempts.push(node);
   };
   for (const node of nodes) startAttempt(node);
   let graceTimer = null;
@@ -382,17 +373,14 @@ async function resolveWithParallelRace(nodes, packet, expectedID) {
       } else {
         result = await Promise.race(active.values());
       }
-      if (!result || !result.node) {
-        break;
-      }
+      if (!result) break; // grace window elapsed
       active.delete(result.node);
       if (result.ok) {
         const value = result.value;
         if (value.usable && value.rcode === 0) {
-          abortAttempts(controllers, result.node);
           return {
             ...value,
-            attempts: attempts.length
+            attempts: nodes.length
           };
         }
         if (value.usable && value.rcode === 3) {
@@ -411,17 +399,17 @@ async function resolveWithParallelRace(nodes, packet, expectedID) {
     if (nxdomain) {
       return {
         ...nxdomain,
-        attempts: attempts.length
+        attempts: nodes.length
       };
     }
     if (fallback) {
       return {
         ...fallback,
-        attempts: attempts.length
+        attempts: nodes.length
       };
     }
     const err = new Error('All DNS upstreams failed');
-    err.attempts = attempts.length;
+    err.attempts = nodes.length;
     throw err;
   } finally {
     clearGrace();
@@ -436,11 +424,9 @@ function isBetterDegraded(value, node, bestValue, bestNode) {
   if (node.score !== bestNode.score) return node.score > bestNode.score;
   return value.latencyMs < bestValue.latencyMs;
 }
-function abortAttempts(controllers, winnerNode) {
-  for (const [node, controller] of controllers) {
-    if (!winnerNode || node !== winnerNode) {
-      try { controller.abort('winner-selected'); } catch (_) {}
-    }
+function abortAttempts(controllers) {
+  for (const controller of controllers.values()) {
+    try { controller.abort('winner-selected'); } catch (_) {}
   }
 }
 function upstreamError(message, kind) {
@@ -460,7 +446,7 @@ async function relay(node, packet, expectedID, signal) {
         accept: 'application/dns-message',
         'content-type': 'application/dns-message'
       },
-      body: packet.slice ? packet.slice(0) : packet,
+      body: packet.slice(),
       signal: combinedSignal
     });
     if (!res.ok) {
@@ -520,8 +506,6 @@ async function relay(node, packet, expectedID, signal) {
     if (raceAbort) throw err;
     if (timeoutAbort) {
       node.timeout += 1;
-      node.lastError = 'timeout';
-      node.lastErrorKind = 'timeout';
       penalize(node, CONFIG.SCORE_TIMEOUT_DELTA, 'timeout', false);
     } else {
       if (err && typeof err === 'object' && !err.kind) err.kind = 'network';
@@ -586,14 +570,14 @@ function skipDNSName(bytes, offset, context = null) {
     if ((len & 0xc0) === 0xc0) {
       if (pos + 1 >= bytes.length) return -1;
       const pointer = ((len & 0x3f) << 8) | bytes[pos + 1];
-      if (pointer >= pos || pointer >= bytes.length) return -1;
+      if (pointer >= pos) return -1;
       if (context && (pointer < 12 || !context.nameOffsets.has(pointer))) return -1;
       if (++jumps > 127) return -1;
       if (end < 0) end = pos + 2;
       pos = pointer;
       continue;
     }
-    if ((len & 0xc0) !== 0 || len > 63 || pos + 1 + len > bytes.length) {
+    if ((len & 0xc0) !== 0 || pos + 1 + len > bytes.length) {
       return -1;
     }
     if (expandedWireLength + len + 1 > 255) return -1;
@@ -752,12 +736,11 @@ function getDNSCacheTTL(responseBuffer) {
       }
     }
   }
-  let ttl;
-  if (rcode === 3 || (rcode === 0 && ancount === 0)) {
-    ttl = soaNegativeMin === Infinity ? Infinity : Math.min(authorityMin, soaNegativeMin);
-  } else {
-    ttl = answerMin;
-  }
+  const negativeTTL = soaNegativeMin === Infinity ? Infinity : Math.min(authorityMin, soaNegativeMin);
+  // A negative answer (NXDOMAIN/NODATA) needs an SOA; any answer-section records
+  // (for example the CNAME chain in front of an NXDOMAIN) bound the lifetime too.
+  if (negativeTTL === Infinity && (rcode === 3 || ancount === 0)) return 0;
+  const ttl = Math.min(answerMin, negativeTTL);
   if (!Number.isFinite(ttl) || ttl <= 0) return 0;
   return clamp(
     Math.floor(ttl),
@@ -920,10 +903,7 @@ function restoreQuestionCase(target, query) {
     if ((len & 0xc0) !== 0 || target[offset] !== len) return;
     if (offset + 1 + len > maxLen) return;
     for (let i = offset + 1; i <= offset + len; i++) {
-      const qv = query[i];
-      const tv = target[i];
-      if (typeof qv !== 'number' || typeof tv !== 'number') return;
-      if (lower(qv) !== lower(tv)) return;
+      if (lower(query[i]) !== lower(target[i])) return;
     }
     for (let i = offset + 1; i <= offset + len; i++) target[i] = query[i];
     offset += 1 + len;
@@ -998,13 +978,14 @@ async function putEdgeCache(key, body, ttlSeconds, storedAt, origin) {
   try {
     const cache = caches.default;
     const cacheKey = makeEdgeCacheRequest(origin, key);
+    const ttl = Math.max(1, Math.floor(ttlSeconds));
     const response = new Response(body, {
       status: 200,
       headers: {
         'content-type': 'application/dns-message',
-        'cache-control': `public, s-maxage=${Math.max(1, Math.floor(ttlSeconds))}`,
+        'cache-control': `public, s-maxage=${ttl}`,
         'x-doh-stored-at': String(storedAt),
-        'x-doh-ttl': String(Math.max(1, Math.floor(ttlSeconds)))
+        'x-doh-ttl': String(ttl)
       }
     });
     await cache.put(cacheKey, response);
@@ -1025,13 +1006,13 @@ function maybeSweepState() {
 async function allowDNSRequest(ip, env) {
   if (env?.DNS_RATE_LIMITER?.limit) {
     try {
-      const result = await env.DNS_RATE_LIMITER.limit({ key: ip || 'unknown' });
+      const result = await env.DNS_RATE_LIMITER.limit({ key: ip });
       if (typeof result?.success === 'boolean') return result.success;
       throw new Error('Invalid DNS_RATE_LIMITER response');
     } catch (_) {
     }
   }
-  return localRateLimit(ip || 'unknown');
+  return localRateLimit(ip);
 }
 function localRateLimit(ip) {
   const now = Date.now();
