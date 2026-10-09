@@ -1,4 +1,4 @@
-const VERSION = '0.4.6';
+const VERSION = '0.4.7';
 const CONFIG = {
   DNS_PATH: '/dns-query',
   EDGE_CACHE_ENABLED: true,
@@ -138,14 +138,13 @@ async function handleDNS(req, url, ctx) {
     const result = await resolveWithParallelRace(RESOLVER_NODES, payload, parsed.id);
     const storedAt = Date.now();
     const ttlSeconds = getDNSCacheTTL(result.body);
-    const normalizedBody = result.body;
     if (ttlSeconds > 0) {
       // The buffer is private to this job (fresh from relay()), so zero the ID in place.
-      new Uint8Array(normalizedBody).fill(0, 0, 2);
+      new Uint8Array(result.body).fill(0, 0, 2);
       const localTTL = cappedTTL(ttlSeconds, CONFIG.LOCAL_CACHE_MAX_TTL_SECONDS);
       setCache(
         cacheKey,
-        normalizedBody,
+        result.body,
         localTTL,
         storedAt
       );
@@ -153,7 +152,7 @@ async function handleDNS(req, url, ctx) {
         try {
           ctx?.waitUntil?.(putEdgeCache(
             cacheKey,
-            normalizedBody,
+            result.body,
             cappedTTL(ttlSeconds, CONFIG.EDGE_CACHE_MAX_TTL_SECONDS),
             storedAt,
             url.origin
@@ -161,11 +160,7 @@ async function handleDNS(req, url, ctx) {
         } catch (_) {}
       }
     }
-    return {
-      ...result,
-      body: normalizedBody,
-      storedAt
-    };
+    return { ...result, storedAt };
   })();
   APP_STATE.inflight.set(cacheKey, job);
   try {
@@ -275,7 +270,7 @@ async function readCappedBody(source, maxBytes, tooLargeMessage) {
       chunks.push(value);
     }
   } finally {
-    try { await reader.releaseLock(); } catch (_) {}
+    try { reader.releaseLock(); } catch (_) {}
   }
   if (chunks.length === 1) return new Uint8Array(chunks[0]);
   const out = new Uint8Array(total);
@@ -305,8 +300,7 @@ function decodeBase64Url(input) {
     throw httpError('Invalid base64url DNS query', 400);
   }
 }
-function parseDNSQuestion(packet) {
-  const bytes = packet instanceof Uint8Array ? packet : new Uint8Array(packet);
+function parseDNSQuestion(bytes) {
   if (bytes.byteLength < 12) {
     return { ok: false, error: 'DNS message too short' };
   }
@@ -649,8 +643,7 @@ function normalizeUncompressedQuestionName(bytes) {
   while (offset < bytes.length) {
     const len = bytes[offset];
     if (len === 0) return;
-    if ((len & 0xc0) !== 0) return; 
-    if (len > 63 || offset + 1 + len > bytes.length) return;
+    if ((len & 0xc0) !== 0 || offset + 1 + len > bytes.length) return;
     for (let i = offset + 1; i <= offset + len; i++) {
       const value = bytes[i];
       if (value >= 65 && value <= 90) bytes[i] = value + 32;
@@ -659,8 +652,7 @@ function normalizeUncompressedQuestionName(bytes) {
   }
 }
 async function makeCacheKey(packet) {
-  const bytes = packet instanceof Uint8Array ? packet : new Uint8Array(packet);
-  const normalized = bytes.slice();
+  const normalized = packet.slice();
   normalized[0] = 0;
   normalized[1] = 0;
   normalizeUncompressedQuestionName(normalized);
@@ -910,9 +902,7 @@ function restoreQuestionCase(target, query) {
   }
 }
 function patchDNSResponseForAge(responseBuffer, queryID, ageSeconds, queryBytes) {
-  const bytes = new Uint8Array(responseBuffer);
-  const copy = new Uint8Array(bytes.length);
-  copy.set(bytes);
+  const copy = new Uint8Array(responseBuffer).slice();
   copy[0] = (queryID >> 8) & 0xff;
   copy[1] = queryID & 0xff;
   if (queryBytes) restoreQuestionCase(copy, queryBytes);
@@ -1295,6 +1285,7 @@ function renderUI(host) {
             if (!I18N[c]) c = 'en';
             try { localStorage.setItem('doc_v6', c); } catch (_) {}
             const l = I18N[c];
+            document.documentElement.lang = c;
             document.body.classList.toggle('lang-fa', c === 'fa');
             document.getElementById('currentLang').innerText = l.curL;
             document.getElementById('mainTitle').innerText = l.main;

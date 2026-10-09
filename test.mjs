@@ -660,3 +660,63 @@ test('a cold-miss race reports one attempt per upstream, and a winner does not p
     globalThis.fetch = realFetch;
   }
 });
+test('localRateLimit opens a fresh window exactly when the previous one has expired', () => {
+  const realNow = Date.now;
+  let now = 1_000_000;
+  Date.now = () => now;
+  dns.APP_STATE.throttle.clear();
+  try {
+    for (let i = 0; i < dns.CONFIG.RATE_LIMIT_MAX_REQUESTS; i++) {
+      assert.equal(dns.localRateLimit('window-ip'), true);
+    }
+    assert.equal(dns.localRateLimit('window-ip'), false);
+    now += dns.CONFIG.RATE_LIMIT_WINDOW_MS - 1;
+    assert.equal(dns.localRateLimit('window-ip'), false);
+    now += 1;
+    assert.equal(dns.localRateLimit('window-ip'), true);
+    assert.equal(dns.APP_STATE.throttle.get('window-ip').count, 1);
+  } finally {
+    Date.now = realNow;
+    dns.APP_STATE.throttle.clear();
+  }
+});
+test('makeCacheKey and patchDNSResponseForAge never mutate their input buffers', async () => {
+  const packet = buildQuery(0x2424, 'MiXeD.Example.COM');
+  const before = [...packet];
+  await dns.makeCacheKey(packet);
+  assert.deepEqual([...packet], before);
+  const stored = buildResponse(buildQuery(0, 'example.com'), { answers: [aRecord('1.2.3.4', 300)] });
+  const storedBefore = [...stored];
+  const patched = new Uint8Array(dns.patchDNSResponseForAge(stored.buffer, 0xabcd, 50, buildQuery(1, 'EXAMPLE.com')));
+  assert.deepEqual([...stored], storedBefore);
+  assert.notEqual(patched.buffer, stored.buffer);
+  assert.equal((patched[0] << 8) | patched[1], 0xabcd);
+});
+test('relay still classifies timeouts and ignores race aborts when AbortSignal.any is unavailable', async () => {
+  const realFetch = globalThis.fetch;
+  const realAny = AbortSignal.any;
+  const previousTimeout = dns.CONFIG.UPSTREAM_TIMEOUT_MS;
+  const makeNode = (url) => ({ url, score: 100, ok: 0, fail: 0, timeout: 0,
+    lastLatencyMs: null, ewmaLatencyMs: null, lastError: null, lastErrorKind: null });
+  globalThis.fetch = (_url, { signal } = {}) => new Promise((_resolve, reject) => {
+    signal?.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), { once: true });
+  });
+  AbortSignal.any = undefined;
+  try {
+    dns.CONFIG.UPSTREAM_TIMEOUT_MS = 15;
+    const slow = makeNode('https://any-fallback-timeout.test/dns-query');
+    await assert.rejects(() => dns.relay(slow, buildQuery(0x2525), 0x2525, new AbortController().signal));
+    assert.deepEqual([slow.timeout, slow.fail, slow.score], [1, 0, 92]);
+    dns.CONFIG.UPSTREAM_TIMEOUT_MS = 5_000;
+    const loser = makeNode('https://any-fallback-abort.test/dns-query');
+    const controller = new AbortController();
+    const pending = dns.relay(loser, buildQuery(0x2626), 0x2626, controller.signal);
+    controller.abort('winner-selected');
+    await assert.rejects(() => pending);
+    assert.deepEqual([loser.timeout, loser.fail, loser.score, loser.lastError], [0, 0, 100, null]);
+  } finally {
+    AbortSignal.any = realAny;
+    globalThis.fetch = realFetch;
+    dns.CONFIG.UPSTREAM_TIMEOUT_MS = previousTimeout;
+  }
+});

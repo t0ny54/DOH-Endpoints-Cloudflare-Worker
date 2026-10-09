@@ -1,6 +1,6 @@
 # 🛡️ DoH — Cloudflare Worker
 
-**Version 0.4.6** · see [`CHANGELOG.md`](CHANGELOG.md)
+**Version 0.4.7** · see [`CHANGELOG.md`](CHANGELOG.md)
 
 A lightweight Cloudflare Worker that exposes a standard **DNS-over-HTTPS** endpoint, races three configured DoH upstreams in parallel, and keeps a two-level DNS cache:
 
@@ -21,6 +21,7 @@ This Worker deliberately stays far below those ceilings on ordinary DNS traffic:
 | Path | Cache API | configured DoH upstreams |
 |---|---:|---:|
 | L1 cache hit | 0 | 0 |
+| Coalesced (joins a lookup already in flight) | 0, or 1 match if the lookup started while the L2 check was pending | 0 |
 | L2 cache hit | 1 | 0 |
 | Cold cache miss | 1 match + 1 async put (cacheable answers only) | 3 in parallel |
 | Degraded upstream fallback | 1 match | 3 in parallel |
@@ -66,7 +67,7 @@ After deployment:
 https://YOUR-DOMAIN.example/dns-query
 ```
 
-The Worker also serves a small English/Persian/Chinese setup dashboard at `/` (also reachable as `/index.html`; it loads Tailwind from `cdn.tailwindcss.com`, while the DoH endpoint itself has no external dependency) and a JSON status page at `/health`. The dashboard is served with `Content-Security-Policy` (scripts only from itself, inline scripts and `cdn.tailwindcss.com`), `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer` and `Cache-Control: public, max-age=300`.
+The Worker also serves a small English/Persian/Chinese setup dashboard at `/` (also reachable as `/index.html`; it loads Tailwind from `cdn.tailwindcss.com`, while the DoH endpoint itself has no external dependency; choosing a language also updates the page's `lang` attribute) and a JSON status page at `/health`. The dashboard is served with `Content-Security-Policy` (scripts only from itself, inline scripts and `cdn.tailwindcss.com`), `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer` and `Cache-Control: public, max-age=300`.
 
 ## DoH methods
 
@@ -124,9 +125,9 @@ npm run test:all
 
 The integration and smoke tests read the expected version from `package.json` and compare it with `/health`, so a release only needs `package.json` and the `VERSION` constant in `Worker.js` to be bumped together.
 
-The unit suite (36 tests) covers DNS wire parsing, strict compression-pointer validation, all RR sections, name-bearing RDATA, SOA structure/compression boundaries, TTL/cacheability rules (including the negative-cache TTL of lowest authority TTL capped by SOA `MINIMUM`, answer-section CNAME TTLs bounding NXDOMAIN/NODATA answers, and RFC 2181 top-bit TTLs), response patching (transaction ID, TTL aging, question-case restoration, top-bit TTLs aged as 0), IPv6/other RR types, DNSSEC-heavy responses, L1 expiration/LRU eviction, resolver scoring, upstream failure classification (timeout, HTTP, content-type, oversized body, network), NXDOMAIN-vs-NOERROR race timing, attempt counting and loser handling in the race, L2-to-L1 promotion expiry, DNS name scanning (pointer loops/forward pointers), local rate-limiter LRU eviction, wire-level question matching (case-insensitive, label structure must match), degraded-answer ranking (SERVFAIL, then score, then latency), and cache-key normalization.
+The unit suite (39 tests) covers DNS wire parsing, strict compression-pointer validation, all RR sections, name-bearing RDATA, SOA structure/compression boundaries, TTL/cacheability rules (including the negative-cache TTL of lowest authority TTL capped by SOA `MINIMUM`, answer-section CNAME TTLs bounding NXDOMAIN/NODATA answers, and RFC 2181 top-bit TTLs), response patching (transaction ID, TTL aging, question-case restoration, top-bit TTLs aged as 0), IPv6/other RR types, DNSSEC-heavy responses, L1 expiration/LRU eviction, resolver scoring, upstream failure classification (timeout, HTTP, content-type, oversized body, network), NXDOMAIN-vs-NOERROR race timing, attempt counting and loser handling in the race, L2-to-L1 promotion expiry, DNS name scanning (pointer loops/forward pointers), local rate-limiter LRU eviction and window reset, wire-level question matching (case-insensitive, label structure must match), degraded-answer ranking (SERVFAIL, then score, then latency), cache-key normalization, the guarantee that cache-key and TTL-aging helpers never mutate their input buffers (cached and coalesced bodies are shared), and relay timeout/abort bookkeeping on runtimes without `AbortSignal.any`.
 
-The integration suite exercises the exported Worker `fetch()` handler for routing, GET/POST DoH, request validation, L1/L2 caching, expired L2 entries, transaction-ID restoration, request coalescing, the `MAX_INFLIGHT_ENTRIES` saturation path, native/local rate limiting, malformed/throwing rate-limit bindings, degraded `SERVFAIL` answers (relayed with `x-dns-degraded: 1` and never cached), HTTP/content-type/timeout/oversized-chunked/connection-level upstream failures (including the `lastErrorKind` values reported by `/health`), cache API failures, and size protections.
+The integration suite exercises the exported Worker `fetch()` handler for routing, GET/POST DoH, request validation, L1/L2 caching, expired L2 entries, transaction-ID restoration, request coalescing, the `MAX_INFLIGHT_ENTRIES` saturation path, native/local rate limiting, malformed/throwing rate-limit bindings, client body limits (`Content-Length` and chunked bodies over 4 KiB, empty POST), malformed L2 entries without the `x-doh-*` headers, the periodic sweep of expired L1/throttle entries, the headers of coalesced responses, degraded `SERVFAIL` answers (relayed with `x-dns-degraded: 1` and never cached), HTTP/content-type/timeout/oversized-chunked/connection-level upstream failures (including the `lastErrorKind` values reported by `/health`), cache API failures, and size protections.
 
 `wrangler-smoke.mjs` starts the actual local Wrangler `dev` runtime (Cloudflare's `workerd` through Wrangler/Miniflare), then probes `/health`, `/`, an invalid DoH request, and an unsupported method without contacting the public DoH upstreams. On Linux/macOS it stops the whole Wrangler process group when it finishes; on Windows it runs through a shell and ends the whole process tree with `taskkill /T /F`, so no `workerd` process is left behind. If Wrangler cannot start or exits early, the script fails immediately and prints Wrangler's output instead of waiting for the 20-second startup timeout. The Rate Limiting binding is locally simulated during `wrangler dev`; it is not a test of production-wide Cloudflare counters. See the [Cloudflare local-development documentation](https://developers.cloudflare.com/workers/local-development/) and [Rate Limiting API documentation](https://developers.cloudflare.com/workers/runtime-apis/bindings/rate-limit/).
 
@@ -143,8 +144,8 @@ Useful response headers include:
 x-cache: L1-HIT / L2-HIT / COALESCED / MISS
 x-edge-cache: HIT / MISS / SKIP / DISABLED
 x-upstreams: 0 (cache/coalesced) or 3 (every cold lookup races all three)
-x-winner: <upstream-url>
-x-winner-lat: <latency>
+x-winner: <upstream-url>          (MISS and COALESCED)
+x-winner-lat: <latency>           (MISS and COALESCED)
 x-dns-degraded: 1   (only when the answer is SERVFAIL/REFUSED/etc.)
 ```
 
