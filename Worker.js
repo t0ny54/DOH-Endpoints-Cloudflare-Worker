@@ -1,4 +1,4 @@
-const VERSION = '0.4.7';
+const VERSION = '0.4.8';
 const CONFIG = {
   DNS_PATH: '/dns-query',
   EDGE_CACHE_ENABLED: true,
@@ -55,7 +55,7 @@ export default {
       if (!(await allowDNSRequest(clientIP, env))) {
         return textResponse('Rate limit exceeded', 429, {
           'cache-control': 'no-store',
-          'retry-after': '60'
+          'retry-after': String(Math.ceil(CONFIG.RATE_LIMIT_WINDOW_MS / 1000))
         });
       }
       return handleDNS(req, url, ctx);
@@ -91,15 +91,7 @@ async function handleDNS(req, url, ctx) {
   }
   const cacheKey = await makeCacheKey(payload);
   const localHit = getCache(cacheKey);
-  if (localHit) {
-    const ageSeconds = Math.max(0, Math.floor((Date.now() - localHit.storedAt) / 1000));
-    const responseBody = patchDNSResponseForAge(localHit.body, parsed.id, ageSeconds, payload);
-    return dnsResponse(responseBody, {
-      'x-cache': 'L1-HIT',
-      'x-edge-cache': 'SKIP',
-      'x-upstreams': '0'
-    });
-  }
+  if (localHit) return l1HitResponse(localHit, parsed, payload);
   const existing = APP_STATE.inflight.get(cacheKey);
   if (existing) return joinInflight(existing, parsed, payload);
   if (CONFIG.EDGE_CACHE_ENABLED) {
@@ -126,6 +118,10 @@ async function handleDNS(req, url, ctx) {
       });
     }
   }
+  // The L2 lookup above is asynchronous: another request may have finished (L1 filled,
+  // in-flight entry removed) or started a lookup in the meantime.
+  const lateHit = getCache(cacheKey);
+  if (lateHit) return l1HitResponse(lateHit, parsed, payload);
   const raced = APP_STATE.inflight.get(cacheKey);
   if (raced) return joinInflight(raced, parsed, payload);
   if (APP_STATE.inflight.size >= CONFIG.MAX_INFLIGHT_ENTRIES) {
@@ -180,6 +176,14 @@ async function handleDNS(req, url, ctx) {
   } finally {
     if (APP_STATE.inflight.get(cacheKey) === job) APP_STATE.inflight.delete(cacheKey);
   }
+}
+function l1HitResponse(hit, parsed, queryBytes) {
+  const ageSeconds = Math.max(0, Math.floor((Date.now() - hit.storedAt) / 1000));
+  return dnsResponse(patchDNSResponseForAge(hit.body, parsed.id, ageSeconds, queryBytes), {
+    'x-cache': 'L1-HIT',
+    'x-edge-cache': 'SKIP',
+    'x-upstreams': '0'
+  });
 }
 async function joinInflight(job, parsed, queryBytes) {
   try {
@@ -657,7 +661,7 @@ async function makeCacheKey(packet) {
   normalized[1] = 0;
   normalizeUncompressedQuestionName(normalized);
   const digest = await crypto.subtle.digest('SHA-256', normalized);
-  const view = new Uint8Array(digest, 0, 16); 
+  const view = new Uint8Array(digest, 0, 16);
   let out = '';
   for (let i = 0; i < view.length; i++) out += view[i].toString(16).padStart(2, '0');
   return out;
@@ -692,7 +696,7 @@ function getDNSCacheTTL(responseBuffer) {
   if (bytes.length < 12 || bytes.length > CONFIG.MAX_UPSTREAM_DNS_MESSAGE_BYTES) return 0;
   const flags = (bytes[2] << 8) | bytes[3];
   if ((flags & 0x8000) === 0) return 0;
-  if ((flags & 0x0200) !== 0) return 0; 
+  if ((flags & 0x0200) !== 0) return 0;
   const rcode = flags & 0x000f;
   if (rcode !== 0 && rcode !== 3) return 0;
   const qdcount = (bytes[4] << 8) | bytes[5];
@@ -754,16 +758,16 @@ function readResourceRecord(bytes, offset, context = null) {
   return { type, ttl, rdataOffset, rdEnd };
 }
 const SINGLE_NAME_TYPES = new Set([2, 3, 4, 5, 7, 8, 9, 12, 39]);
-const PREF_NAME_TYPES = new Set([15, 18, 21, 36]); 
+const PREF_NAME_TYPES = new Set([15, 18, 21, 36]);
 function validateRData(bytes, type, rrClass, rdataOffset, rdEnd, context) {
   const readName = (offset) => skipDNSName(bytes, offset, context);
-  if (rrClass === 1 && type === 1) return rdEnd - rdataOffset === 4;   
-  if (rrClass === 1 && type === 28) return rdEnd - rdataOffset === 16; 
+  if (rrClass === 1 && type === 1) return rdEnd - rdataOffset === 4;
+  if (rrClass === 1 && type === 28) return rdEnd - rdataOffset === 16;
   if (SINGLE_NAME_TYPES.has(type)) {
     const end = readName(rdataOffset);
     return end >= 0 && end === rdEnd;
   }
-  if (type === 14 || type === 17) { 
+  if (type === 14 || type === 17) {
     let pos = readName(rdataOffset);
     if (pos < 0 || pos > rdEnd) return false;
     pos = readName(pos);
@@ -805,14 +809,14 @@ function validateRData(bytes, type, rrClass, rdataOffset, rdEnd, context) {
     const end = readName(pos);
     return end >= 0 && end === rdEnd;
   }
-  if (type === 24 || type === 46) { 
-    const fixed = 18; 
+  if (type === 24 || type === 46) {
+    const fixed = 18;
     if (rdataOffset + fixed > rdEnd) return false;
     const signerStart = rdataOffset + fixed;
     const end = readName(signerStart);
     return end >= 0 && end < rdEnd;
   }
-  if (type === 25 || type === 43 || type === 48) { 
+  if (type === 25 || type === 43 || type === 48) {
     return rdEnd - rdataOffset >= 4;
   }
   if (type === 47) {
@@ -1192,7 +1196,7 @@ function renderUI(host) {
                     <h3 class="text-2xl font-black mb-8 text-cyan-100" id="cH">Setup for Chromium Browsers</h3>
                     <div class="space-y-6 text-slate-400 text-sm leading-relaxed" id="cL">
                         <p>1. Open Browser <b>Settings</b> and type "DNS" in the search box.</p>
-                        <p>2. Select <b>Security</b> > Scroll to <b>Use Secure DNS</b>.</p>
+                        <p>2. Select <b>Security</b> &gt; Scroll to <b>Use Secure DNS</b>.</p>
                         <p>3. Choose <b>"With Custom"</b> provider.</p>
                         <p>4. Paste your DoH endpoint URL from the copy-box above.</p>
                         <p>5. Test by visiting a DNS-restricted website.</p>
@@ -1222,7 +1226,7 @@ function renderUI(host) {
         <!-- SPECIAL EXPLANATION (Critical Point) -->
         <div class="cyber-glass p-8 md:p-12 rounded-[3.5rem] mb-20 border-sky-900/40 relative">
             <h4 class="text-sky-400 font-black text-base md:text-lg mb-6 flex items-center gap-3">
-                ⭐ <span id="whyH">Why ONLY Browser-level DOH? (Crucial Tip)</span>
+                ⭐ <span id="whyH">Why ONLY Browser-level DoH? (Crucial Tip)</span>
             </h4>
             <div class="space-y-6 text-[13px] md:text-[14px] text-slate-400 leading-loose" id="whyT">
                 <p>Most operating systems (Windows settings, Android "Private DNS", or Apple Profiles) natively expect <b>DNS-over-TLS (DoT)</b> which runs on Port 853. Since this worker is built on <code>https://</code> and Port 443, it is not directly usable in these native settings.</p>
@@ -1245,12 +1249,12 @@ function renderUI(host) {
             en: {
                 main: 'Secure DNS over HTTPS', sub: 'Edge Resolve Network • Parallel DoH Resolution',
                 urlL: 'Endpoint URL', cpT: 'COPY ENDPOINT', copied: 'LINK CAPTURED!', tabC: 'Chrome / Brave / Edge', tabF: 'Firefox', tabM: 'Android / iOS',
-                cH: 'Chromium Browser Settings', cL: '<p>1. Open Browser <b>Settings</b> and find <b>Privacy & Security</b>.</p><p>2. Scroll to <b>"Use Secure DNS"</b>.</p><p>3. Select <b>"With Custom"</b>.</p><p>4. Paste the worker URL into the provider field.</p><p>5. Verify with a blocked site or your own DNS test.</p>',
-                fH: 'Firefox Network Options', fL: '<p>1. In Firefox <code>Settings</code>, search for "DNS over HTTPS".</p><p>2. Select <b>Custom</b> from the providers dropdown.</p><p>3. Paste your DoH server address and confirm.</p><p>4. Switch to <b>Max Protection</b> for stronger privacy.</p>',
-                mH: 'Mobile Setup Strategy', mD: 'Smartphones often prioritize DoT hostnames in system settings. To use this Worker DoH endpoint:',
-                mL: '<p><b>In Browsers:</b> Setting it directly in Chrome or Firefox for Mobile is the easiest path.</p><p><b>For Apps:</b> Use <b>Intra</b> or <b>RethinkDNS</b> apps and set DoH as the resolver.</p>',
-                whyH: 'Why Browser-Level ONLY? (The Technical Reality)',
-                whyT: '<p>Operating systems like Windows/Android often expect <b>DoT (Port 853)</b> or native resolver formats and may not accept a full <code>https://</code> DoH URL. Workers on Cloudflare listen on <b>Port 443</b>, which fits browsers and not native system resolvers.</p><p>Browsers are the intended place to use this service.</p>',
+                cH: 'Setup for Chromium Browsers', cL: '<p>1. Open Browser <b>Settings</b> and type "DNS" in the search box.</p><p>2. Select <b>Security</b> &gt; Scroll to <b>Use Secure DNS</b>.</p><p>3. Choose <b>"With Custom"</b> provider.</p><p>4. Paste your DoH endpoint URL from the copy-box above.</p><p>5. Test by visiting a DNS-restricted website.</p>',
+                fH: 'Setup for Firefox', fL: '<p>1. Open Firefox <code>Settings</code> and scroll down to <b>Network Settings</b>.</p><p>2. Click <b>Settings...</b> and check <b>"Enable DNS over HTTPS"</b> at the bottom.</p><p>3. Set provider to <b>Custom</b> and paste your unique URL.</p><p>4. Select <b>"Max Protection"</b> for stronger browser-level DNS privacy.</p>',
+                mH: 'Android / iOS Logic', mD: 'This resolver is a DoH (HTTPS-based) service, which modern phones handle differently than system-wide settings.',
+                mL: '<p><b>A) For Mobile Browsers:</b> Open Browser settings (Chrome/Firefox/Edge) on your phone and follow the desktop steps. <b>This is the best and fastest way.</b></p><p><b>B) For System-wide Apps:</b> We recommend using <b>RethinkDNS</b> or <b>Intra</b> apps. In these apps, set the DNS type to DoH and provide your unique DoH endpoint link.</p>',
+                whyH: 'Why ONLY Browser-level DoH? (Crucial Tip)',
+                whyT: '<p>Most operating systems (Windows settings, Android "Private DNS", or Apple Profiles) natively expect <b>DNS-over-TLS (DoT)</b> which runs on Port 853. Since this worker is built on <code>https://</code> and Port 443, it is not directly usable in these native settings.</p><p><b>The Issue:</b> You <u>cannot</u> paste an <code>https://</code> link into many native DNS settings. It will usually result in an "Invalid Hostname" error. Systems there expect a hostname or DoT endpoint, not a full HTTPS resolver URL.</p><p><b>The Solution:</b> Browsers (Chrome, Edge, Firefox) have their own independent DoH clients. They are compatible with Port 443 workers and provide browser-level encrypted DNS. DoH is therefore best configured directly in the browser.</p>',
                 curL: 'ENGLISH'
             },
             fa: {

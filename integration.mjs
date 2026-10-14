@@ -99,7 +99,6 @@ const healthAfterFail=await (await worker.fetch(req('/health'))).json();
 assert.ok(healthAfterFail.upstreams.every(u=>u.lastErrorKind==='network'));
 const huge='A'.repeat(5463); r=await worker.fetch(req('/dns-query?dns='+huge,{method:'GET',headers:{'CF-Connecting-IP':'huge'}}), rateOK); assert.equal(r.status,413);
 r=await worker.fetch(req('/dns-query?dns=%%%',{method:'GET',headers:{'CF-Connecting-IP':'badb64'}}), rateOK); assert.equal(r.status,400);
-dns.CONFIG.MAX_CACHE_ENTRIES = 512;
 mode='slow'; upstreamCalls=0;
 const coalesceQ=query(0x3333,'coalesce.example');
 const p1=worker.fetch(req('/dns-query',{method:'POST',headers:{'CF-Connecting-IP':'c1','content-type':'application/dns-message'},body:coalesceQ}),rateOK);
@@ -246,6 +245,33 @@ assert.equal(dns.APP_STATE.cache.has('sweep-expired'),false); assert.equal(dns.A
 assert.equal(dns.APP_STATE.throttle.has('sweep-expired-ip'),false); assert.equal(dns.APP_STATE.throttle.has('sweep-live-ip'),true);
 dns.APP_STATE.cache.clear(); dns.APP_STATE.throttle.clear();
 r=await worker.fetch(req('/index.html')); assert.equal(r.status,200);
-assert.match(await r.text(),/document\.documentElement\.lang = c;/);
-mode='ok';
+const uiHtml = await r.text();
+assert.match(uiHtml,/document\.documentElement\.lang = c;/);
+// The English copy exists twice (static HTML and I18N.en); they must not drift apart.
+const norm = (h) => h.replace(/>\s+</g,'><').replace(/&gt;/g,'>').trim();
+for (const [id, tag] of [['cH','h3'],['cL','div'],['fH','h3'],['fL','div'],['mH','h3'],['mD','p'],['mL','div'],['whyH','span'],['whyT','div']]) {
+  const stat = uiHtml.match(new RegExp(`id="${id}"[^>]*>([\\s\\S]*?)</${tag}>`));
+  const dyn = uiHtml.match(new RegExp(`\\b${id}: '((?:[^'\\\\]|\\\\.)*)'`));
+  assert.ok(stat && dyn, `dashboard copy for ${id} not found`);
+  assert.equal(norm(dyn[1]), norm(stat[1]), `static and I18N.en text differ for ${id}`);
+}
+// Rate-limit rejections advertise the configured window.
+dns.APP_STATE.throttle.clear();
+r=await worker.fetch(req('/dns-query',{method:'POST',headers:{'CF-Connecting-IP':'retry','content-type':'application/dns-message'},body:q1}),{DNS_RATE_LIMITER:{limit:async()=>({success:false})}});
+assert.equal(r.status,429); assert.equal(r.headers.get('retry-after'),String(dns.CONFIG.RATE_LIMIT_WINDOW_MS/1000));
+// L1 filled by another request while this one waits for the (asynchronous) L2 lookup: no upstream work.
+dns.APP_STATE.cache.clear(); cacheStore.clear(); upstreamCalls=0; mode='ok';
+const lateQ=query(0x778c,'late-l1.example');
+const lateKey=await dns.makeCacheKey(lateQ);
+const lateBody=answerFor(lateQ,'5.6.7.8',60); lateBody[0]=0; lateBody[1]=0;
+const realCaches=globalThis.caches;
+globalThis.caches={default:{
+  async match(){ await new Promise(resolve=>setTimeout(resolve,5)); dns.setCache(lateKey,lateBody.buffer,60); return undefined; },
+  async put(){}
+}};
+r=await worker.fetch(req('/dns-query',{method:'POST',headers:{'CF-Connecting-IP':'late-l1','content-type':'application/dns-message'},body:lateQ}),rateOK);
+globalThis.caches=realCaches;
+assert.equal(r.status,200); assert.equal(r.headers.get('x-cache'),'L1-HIT'); assert.equal(upstreamCalls,0);
+out=new Uint8Array(await r.arrayBuffer()); assert.equal((out[0]<<8)|out[1],0x778c);
+dns.APP_STATE.cache.clear();
 console.log('INTEGRATION TESTS: PASS');

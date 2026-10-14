@@ -35,24 +35,24 @@ function soaRecord(ttl = 60, minimum = 30) {
     0xc0, 0x0c, 0x00, 0x06, 0x00, 0x01,
     ttl >>> 24, (ttl >>> 16) & 0xff, (ttl >>> 8) & 0xff, ttl & 0xff,
     0x00, 0x24,
-    0x02, 0x6e, 0x73, 0x00,             
-    0x0a, 0x68, 0x6f, 0x73, 0x74, 0x6d, 0x61, 0x73, 0x74, 0x65, 0x72, 0x00, 
-    0x00, 0x00, 0x00, 0x01,             
-    0x00, 0x00, 0x0e, 0x10,             
-    0x00, 0x00, 0x01, 0x2c,             
-    0x00, 0x09, 0x3a, 0x80,             
+    0x02, 0x6e, 0x73, 0x00,
+    0x0a, 0x68, 0x6f, 0x73, 0x74, 0x6d, 0x61, 0x73, 0x74, 0x65, 0x72, 0x00,
+    0x00, 0x00, 0x00, 0x01,
+    0x00, 0x00, 0x0e, 0x10,
+    0x00, 0x00, 0x01, 0x2c,
+    0x00, 0x09, 0x3a, 0x80,
     minimum >>> 24, (minimum >>> 16) & 0xff, (minimum >>> 8) & 0xff, minimum & 0xff
   ];
 }
 function buildResponse(query, { rcode = 0, answers = [], authority = [], additional = [] } = {}) {
   const header = [
-    query[0], query[1], 0x80, 0x80 | rcode, 
+    query[0], query[1], 0x80, 0x80 | rcode,
     0x00, 0x01,
     answers.length >> 8, answers.length & 0xff,
     authority.length >> 8, authority.length & 0xff,
     additional.length >> 8, additional.length & 0xff
   ];
-  const question = [...query.slice(12)]; 
+  const question = [...query.slice(12)];
   return Uint8Array.from([...header, ...question, ...answers.flat(), ...authority.flat(), ...additional.flat()]);
 }
 test('parseDNSQuestion accepts a valid query', () => {
@@ -74,7 +74,7 @@ test('skipDNSName follows backward pointers, rejects out-of-bounds pointers and 
   assert.equal(dns.skipDNSName(Uint8Array.from([0x00, 1, 0x61, 0x00, 0xc0, 0x00]), 4), 6);
   assert.equal(dns.skipDNSName(Uint8Array.from([1, 0x61, 0xc0, 0x3f, 1, 0x62, 0x00]), 0), -1);
   assert.equal(dns.skipDNSName(Uint8Array.from([0xc0, 0x00]), 0), -1);
-  assert.equal(dns.skipDNSName(Uint8Array.from([1, 0x61, 0xc0, 0x02, 0x00]), 0), -1); 
+  assert.equal(dns.skipDNSName(Uint8Array.from([1, 0x61, 0xc0, 0x02, 0x00]), 0), -1);
 });
 test('validateDNSResponse rejects matching-ID fakes and mismatched questions', () => {
   const query = buildQuery(0x1234);
@@ -97,7 +97,7 @@ test('validateDNSResponse accepts NXDOMAIN and rejects non-zero opcodes', () => 
   const nx = buildResponse(query, { rcode: 3 });
   assert.equal(dns.validateDNSResponse(nx.buffer, 5, query).ok, true);
   const badOp = Uint8Array.from(nx);
-  badOp[2] = 0x88; 
+  badOp[2] = 0x88;
   assert.equal(dns.validateDNSResponse(badOp.buffer, 5, query).ok, false);
 });
 test('getDNSCacheTTL honors min answer TTL', () => {
@@ -181,7 +181,7 @@ function rr(owner, type, rdata, ttl = 60, rrClass = 1) {
   ];
 }
 function compressedOwner() {
-  return [0xc0, 0x0c]; 
+  return [0xc0, 0x0c];
 }
 function aaaaRData() {
   return [
@@ -191,15 +191,15 @@ function aaaaRData() {
 }
 function rrsigRData() {
   return [
-    0x00,0x01, 
-    0x08,     
-    0x03,     
-    0x00,0x00,0x00,0x3c, 
-    0x65,0x53,0x12,0x34, 
-    0x65,0x52,0x12,0x34, 
-    0x12,0x34, 
-    0xc0,0x0c, 
-    0xaa,0xbb 
+    0x00,0x01,
+    0x08,
+    0x03,
+    0x00,0x00,0x00,0x3c,
+    0x65,0x53,0x12,0x34,
+    0x65,0x52,0x12,0x34,
+    0x12,0x34,
+    0xc0,0x0c,
+    0xaa,0xbb
   ];
 }
 function dnskeyRData() {
@@ -232,7 +232,7 @@ test('validateDNSResponse handles compressed owner names across answer, authorit
 });
 test('validateDNSResponse rejects malformed compression pointers in every RR section', () => {
   const query = buildQuery(0x1111);
-  const malformedOwner = [0xc0, 0xff]; 
+  const malformedOwner = [0xc0, 0xff];
   const malformed = rr(malformedOwner, 1, [1,2,3,4]);
   for (const section of ['answers', 'authority', 'additional']) {
     const opts = { answers: [], authority: [], additional: [] };
@@ -294,7 +294,7 @@ test('malformed and boundary-crossing SOA records are rejected', () => {
 });
 test('malformed compressed names inside name-bearing RDATA are rejected in every RR section', () => {
   const query = buildQuery(0x1a1a);
-  const badCname = rr(compressedOwner(), 5, [0xc0,0xff]); 
+  const badCname = rr(compressedOwner(), 5, [0xc0,0xff]);
   for (const section of ['answers', 'authority', 'additional']) {
     const opts = { answers: [], authority: [], additional: [] };
     opts[section] = [badCname];
@@ -311,13 +311,13 @@ test('DNSSEC-heavy and IPv6/other-type responses remain valid and cacheable', ()
   const owner = compressedOwner();
   const response = buildResponse(query, {
     answers: [
-      rr(owner, 28, aaaaRData(), 120),   
-      rr(owner, 15, mxRData(), 180),      
-      rr(owner, 33, srvRData(), 240),     
-      rr(owner, 43, dsRData(), 300),      
-      rr(owner, 46, rrsigRData(), 300),   
-      rr(owner, 48, dnskeyRData(), 300),  
-      rr(owner, 47, nsecRData(), 300)     
+      rr(owner, 28, aaaaRData(), 120),
+      rr(owner, 15, mxRData(), 180),
+      rr(owner, 33, srvRData(), 240),
+      rr(owner, 43, dsRData(), 300),
+      rr(owner, 46, rrsigRData(), 300),
+      rr(owner, 48, dnskeyRData(), 300),
+      rr(owner, 47, nsecRData(), 300)
     ]
   });
   const validated = dns.validateDNSResponse(response.buffer, 0x1414, query);
@@ -338,7 +338,7 @@ test('L1 cache expires entries and evicts the least-recently-used item', () => {
   assert.equal(dns.getCache('expired'), null);
   dns.setCache('a', new ArrayBuffer(1), 60);
   dns.setCache('b', new ArrayBuffer(1), 60);
-  assert.ok(dns.getCache('a')); 
+  assert.ok(dns.getCache('a'));
   dns.setCache('c', new ArrayBuffer(1), 60);
   assert.ok(dns.getCache('a'));
   assert.equal(dns.getCache('b'), null);
@@ -538,8 +538,8 @@ test('localRateLimit evicts the least recently used IP, not an actively limited 
   try {
     dns.localRateLimit('busy');
     dns.localRateLimit('idle');
-    dns.localRateLimit('busy');   
-    dns.localRateLimit('newcomer'); 
+    dns.localRateLimit('busy');
+    dns.localRateLimit('newcomer');
     assert.ok(dns.APP_STATE.throttle.has('busy'), 'active IP must keep its counter');
     assert.equal(dns.APP_STATE.throttle.get('busy').count, 2);
     assert.ok(!dns.APP_STATE.throttle.has('idle'));

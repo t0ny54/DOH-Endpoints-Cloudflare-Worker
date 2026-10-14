@@ -1,39 +1,37 @@
 # Changelog
 
-## 0.4.7
+## 0.4.8
 
-Audit release: every file (`Worker.js`, `test.mjs`, `integration.mjs`, `wrangler-smoke.mjs`, `wrangler.toml`, `package.json`, `README.md`, `CHANGELOG.md`, `LICENSE`) was read in full. No functional DNS bug was found; the changes below are one small UI fix, leftover/dead code, and test and documentation gaps.
+Audit release: every file (`Worker.js`, `test.mjs`, `integration.mjs`, `wrangler-smoke.mjs`, `wrangler.toml`, `package.json`, `README.md`, `CHANGELOG.md`, `LICENSE`) was read in full. One behavior bug (wasted upstream work under a cache race), one conflict (dashboard English text defined twice with different wording) and a few redundancies were found and fixed. DNS parsing, validation and caching rules are unchanged.
 
 ### Fixed
-- **Dashboard `lang` attribute:** the page is served with `<html lang="en">` and switching to Persian or Chinese only replaced the text, so screen readers and browser translation still treated the page as English. `changeLang()` now also sets `document.documentElement.lang`.
-- **Docs:** `README.md` listed no cost for a request that joins an in-flight lookup (the `COALESCED` path: 0 upstreams and, at most, one Cache API `match`), and described `x-winner` / `x-winner-lat` without saying they are also sent on `COALESCED` responses. Both are documented now; the version and test count are updated.
+- **Wasted upstream lookups after the L2 await:** `handleDNS()` checked L1 and the in-flight map, then awaited the Cache API (L2), then re-checked only the in-flight map. If another request finished in that window (L1 filled, in-flight entry removed), the request found neither and raced all three upstreams again. It now re-checks L1 after the L2 lookup and answers `L1-HIT` with 0 upstreams. Reproduced before the fix: `x-cache: MISS`, 3 upstream calls; after: `L1-HIT`, 0 calls.
+- **Dashboard English text conflict:** the page carried its English copy twice, in the static HTML and in `I18N.en`, with different wording (for example "Setup for Chromium Browsers" vs "Chromium Browser Settings", and different steps), and `changeLang()` runs on every load, so English visitors saw the static text replaced a moment after first paint. `I18N.en` now equals the static text, so the page no longer changes wording on load or when switching back to English. The heading "DOH" is spelled "DoH", and the raw `>` in a step is written `&gt;`.
+- **`Retry-After` on 429:** the value was a hard-coded `'60'`; it is now derived from `RATE_LIMIT_WINDOW_MS` (still 60 with the shipped settings).
 
 ### Removed (dead / redundant code)
-- `normalizeUncompressedQuestionName()`: the `len > 63` test was unreachable (any length byte above 63 has one of its two top bits set and had already returned), and a line carried trailing whitespace.
-- `handleDNS()`: the `normalizedBody` alias and the `body: normalizedBody` override were leftovers from the removed `normalizeDNSResponseID()` (0.4.6); the alias always equalled `result.body`.
-- `parseDNSQuestion()` and `makeCacheKey()`: the `instanceof Uint8Array` fallbacks. Both receive the `Uint8Array` produced by `readDNSPayload()`.
-- `readCappedBody()`: `await` on `reader.releaseLock()`, which is synchronous.
-- `patchDNSResponseForAge()`: the intermediate `bytes` view plus allocate-and-`set()`; a single `slice()` makes the copy.
+- `handleDNS()`: the duplicated L1-hit response block; `l1HitResponse()` now serves both L1 checks.
+- Trailing whitespace left behind by removed comments in `Worker.js` and `test.mjs` (about 40 lines).
+- `wrangler-smoke.mjs`: the second `/health` request. The readiness probe's response is now reused.
+- `integration.mjs`: a no-op `MAX_CACHE_ENTRIES = 512` assignment (the value was never changed before it) and a trailing `mode = 'ok'`.
 
 ### Changed
-- `package.json`, `Worker.js` `VERSION`: version `0.4.7`.
-- `test.mjs`: 39 tests (was 36). New: local rate-limiter window reset (exactly at `RATE_LIMIT_WINDOW_MS`); `makeCacheKey()` and `patchDNSResponseForAge()` never mutate their inputs (cached and coalesced bodies are shared, so this is a safety property); `relay()` timeout and race-abort bookkeeping without `AbortSignal.any` (covers the `anySignal()` fallback, previously never executed by any test).
-- `integration.mjs`: new checks for client body limits (chunked body over 4 KiB, `Content-Length` over 4 KiB, empty POST), an L2 entry without `x-doh-*` headers (ignored, resolved upstream), the periodic sweep of expired L1 and throttle entries, `COALESCED` response headers, and the dashboard `lang` update.
+- `package.json`, `Worker.js` `VERSION`: version `0.4.8`.
+- `integration.mjs`: new checks for the late-L1 race (L2 `match()` that fills L1 while pending), for static/`I18N.en` dashboard text staying identical (nine fields), and for the `Retry-After` value. The first two fail against 0.4.7.
+- `README.md`: version, the race and dashboard behavior, the unchanged-by-design list below, and the description of the integration suite.
 
 ### Verified
-- `npm test` (39 unit tests plus the integration suite) passes on Node 22.22.2. Line coverage of `Worker.js` under both suites rose from 89.7% to 92.3%; the remaining uncovered lines are mostly rarely used RDATA validators and defensive guards.
-- The 39 unit tests also pass against the unmodified 0.4.6 `Worker.js`, i.e. the refactors did not change behavior.
-- Differential check against 0.4.6 (20,000 random queries, valid and byte-mutated): identical `makeCacheKey()`, `parseDNSQuestion()` and `patchDNSResponseForAge()` output in every case.
-- Fuzz (200,000 byte-mutated or truncated responses): `validateDNSResponse()`, `getDNSCacheTTL()`, `patchDNSResponseForAge()` and `parseDNSQuestion()` never threw, and aging never changed a response's length (about 46,800 mutants were still structurally valid).
-- The dashboard's inline script passes `node --check`; the pinned `wrangler@4.143.0` exists on the public release list.
-- Not run: `npm run test:wrangler` (no network or Wrangler install in the audit environment). `wrangler.toml` and `wrangler-smoke.mjs` are unchanged.
+- `npm test` (39 unit tests plus the integration suite) passes on Node 22.22.2. The unit tests are unchanged and pass against both 0.4.7 and 0.4.8 `Worker.js`.
+- The new integration checks were run against 0.4.7 `Worker.js` and fail there (dashboard text differs), and pass on 0.4.8.
+- The dashboard's inline script passes `node --check`; `wrangler-smoke.mjs` passes `node --check`.
+- Not run: `npm run test:wrangler` (no network or Wrangler install in the audit environment). `wrangler.toml` is unchanged; the only smoke-test change is reusing one response.
 
 ### Not changed (reviewed)
-- `decodeBase64Url()`: the post-decode 413 check cannot trigger with the shipped limits (5,462 base64url characters decode to at most 4,096 bytes). It stays as a guard so changing `MAX_GET_DNS_CHARS` alone cannot let an oversized query through.
-- `anySignal()`: unreachable on Node 20.3+ and current `workerd`, but `engines` still allows Node 20.0 to 20.2, so it stays (and is now tested).
-- `relay()` still passes `packet.slice()` to `fetch()`; dropping the three small copies per cold miss could not be verified against `workerd` here.
-- `ctx?.waitUntil?.()` stays inside its `try`/`catch`; `putEdgeCache()` never rejects, but the guard keeps a misbehaving `ctx` from failing a DNS answer.
-- `wrangler-smoke.mjs` requests `/health` twice (the readiness probe's response is discarded); harmless and untestable here.
-- `/health` and `/` answer any HTTP method and are not rate limited, as documented. The DoH endpoint sends no CORS headers; browsers' built-in DoH does not need them.
+- **NXDOMAIN grace window:** when two upstreams return `NXDOMAIN` the Worker still waits out the remaining `NXDOMAIN_GRACE_MS` (200 ms) for the third. Returning on a 2-of-3 agreement would cut that latency but weakens the protection against filtered upstreams; this is a policy choice, so it stays.
+- **Cache key includes the EDNS OPT record:** clients that send per-query EDNS data (cookies, client subnet) get separate cache entries. Ordinary DoH clients do not.
+- **`Vary: Accept-Encoding`** on DNS responses is redundant next to `Cache-Control: no-store` but harmless; header set left as is.
+- **`validateDNSResponse()` requires one question:** a response with an empty question section (rare FORMERR/NOTIMP replies) counts as an upstream failure. Left strict by design.
+- `getDNSCacheTTL()` and `validateDNSResponse()` both walk the response on a cold miss; merging them would save CPU but risk diverging validation, so they stay separate.
+- `decodeBase64Url()` post-decode size check, `anySignal()`, `packet.slice()` in `relay()` and the `try`/`catch` around `ctx.waitUntil()` stay as documented in 0.4.7.
 - `LICENSE` still has no copyright holder name after "Copyright (c) 2026"; add one if needed.
 

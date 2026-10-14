@@ -57,8 +57,7 @@ function stopWrangler() {
   } catch (_) {}
 }
 try {
-  await waitForServer();
-  const health = await (await fetch(`${BASE}/health`)).json();
+  const health = await (await waitForServer()).json();
   assert.equal(health.version, PKG_VERSION);
   assert.equal(health.maxSimultaneousUpstreams, 3);
   assert.equal(health.upstreamStrategy, 'parallel-race');
