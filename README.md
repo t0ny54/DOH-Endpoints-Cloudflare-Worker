@@ -1,6 +1,6 @@
 # 🛡️ DoH — Cloudflare Worker
 
-**Version 0.4.8** · see [`CHANGELOG.md`](CHANGELOG.md)
+**Version 0.4.13** · see [`CHANGELOG.md`](CHANGELOG.md)
 
 A lightweight Cloudflare Worker that exposes a standard **DNS-over-HTTPS** endpoint, races three configured DoH upstreams in parallel, and keeps a two-level DNS cache:
 
@@ -45,7 +45,7 @@ Responses cached internally use DNS TTL-derived expiration. The response transac
 
 ### Rate limiting
 
-`/dns-query` is limited to **100 requests per 60 seconds per client IP** through the native `DNS_RATE_LIMITER` binding in `wrangler.toml`. A lightweight per-isolate fallback limiter (bounded to 2048 IPs, evicting the least recently seen) is used when the binding is missing, throws, or returns an invalid response (the request is then limited locally rather than rejected or allowed unconditionally). Rejected requests get `429` with `Retry-After` set to the window length (60 seconds with the shipped settings). Cloudflare documents the native Rate Limiting API as low-latency; its counters are scoped to the relevant Cloudflare location rather than being one globally exact counter.
+`/dns-query` is limited to **100 requests per 60 seconds per client IP** through the native `DNS_RATE_LIMITER` binding in `wrangler.toml`. A lightweight per-isolate fallback limiter (bounded to 2048 IPs, evicting the least recently seen) is used when the binding is missing, throws, or returns an invalid response (the request is then limited locally rather than rejected or allowed unconditionally). Rejected requests get `429` with `Retry-After` set to the window length (60 seconds with the shipped settings). The fallback limiter always sends `Retry-After` equal to the full window length; the native `DNS_RATE_LIMITER` binding path is unaffected. Cloudflare documents the native Rate Limiting API as low-latency; its counters are scoped to the relevant Cloudflare location rather than being one globally exact counter.
 
 ### Request-size protection
 
@@ -111,7 +111,7 @@ Known name-bearing RDATA is validated within each RR's `RDLENGTH`. In particular
 
 Upstream failure handling classifies every failure as `timeout`, `http` (HTTP status), `content-type` (incompatible content type), `response-too-large`, `dns-invalid` or `network` (connection-level `fetch()` errors and body-stream errors), and `/health` reports the last kind per upstream as `lastErrorKind` (a degraded SERVFAIL/REFUSED answer records `lastError` as `DNS RCODE n` with no kind). For scoring, a timeout costs 8 points and is counted in `timeout` rather than `fail`; every other failure, including a degraded RCODE answer, costs 12 and is counted in `fail`; a usable NOERROR/NXDOMAIN answer earns 1 point (score range 0-100).
 
-Cache behavior is defensive at both levels: expired L1 entries are removed before use, L1 is true LRU, live in-flight resolutions are never evicted, expired L2 entries fall through to resolution, and exceptions from `caches.default.match()` / `put()` or malformed/throwing rate-limit bindings do not break DNS resolution.
+Cache behavior is defensive at both levels: expired L1 entries are removed before use, L1 is true LRU, live in-flight resolutions are never evicted, expired L2 entries fall through to resolution, oversized or malformed L2 entries are rejected via a stream-limited read before they are ever fully buffered, and exceptions from `caches.default.match()` / `put()` or malformed/throwing rate-limit bindings do not break DNS resolution.
 
 ## Testing
 

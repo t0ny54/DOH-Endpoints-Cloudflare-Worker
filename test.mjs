@@ -1,6 +1,19 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { __internals as dns } from './Worker.js';
+function makeNode(url) {
+  return {
+    url,
+    score: 100,
+    ok: 0,
+    fail: 0,
+    timeout: 0,
+    lastLatencyMs: null,
+    ewmaLatencyMs: null,
+    lastError: null,
+    lastErrorKind: null
+  };
+}
 function encodeName(name) {
   if (!name) return [0];
   const out = [];
@@ -350,17 +363,7 @@ test('timeout classification increments timeout without counting it as a generic
   const realFetch = globalThis.fetch;
   const previousTimeout = dns.CONFIG.UPSTREAM_TIMEOUT_MS;
   dns.CONFIG.UPSTREAM_TIMEOUT_MS = 20;
-  const node = {
-    url: 'https://timeout.test/dns-query',
-    score: 100,
-    ok: 0,
-    fail: 0,
-    timeout: 0,
-    lastLatencyMs: null,
-    ewmaLatencyMs: null,
-    lastError: null,
-    lastErrorKind: null
-  };
+  const node = makeNode('https://timeout.test/dns-query');
   globalThis.fetch = async (_url, { signal } = {}) => {
     await new Promise((resolve, reject) => {
       const timer = setTimeout(resolve, 500);
@@ -386,24 +389,13 @@ test('timeout classification increments timeout without counting it as a generic
 });
 test('HTTP errors and content-type failures are classified distinctly from DNS-invalid payloads', async () => {
   const realFetch = globalThis.fetch;
-  const makeNode = () => ({
-    url: 'https://failure.test/dns-query',
-    score: 100,
-    ok: 0,
-    fail: 0,
-    timeout: 0,
-    lastLatencyMs: null,
-    ewmaLatencyMs: null,
-    lastError: null,
-    lastErrorKind: null
-  });
   try {
-    let node = makeNode();
+    let node = makeNode('https://http.test/dns-query');
     globalThis.fetch = async () => new Response('bad gateway', { status: 503 });
     await assert.rejects(() => dns.relay(node, buildQuery(0x1616), 0x1616, null));
     assert.match(node.lastError, /^Upstream HTTP 503/);
     assert.equal(node.lastErrorKind, 'http');
-    node = makeNode();
+    node = makeNode('https://content-type.test/dns-query');
     globalThis.fetch = async () => new Response('<html>oops</html>', {
       status: 200,
       headers: { 'content-type': 'text/html' }
@@ -411,7 +403,7 @@ test('HTTP errors and content-type failures are classified distinctly from DNS-i
     await assert.rejects(() => dns.relay(node, buildQuery(0x1717), 0x1717, null));
     assert.equal(node.lastError, 'Upstream returned an invalid content type');
     assert.equal(node.lastErrorKind, 'content-type');
-    node = makeNode();
+    node = makeNode('https://oversized.test/dns-query');
     globalThis.fetch = async () => new Response(
       new ReadableStream({
         start(controller) {
@@ -435,17 +427,6 @@ test('NXDOMAIN vs NOERROR race timing respects the grace window', async () => {
   const previousTimeout = dns.CONFIG.UPSTREAM_TIMEOUT_MS;
   dns.CONFIG.NXDOMAIN_GRACE_MS = 60;
   dns.CONFIG.UPSTREAM_TIMEOUT_MS = 500;
-  const makeNode = (url) => ({
-    url,
-    score: 100,
-    ok: 0,
-    fail: 0,
-    timeout: 0,
-    lastLatencyMs: null,
-    ewmaLatencyMs: null,
-    lastError: null,
-    lastErrorKind: null
-  });
   const nodes = [
     makeNode('https://race/nxdomain'),
     makeNode('https://race/noerror-fast'),
@@ -579,17 +560,7 @@ test('patchDNSResponseForAge treats top-bit TTLs as zero instead of aging them f
 });
 test('connection-level fetch failures are classified as network failures and count as failures', async () => {
   const realFetch = globalThis.fetch;
-  const node = {
-    url: 'https://network.test/dns-query',
-    score: 100,
-    ok: 0,
-    fail: 0,
-    timeout: 0,
-    lastLatencyMs: null,
-    ewmaLatencyMs: null,
-    lastError: null,
-    lastErrorKind: null
-  };
+  const node = makeNode('https://network.test/dns-query');
   globalThis.fetch = async () => { throw new TypeError('fetch failed'); };
   try {
     await assert.rejects(() => dns.relay(node, buildQuery(0x2121), 0x2121, null));
@@ -621,8 +592,7 @@ test('a timeout records lastError and lastErrorKind through penalize() alone and
   const realFetch = globalThis.fetch;
   const previousTimeout = dns.CONFIG.UPSTREAM_TIMEOUT_MS;
   dns.CONFIG.UPSTREAM_TIMEOUT_MS = 15;
-  const node = { url: 'https://timeout2.test/dns-query', score: 100, ok: 0, fail: 0, timeout: 0,
-    lastLatencyMs: null, ewmaLatencyMs: null, lastError: null, lastErrorKind: null };
+  const node = makeNode('https://timeout2.test/dns-query');
   globalThis.fetch = (_url, { signal } = {}) => new Promise((_resolve, reject) => {
     signal?.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), { once: true });
   });
@@ -638,9 +608,7 @@ test('a timeout records lastError and lastErrorKind through penalize() alone and
 test('a cold-miss race reports one attempt per upstream, and a winner does not penalize aborted losers', async () => {
   const realFetch = globalThis.fetch;
   const query = buildQuery(0x2323);
-  const mk = (url) => ({ url, score: 100, ok: 0, fail: 0, timeout: 0, lastLatencyMs: null,
-    ewmaLatencyMs: null, lastError: null, lastErrorKind: null });
-  const nodes = [mk('https://w/fast'), mk('https://w/slow-a'), mk('https://w/slow-b')];
+  const nodes = [makeNode('https://w/fast'), makeNode('https://w/slow-a'), makeNode('https://w/slow-b')];
   globalThis.fetch = (url, { signal } = {}) => new Promise((resolve, reject) => {
     const fast = String(url).endsWith('fast');
     const timer = setTimeout(() => resolve(new Response(buildResponse(query, { answers: [aRecord('1.2.3.4')] }), {
@@ -696,8 +664,6 @@ test('relay still classifies timeouts and ignores race aborts when AbortSignal.a
   const realFetch = globalThis.fetch;
   const realAny = AbortSignal.any;
   const previousTimeout = dns.CONFIG.UPSTREAM_TIMEOUT_MS;
-  const makeNode = (url) => ({ url, score: 100, ok: 0, fail: 0, timeout: 0,
-    lastLatencyMs: null, ewmaLatencyMs: null, lastError: null, lastErrorKind: null });
   globalThis.fetch = (_url, { signal } = {}) => new Promise((_resolve, reject) => {
     signal?.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), { once: true });
   });

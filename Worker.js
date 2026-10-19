@@ -1,4 +1,4 @@
-const VERSION = '0.4.8';
+const VERSION = '0.4.13';
 const CONFIG = {
   DNS_PATH: '/dns-query',
   EDGE_CACHE_ENABLED: true,
@@ -82,9 +82,6 @@ async function handleDNS(req, url, ctx) {
       'cache-control': 'no-store'
     });
   }
-  if (payload.byteLength === 0) {
-    return textResponse('Empty DNS query', 400, { 'cache-control': 'no-store' });
-  }
   const parsed = parseDNSQuestion(payload);
   if (!parsed.ok) {
     return textResponse(parsed.error, 400, { 'cache-control': 'no-store' });
@@ -145,15 +142,13 @@ async function handleDNS(req, url, ctx) {
         storedAt
       );
       if (CONFIG.EDGE_CACHE_ENABLED) {
-        try {
-          ctx?.waitUntil?.(putEdgeCache(
-            cacheKey,
-            result.body,
-            cappedTTL(ttlSeconds, CONFIG.EDGE_CACHE_MAX_TTL_SECONDS),
-            storedAt,
-            url.origin
-          ));
-        } catch (_) {}
+        ctx?.waitUntil?.(putEdgeCache(
+          cacheKey,
+          result.body,
+          cappedTTL(ttlSeconds, CONFIG.EDGE_CACHE_MAX_TTL_SECONDS),
+          storedAt,
+          url.origin
+        ));
       }
     }
     return { ...result, storedAt };
@@ -172,7 +167,7 @@ async function handleDNS(req, url, ctx) {
     if (result.degraded) headers['x-dns-degraded'] = '1';
     return dnsResponse(responseBody, headers);
   } catch (err) {
-    return upstreamFailureResponse(err, RESOLVER_NODES.length);
+    return upstreamFailureResponse(err);
   } finally {
     if (APP_STATE.inflight.get(cacheKey) === job) APP_STATE.inflight.delete(cacheKey);
   }
@@ -190,13 +185,13 @@ async function joinInflight(job, parsed, queryBytes) {
     const shared = await job;
     return coalescedDNSResponse(shared, parsed, queryBytes);
   } catch (err) {
-    return upstreamFailureResponse(err, RESOLVER_NODES.length);
+    return upstreamFailureResponse(err);
   }
 }
-function upstreamFailureResponse(err, fallbackAttempts = 0) {
+function upstreamFailureResponse(err) {
   return textResponse('Global resolving failed', 502, {
     'cache-control': 'no-store',
-    'x-upstreams': String(err?.attempts || fallbackAttempts)
+    'x-upstreams': String(err?.attempts ?? RESOLVER_NODES.length)
   });
 }
 function coalescedDNSResponse(shared, parsed, queryBytes) {
@@ -276,7 +271,9 @@ async function readCappedBody(source, maxBytes, tooLargeMessage) {
   } finally {
     try { reader.releaseLock(); } catch (_) {}
   }
-  if (chunks.length === 1) return new Uint8Array(chunks[0]);
+  // Copy so the returned buffer is exactly message-sized (a pooled chunk may be a
+  // subarray view of a larger buffer, and callers use `.buffer` downstream).
+  if (chunks.length === 1) return chunks[0].slice();
   const out = new Uint8Array(total);
   let offset = 0;
   for (const chunk of chunks) {
@@ -341,6 +338,9 @@ function parseDNSQuestion(bytes) {
 }
 async function resolveWithParallelRace(nodes, packet, expectedID) {
   if (!nodes.length) throw new Error('No upstreams configured');
+  // One private copy of the query is shared by every in-flight attempt: fetch()
+  // treats the request body as immutable, so all relays can reuse the same buffer.
+  const relayPacket = packet.slice();
   const controllers = new Map();
   const active = new Map();
   let fallback = null;
@@ -350,7 +350,7 @@ async function resolveWithParallelRace(nodes, packet, expectedID) {
   const startAttempt = (node) => {
     const controller = new AbortController();
     controllers.set(node, controller);
-    const promise = relay(node, packet, expectedID, controller.signal)
+    const promise = relay(node, relayPacket, expectedID, controller.signal)
       .then((value) => ({ ok: true, node, value }))
       .catch((error) => ({ ok: false, node, error }));
     active.set(node, promise);
@@ -444,7 +444,7 @@ async function relay(node, packet, expectedID, signal) {
         accept: 'application/dns-message',
         'content-type': 'application/dns-message'
       },
-      body: packet.slice(),
+      body: packet,
       signal: combinedSignal
     });
     if (!res.ok) {
@@ -947,7 +947,19 @@ async function getEdgeCache(key, queryID, origin, queryBytes) {
     const cacheKey = makeEdgeCacheRequest(origin, key);
     const hit = await cache.match(cacheKey);
     if (!hit) return null;
-    const body = await hit.arrayBuffer();
+    // Stream-limit the read: an oversized/malformed L2 entry must be rejected
+    // before it is fully buffered into memory.
+    let body;
+    try {
+      body = (await readCappedBody(
+        hit,
+        CONFIG.MAX_UPSTREAM_DNS_MESSAGE_BYTES,
+        'L2 cache entry too large'
+      )).buffer;
+    } catch (_) {
+      return null;
+    }
+    if (body.byteLength < 12) return null;
     const storedHeader = hit.headers.get('x-doh-stored-at');
     const ttlHeader = hit.headers.get('x-doh-ttl');
     const storedAt = storedHeader ? Number(storedHeader) : NaN;
@@ -1334,9 +1346,7 @@ function renderUI(host) {
 </body>
 </html>`;
   UI_RESPONSE_CACHE.set(host, html);
-  if (UI_RESPONSE_CACHE.size > UI_RESPONSE_CACHE_MAX_ENTRIES) {
-    UI_RESPONSE_CACHE.delete(UI_RESPONSE_CACHE.keys().next().value);
-  }
+  trimMap(UI_RESPONSE_CACHE, UI_RESPONSE_CACHE_MAX_ENTRIES);
   return new Response(html, uiResponseInit());
 }
 function uiResponseInit() {
