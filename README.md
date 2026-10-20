@@ -1,6 +1,6 @@
 # 🛡️ DoH — Cloudflare Worker
 
-**Version 0.4.13** · see [`CHANGELOG.md`](CHANGELOG.md)
+**Version 0.4.15** · see [`CHANGELOG.md`](CHANGELOG.md)
 
 A lightweight Cloudflare Worker that exposes a standard **DNS-over-HTTPS** endpoint, races three configured DoH upstreams in parallel, and keeps a two-level DNS cache:
 
@@ -45,7 +45,7 @@ Responses cached internally use DNS TTL-derived expiration. The response transac
 
 ### Rate limiting
 
-`/dns-query` is limited to **100 requests per 60 seconds per client IP** through the native `DNS_RATE_LIMITER` binding in `wrangler.toml`. A lightweight per-isolate fallback limiter (bounded to 2048 IPs, evicting the least recently seen) is used when the binding is missing, throws, or returns an invalid response (the request is then limited locally rather than rejected or allowed unconditionally). Rejected requests get `429` with `Retry-After` set to the window length (60 seconds with the shipped settings). The fallback limiter always sends `Retry-After` equal to the full window length; the native `DNS_RATE_LIMITER` binding path is unaffected. Cloudflare documents the native Rate Limiting API as low-latency; its counters are scoped to the relevant Cloudflare location rather than being one globally exact counter.
+`/dns-query` is limited to **100 requests per 60 seconds per client IP** through the native `DNS_RATE_LIMITER` binding in `wrangler.toml`. A lightweight per-isolate fallback limiter (bounded to 2048 IPs, evicting the least recently seen) is used when the binding is missing, throws, or returns an invalid response (the request is then limited locally rather than rejected or allowed unconditionally). Rejected requests get `429` with `Retry-After` set to the window length (60 seconds with the shipped settings). Both limiter paths send the same `Retry-After` (the full window length), because the native binding does not expose a reset time. Cloudflare documents the native Rate Limiting API as low-latency; its counters are scoped to the relevant Cloudflare location rather than being one globally exact counter.
 
 ### Request-size protection
 

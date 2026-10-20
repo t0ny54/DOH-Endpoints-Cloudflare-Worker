@@ -1,4 +1,4 @@
-const VERSION = '0.4.13';
+const VERSION = '0.4.15';
 const CONFIG = {
   DNS_PATH: '/dns-query',
   EDGE_CACHE_ENABLED: true,
@@ -145,7 +145,7 @@ async function handleDNS(req, url, ctx) {
         ctx?.waitUntil?.(putEdgeCache(
           cacheKey,
           result.body,
-          cappedTTL(ttlSeconds, CONFIG.EDGE_CACHE_MAX_TTL_SECONDS),
+          ttlSeconds, // already clamped to EDGE_CACHE_MIN/MAX_TTL_SECONDS by getDNSCacheTTL()
           storedAt,
           url.origin
         ));
@@ -689,7 +689,7 @@ function setCache(key, body, ttlSeconds, storedAt = Date.now(), expiresAtMs = nu
 }
 function cappedTTL(ttlSeconds, maxSeconds) {
   if (!Number.isFinite(ttlSeconds)) return 0;
-  return clamp(Math.max(1, Math.floor(ttlSeconds)), CONFIG.EDGE_CACHE_MIN_TTL_SECONDS, maxSeconds);
+  return clamp(Math.floor(ttlSeconds), CONFIG.EDGE_CACHE_MIN_TTL_SECONDS, maxSeconds);
 }
 function getDNSCacheTTL(responseBuffer) {
   const bytes = new Uint8Array(responseBuffer);
@@ -713,7 +713,6 @@ function getDNSCacheTTL(responseBuffer) {
   let answerMin = Infinity;
   let authorityMin = Infinity;
   let soaNegativeMin = Infinity;
-  const answerEnd = ancount;
   const authorityEnd = ancount + nscount;
   const rrTotal = authorityEnd + arcount;
   for (let i = 0; i < rrTotal; i++) {
@@ -722,7 +721,7 @@ function getDNSCacheTTL(responseBuffer) {
     offset = rr.rdEnd;
     if (rr.type === 41 || i >= authorityEnd) continue;
     const rrTTL = effectiveTTL(rr.ttl);
-    if (i < answerEnd) {
+    if (i < ancount) {
       answerMin = Math.min(answerMin, rrTTL);
     } else {
       authorityMin = Math.min(authorityMin, rrTTL);
@@ -984,18 +983,18 @@ async function putEdgeCache(key, body, ttlSeconds, storedAt, origin) {
   try {
     const cache = caches.default;
     const cacheKey = makeEdgeCacheRequest(origin, key);
-    const ttl = Math.max(1, Math.floor(ttlSeconds));
     const response = new Response(body, {
       status: 200,
       headers: {
         'content-type': 'application/dns-message',
-        'cache-control': `public, s-maxage=${ttl}`,
+        'cache-control': `public, s-maxage=${ttlSeconds}`,
         'x-doh-stored-at': String(storedAt),
-        'x-doh-ttl': String(ttl)
+        'x-doh-ttl': String(ttlSeconds)
       }
     });
     await cache.put(cacheKey, response);
   } catch (_) {
+    // L2 is best-effort: a failed put never affects the client response.
   }
 }
 function maybeSweepState() {
@@ -1016,6 +1015,7 @@ async function allowDNSRequest(ip, env) {
       if (typeof result?.success === 'boolean') return result.success;
       throw new Error('Invalid DNS_RATE_LIMITER response');
     } catch (_) {
+      // Missing/throwing/malformed binding: fall through to the local limiter.
     }
   }
   return localRateLimit(ip);
@@ -1161,7 +1161,7 @@ function renderUI(host) {
     <style>
         body { background: #020617; color: #cbd5e1; font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; overflow-x: hidden; }
         .cyber-glass { background: rgba(15, 23, 42, 0.7); backdrop-filter: blur(15px); border: 1px solid rgba(0, 243, 255, 0.08); }
-        .lang-fa { direction: rtl; font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
+        .lang-fa { direction: rtl; }
         .nav-active { background: #0ea5e9; color: white !important; border-color: #38bdf8 !important; box-shadow: 0 0 15px rgba(14, 165, 233, 0.3); }
         .panel { display: none; } .panel-active { display: block; animation: fadeInUp 0.3s ease-out; }
         @keyframes fadeInUp { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
@@ -1197,12 +1197,12 @@ function renderUI(host) {
         </section>
         <!-- TUTORIAL SECTION -->
         <div class="mb-16">
-            <nav id="tutorialNav" class="flex flex-wrap gap-3 justify-center mb-8">
+            <nav class="flex flex-wrap gap-3 justify-center mb-8">
                 <button onclick="tab('chrome', this)" id="btnC" class="btn-tab px-6 py-3 rounded-2xl text-[11px] font-black uppercase text-slate-400 nav-active">Chrome / Brave / Edge</button>
                 <button onclick="tab('firefox', this)" id="btnF" class="btn-tab px-6 py-3 rounded-2xl text-[11px] font-black uppercase text-slate-400">Firefox</button>
                 <button onclick="tab('mobile', this)" id="btnM" class="btn-tab px-6 py-3 rounded-2xl text-[11px] font-black uppercase text-slate-400">Android / iOS</button>
             </nav>
-            <section id="docPanels" class="min-h-[300px]">
+            <section class="min-h-[300px]">
                 <!-- Chrome/Edge Panel -->
                 <div id="chrome" class="panel panel-active cyber-glass p-10 md:p-14 rounded-[3rem]">
                     <h3 class="text-2xl font-black mb-8 text-cyan-100" id="cH">Setup for Chromium Browsers</h3>
