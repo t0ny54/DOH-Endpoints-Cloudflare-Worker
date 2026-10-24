@@ -1,14 +1,13 @@
 # Changelog
 
-## 0.4.15
+## 0.4.19
 
-Eighth audit release: every file (`Worker.js`, `test.mjs`, `integration.mjs`, `wrangler-smoke.mjs`, `wrangler.toml`, `package.json`, `README.md`, `CHANGELOG.md`, `LICENSE`) was read in full. No bugs or conflicts were found; only redundant code was removed.
+### Changed
+- Removed redundant code only; no behavior change. The POST `content-type` check now reuses the shared media-type helper instead of a second hand-written parser, and the unreachable "no query bytes" shortcut in the upstream question matcher is gone (every caller supplies the query).
+- Dropped the meaningless `Vary: Accept-Encoding` header from `Cache-Control: no-store` DNS responses.
+- Merged the three duplicated result constructions at the end of the upstream race into one, and removed a dead non-finite-age guard in TTL aging (callers always pass a finite age). A too-short buffer is now returned before any byte is written.
+- The dashboard response headers are built once at load time instead of on every request.
 
-### Changed (dead/redundant code removed)
-- `Worker.js` `cappedTTL()`: dropped the `Math.max(1, ...)` before `clamp()`; `EDGE_CACHE_MIN_TTL_SECONDS` (1) already enforces the same lower bound.
-- `Worker.js` `putEdgeCache()`: removed the `ttl` alias of `ttlSeconds`.
-- `Worker.js` dashboard: removed the unused `tutorialNav` / `docPanels` element ids and the `font-family` in `.lang-fa` that repeated the `body` rule.
-
-### Verified (no change)
-- No unused functions or `CONFIG` keys; `test.mjs` (39/39) and `integration.mjs` pass unchanged. `wrangler-smoke.mjs`, `wrangler.toml`, `LICENSE` need no change.
-- `Worker.js` `VERSION`, `package.json`, `README.md`: bumped to `0.4.15` together.
+### Verified
+- Read and audited every file (Worker.js, tests, integration, smoke script, config, docs); a scan found no unused functions, constants or config keys, and no functional bugs.
+- `npm test`: 43 unit tests and the Worker integration suite pass.

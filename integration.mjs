@@ -140,8 +140,10 @@ dns.CONFIG.UPSTREAM_TIMEOUT_MS=previousTimeout;
 mode='ok'; dns.APP_STATE.cache.clear(); cacheStore.clear(); upstreamCalls=0;
 const expiredQuery=query(0x7781,'expired-l2.example');
 const expiredKey=await dns.makeCacheKey(expiredQuery);
+const expiredBody = answerFor(expiredQuery,'8.8.8.8',60);
+expiredBody[0]=0; expiredBody[1]=0;
 cacheStore.set(`https://dns.example.test/__doh-cache/v1/${expiredKey}`, new Response(
-  answerFor(expiredQuery,'8.8.8.8',60),
+  expiredBody,
   {
     status:200,
     headers:{
@@ -224,6 +226,25 @@ const malformedL2Key=await dns.makeCacheKey(malformedL2Q);
 cacheStore.set(`https://dns.example.test/__doh-cache/v1/${malformedL2Key}`, new Response(answerFor(malformedL2Q,'8.8.4.4',60),{status:200,headers:{'content-type':'application/dns-message'}}));
 r=await worker.fetch(req('/dns-query',{method:'POST',headers:{'CF-Connecting-IP':'malformed-l2','content-type':'application/dns-message'},body:malformedL2Q}),rateOK);
 assert.equal(r.status,200); assert.equal(r.headers.get('x-cache'),'MISS'); assert.equal(upstreamCalls,3);
+// Valid-looking L2 metadata must not make a response for another question cacheable.
+dns.APP_STATE.cache.clear(); cacheStore.clear(); upstreamCalls=0; mode='ok';
+const expectedL2Q=query(0x778d,'expected-l2.example');
+const wrongQuestion= query(0,'wrong-question.example');
+const wrongQuestionBody=answerFor(wrongQuestion,'8.8.4.4',60);
+wrongQuestionBody[0]=0; wrongQuestionBody[1]=0;
+const expectedL2Key=await dns.makeCacheKey(expectedL2Q);
+cacheStore.set(`https://dns.example.test/__doh-cache/v1/${expectedL2Key}`,new Response(wrongQuestionBody,{
+  status:200,
+  headers:{
+    'content-type':'application/dns-message',
+    'x-doh-stored-at':String(Date.now()),
+    'x-doh-ttl':'60'
+  }
+}));
+r=await worker.fetch(req('/dns-query',{method:'POST',headers:{'CF-Connecting-IP':'wrong-question-l2','content-type':'application/dns-message'},body:expectedL2Q}),rateOK);
+assert.equal(r.status,200); assert.equal(r.headers.get('x-cache'),'MISS'); assert.equal(upstreamCalls,3);
+out=new Uint8Array(await r.arrayBuffer());
+assert.equal(dns.validateDNSResponse(out.buffer,(out[0]<<8)|out[1],expectedL2Q).ok,true);
 dns.APP_STATE.cache.clear(); cacheStore.clear(); upstreamCalls=0; mode='slow';
 const sharedQ=query(0x778b,'coalesced-headers.example');
 const sharedCalls=[0,1].map((n)=>worker.fetch(req('/dns-query',{method:'POST',headers:{'CF-Connecting-IP':'shared'+n,'content-type':'application/dns-message'},body:sharedQ}),rateOK));
@@ -274,4 +295,23 @@ globalThis.caches=realCaches;
 assert.equal(r.status,200); assert.equal(r.headers.get('x-cache'),'L1-HIT'); assert.equal(upstreamCalls,0);
 out=new Uint8Array(await r.arrayBuffer()); assert.equal((out[0]<<8)|out[1],0x778c);
 dns.APP_STATE.cache.clear();
+// A failing client body stream must not leak its internal error text.
+const brokenBody=new ReadableStream({start(controller){controller.error(new Error('internal-secret-boom'));}});
+r=await worker.fetch(req('/dns-query',{method:'POST',headers:{'CF-Connecting-IP':'broken-body','content-type':'application/dns-message'},body:brokenBody,duplex:'half'}),rateOK);
+assert.equal(r.status,400); assert.equal(await r.text(),'Invalid DNS query');
+// Every non-dashboard response carries nosniff.
+for (const path of ['/health','/missing']) {
+  r=await worker.fetch(req(path)); assert.equal(r.headers.get('x-content-type-options'),'nosniff',path);
+}
+r=await worker.fetch(req('/dns-query',{method:'PUT',headers:{'CF-Connecting-IP':'nosniff-405'}}),rateOK);
+assert.equal(r.headers.get('x-content-type-options'),'nosniff');
+// Addresses inside one IPv6 /64 share a single local rate-limit bucket.
+dns.APP_STATE.throttle.clear(); mode='ok';
+const prevMax=dns.CONFIG.RATE_LIMIT_MAX_REQUESTS; dns.CONFIG.RATE_LIMIT_MAX_REQUESTS=2;
+const v6=(n)=>worker.fetch(req('/dns-query',{method:'POST',headers:{'CF-Connecting-IP':`2001:db8:9:9::${n}`,'content-type':'application/dns-message'},body:q1}));
+assert.equal((await v6(1)).status,200); assert.equal((await v6(2)).status,200); assert.equal((await v6(3)).status,429);
+assert.equal(dns.APP_STATE.throttle.size,1);
+r=await worker.fetch(req('/dns-query',{method:'POST',headers:{'CF-Connecting-IP':'2001:db8:9:a::1','content-type':'application/dns-message'},body:q1}));
+assert.equal(r.status,200);
+dns.CONFIG.RATE_LIMIT_MAX_REQUESTS=prevMax; dns.APP_STATE.throttle.clear(); dns.APP_STATE.cache.clear();
 console.log('INTEGRATION TESTS: PASS');

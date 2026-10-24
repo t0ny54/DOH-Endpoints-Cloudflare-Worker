@@ -1,4 +1,4 @@
-const VERSION = '0.4.15';
+const VERSION = '0.4.19';
 const CONFIG = {
   DNS_PATH: '/dns-query',
   EDGE_CACHE_ENABLED: true,
@@ -50,9 +50,8 @@ export default {
   async fetch(req, env, ctx) {
     maybeSweepState();
     const url = new URL(req.url);
-    const clientIP = getClientIP(req);
     if (url.pathname === CONFIG.DNS_PATH) {
-      if (!(await allowDNSRequest(clientIP, env))) {
+      if (!(await allowDNSRequest(getClientIP(req), env))) {
         return textResponse('Rate limit exceeded', 429, {
           'cache-control': 'no-store',
           'retry-after': String(Math.ceil(CONFIG.RATE_LIMIT_WINDOW_MS / 1000))
@@ -78,7 +77,9 @@ async function handleDNS(req, url, ctx) {
   try {
     payload = await readDNSPayload(req, url);
   } catch (err) {
-    return textResponse(err.message || 'Invalid DNS query', err.status || 400, {
+    // Only deliberate httpError() messages are client-safe; anything else (for example a
+    // body-stream failure) must not leak internal error text.
+    return textResponse(err?.status ? err.message : 'Invalid DNS query', err?.status || 400, {
       'cache-control': 'no-store'
     });
   }
@@ -87,10 +88,8 @@ async function handleDNS(req, url, ctx) {
     return textResponse(parsed.error, 400, { 'cache-control': 'no-store' });
   }
   const cacheKey = await makeCacheKey(payload);
-  const localHit = getCache(cacheKey);
-  if (localHit) return l1HitResponse(localHit, parsed, payload);
-  const existing = APP_STATE.inflight.get(cacheKey);
-  if (existing) return joinInflight(existing, parsed, payload);
+  const local = serveLocal(cacheKey, parsed, payload);
+  if (local) return local;
   if (CONFIG.EDGE_CACHE_ENABLED) {
     const edgeHit = await getEdgeCache(cacheKey, parsed.id, url.origin, payload);
     if (edgeHit) {
@@ -114,13 +113,11 @@ async function handleDNS(req, url, ctx) {
         'x-upstreams': '0'
       });
     }
+    // The L2 lookup above is asynchronous: another request may have finished (L1 filled,
+    // in-flight entry removed) or started a lookup in the meantime.
+    const raced = serveLocal(cacheKey, parsed, payload);
+    if (raced) return raced;
   }
-  // The L2 lookup above is asynchronous: another request may have finished (L1 filled,
-  // in-flight entry removed) or started a lookup in the meantime.
-  const lateHit = getCache(cacheKey);
-  if (lateHit) return l1HitResponse(lateHit, parsed, payload);
-  const raced = APP_STATE.inflight.get(cacheKey);
-  if (raced) return joinInflight(raced, parsed, payload);
   if (APP_STATE.inflight.size >= CONFIG.MAX_INFLIGHT_ENTRIES) {
     return textResponse('Resolver busy, please retry', 503, {
       'cache-control': 'no-store',
@@ -157,20 +154,28 @@ async function handleDNS(req, url, ctx) {
   try {
     const result = await job;
     const responseBody = patchDNSResponseForAge(result.body, parsed.id, 0, payload);
-    const headers = {
+    return dnsResponse(responseBody, winnerHeaders(result, {
       'x-cache': 'MISS',
       'x-edge-cache': CONFIG.EDGE_CACHE_ENABLED ? 'MISS' : 'DISABLED',
-      'x-upstreams': String(result.attempts),
-      'x-winner': sanitizeHeaderValue(result.url),
-      'x-winner-lat': `${result.latencyMs}ms`
-    };
-    if (result.degraded) headers['x-dns-degraded'] = '1';
-    return dnsResponse(responseBody, headers);
+      'x-upstreams': String(result.attempts)
+    }));
   } catch (err) {
     return upstreamFailureResponse(err);
   } finally {
     if (APP_STATE.inflight.get(cacheKey) === job) APP_STATE.inflight.delete(cacheKey);
   }
+}
+function serveLocal(cacheKey, parsed, queryBytes) {
+  const hit = getCache(cacheKey);
+  if (hit) return l1HitResponse(hit, parsed, queryBytes);
+  const job = APP_STATE.inflight.get(cacheKey);
+  return job ? joinInflight(job, parsed, queryBytes) : null;
+}
+function winnerHeaders(result, headers) {
+  headers['x-winner'] = sanitizeHeaderValue(result.url);
+  headers['x-winner-lat'] = `${result.latencyMs}ms`;
+  if (result.degraded) headers['x-dns-degraded'] = '1';
+  return headers;
 }
 function l1HitResponse(hit, parsed, queryBytes) {
   const ageSeconds = Math.max(0, Math.floor((Date.now() - hit.storedAt) / 1000));
@@ -197,15 +202,11 @@ function upstreamFailureResponse(err) {
 function coalescedDNSResponse(shared, parsed, queryBytes) {
   const ageSeconds = Math.max(0, Math.floor((Date.now() - shared.storedAt) / 1000));
   const responseBody = patchDNSResponseForAge(shared.body, parsed.id, ageSeconds, queryBytes);
-  const headers = {
+  return dnsResponse(responseBody, winnerHeaders(shared, {
     'x-cache': 'COALESCED',
     'x-edge-cache': 'SKIP',
-    'x-upstreams': '0',
-    'x-winner': sanitizeHeaderValue(shared.url),
-    'x-winner-lat': `${shared.latencyMs}ms`
-  };
-  if (shared.degraded) headers['x-dns-degraded'] = '1';
-  return dnsResponse(responseBody, headers);
+    'x-upstreams': '0'
+  }));
 }
 function validateMethod(method) {
   if (method !== 'GET' && method !== 'POST') {
@@ -225,11 +226,7 @@ async function readDNSPayload(req, url) {
     }
     return decodeBase64Url(q);
   }
-  const mediaType = (req.headers.get('content-type') || '')
-    .split(';', 1)[0]
-    .trim()
-    .toLowerCase();
-  if (mediaType !== 'application/dns-message') {
+  if (!isDNSMessageContentType(req.headers.get('content-type'))) {
     throw httpError('POST requires content-type: application/dns-message', 415);
   }
   const contentLength = req.headers.get('content-length');
@@ -338,9 +335,6 @@ function parseDNSQuestion(bytes) {
 }
 async function resolveWithParallelRace(nodes, packet, expectedID) {
   if (!nodes.length) throw new Error('No upstreams configured');
-  // One private copy of the query is shared by every in-flight attempt: fetch()
-  // treats the request body as immutable, so all relays can reuse the same buffer.
-  const relayPacket = packet.slice();
   const controllers = new Map();
   const active = new Map();
   let fallback = null;
@@ -350,7 +344,7 @@ async function resolveWithParallelRace(nodes, packet, expectedID) {
   const startAttempt = (node) => {
     const controller = new AbortController();
     controllers.set(node, controller);
-    const promise = relay(node, relayPacket, expectedID, controller.signal)
+    const promise = relay(node, packet, expectedID, controller.signal)
       .then((value) => ({ ok: true, node, value }))
       .catch((error) => ({ ok: false, node, error }));
     active.set(node, promise);
@@ -376,10 +370,7 @@ async function resolveWithParallelRace(nodes, packet, expectedID) {
       if (result.ok) {
         const value = result.value;
         if (value.usable && value.rcode === 0) {
-          return {
-            ...value,
-            attempts: nodes.length
-          };
+          return { ...value, attempts: nodes.length };
         }
         if (value.usable && value.rcode === 3) {
           if (!nxdomain) {
@@ -394,18 +385,8 @@ async function resolveWithParallelRace(nodes, packet, expectedID) {
         }
       }
     }
-    if (nxdomain) {
-      return {
-        ...nxdomain,
-        attempts: nodes.length
-      };
-    }
-    if (fallback) {
-      return {
-        ...fallback,
-        attempts: nodes.length
-      };
-    }
+    const best = nxdomain || fallback;
+    if (best) return { ...best, attempts: nodes.length };
     const err = new Error('All DNS upstreams failed');
     err.attempts = nodes.length;
     throw err;
@@ -452,7 +433,7 @@ async function relay(node, packet, expectedID, signal) {
       throw upstreamError(`Upstream HTTP ${res.status}`, 'http');
     }
     const contentType = res.headers.get('content-type') || '';
-    if (contentType && !contentType.toLowerCase().startsWith('application/dns-message')) {
+    if (!isDNSMessageContentType(contentType)) {
       discardBody(res);
       throw upstreamError('Upstream returned an invalid content type', 'content-type');
     }
@@ -517,6 +498,9 @@ async function relay(node, packet, expectedID, signal) {
 function discardBody(res) {
   try { res.body?.cancel().catch(() => {}); } catch (_) {}
 }
+function isDNSMessageContentType(value) {
+  return String(value || '').split(';', 1)[0].trim().toLowerCase() === 'application/dns-message';
+}
 function validateDNSResponse(responseBuffer, expectedID, queryBytes) {
   const bytes = new Uint8Array(responseBuffer);
   if (bytes.length < 12) return { ok: false, error: 'Upstream returned short DNS response' };
@@ -570,6 +554,9 @@ function skipDNSName(bytes, offset, context = null) {
       const pointer = ((len & 0x3f) << 8) | bytes[pos + 1];
       if (pointer >= pos) return -1;
       if (context && (pointer < 12 || !context.nameOffsets.has(pointer))) return -1;
+      // A compression pointer is itself the start of a prior name suffix and may
+      // legally be the target of a later pointer. Mark it after validating its target.
+      if (context) context.nameOffsets.add(pos);
       if (++jumps > 127) return -1;
       if (end < 0) end = pos + 2;
       pos = pointer;
@@ -586,7 +573,6 @@ function skipDNSName(bytes, offset, context = null) {
   return -1;
 }
 function questionMatchesQuery(responseBytes, responseNameEnd, queryBytes) {
-  if (!queryBytes || queryBytes.byteLength < 12) return true;
   const queryNameEnd = skipDNSName(queryBytes, 12);
   if (queryNameEnd < 0 || queryNameEnd !== responseNameEnd) return false;
   if (queryNameEnd + 4 > queryBytes.length || responseNameEnd + 4 > responseBytes.length) return false;
@@ -906,10 +892,12 @@ function restoreQuestionCase(target, query) {
 }
 function patchDNSResponseForAge(responseBuffer, queryID, ageSeconds, queryBytes) {
   const copy = new Uint8Array(responseBuffer).slice();
+  if (copy.length < 12) return copy.buffer;
   copy[0] = (queryID >> 8) & 0xff;
   copy[1] = queryID & 0xff;
   if (queryBytes) restoreQuestionCase(copy, queryBytes);
-  if (copy.length < 12 || ageSeconds <= 0) return copy.buffer;
+  // Normalize RFC 2181 top-bit TTLs even for a fresh MISS or a same-second hit.
+  const age = Math.max(0, Math.floor(ageSeconds));
   const qdcount = (copy[4] << 8) | copy[5];
   const ancount = (copy[6] << 8) | copy[7];
   const nscount = (copy[8] << 8) | copy[9];
@@ -926,7 +914,7 @@ function patchDNSResponseForAge(responseBuffer, queryID, ageSeconds, queryBytes)
     const rr = readResourceRecord(copy, offset, nameContext);
     if (!rr) return copy.buffer;
     if (rr.type !== 41) {
-      const remaining = Math.max(0, effectiveTTL(rr.ttl) - ageSeconds);
+      const remaining = Math.max(0, effectiveTTL(rr.ttl) - age);
       const ttlOffset = rr.rdataOffset - 6;
       copy[ttlOffset] = (remaining >>> 24) & 0xff;
       copy[ttlOffset + 1] = (remaining >>> 16) & 0xff;
@@ -945,9 +933,11 @@ async function getEdgeCache(key, queryID, origin, queryBytes) {
     const cache = caches.default;
     const cacheKey = makeEdgeCacheRequest(origin, key);
     const hit = await cache.match(cacheKey);
-    if (!hit) return null;
-    // Stream-limit the read: an oversized/malformed L2 entry must be rejected
-    // before it is fully buffered into memory.
+    if (!hit || hit.status !== 200 || !isDNSMessageContentType(hit.headers.get('content-type'))) {
+      return null;
+    }
+    // Stream-limit the read before buffering. Cache entries are an optimization, not
+    // trusted resolver output, so validate the packet and its metadata before serving.
     let body;
     try {
       body = (await readCappedBody(
@@ -963,10 +953,25 @@ async function getEdgeCache(key, queryID, origin, queryBytes) {
     const ttlHeader = hit.headers.get('x-doh-ttl');
     const storedAt = storedHeader ? Number(storedHeader) : NaN;
     const ttlSeconds = ttlHeader ? Number(ttlHeader) : NaN;
-    if (!Number.isFinite(storedAt) || !Number.isFinite(ttlSeconds) || ttlSeconds <= 0) {
+    const now = Date.now();
+    if (
+      !Number.isSafeInteger(storedAt)
+      || storedAt <= 0
+      || storedAt > now
+      || !Number.isSafeInteger(ttlSeconds)
+      || ttlSeconds <= 0
+      || ttlSeconds > CONFIG.EDGE_CACHE_MAX_TTL_SECONDS
+    ) {
       return null;
     }
-    const ageSeconds = Math.max(0, Math.floor((Date.now() - storedAt) / 1000));
+    // Cache values are stored with their DNS transaction ID zeroed. Recheck the full
+    // DNS structure, matching question, and effective DNS TTL to avoid serving corrupt
+    // or mismatched cache content even when its metadata looks plausible.
+    const validation = validateDNSResponse(body, 0, queryBytes);
+    if (!validation.ok) return null;
+    const dnsTTL = getDNSCacheTTL(body);
+    if (dnsTTL <= 0 || ttlSeconds > dnsTTL) return null;
+    const ageSeconds = Math.floor((now - storedAt) / 1000);
     if (ageSeconds >= ttlSeconds) return null;
     return {
       body,
@@ -1009,16 +1014,35 @@ function maybeSweepState() {
   APP_STATE.lastSweepAt = now;
 }
 async function allowDNSRequest(ip, env) {
+  const key = rateLimitKey(ip);
   if (env?.DNS_RATE_LIMITER?.limit) {
     try {
-      const result = await env.DNS_RATE_LIMITER.limit({ key: ip });
+      const result = await env.DNS_RATE_LIMITER.limit({ key });
       if (typeof result?.success === 'boolean') return result.success;
       throw new Error('Invalid DNS_RATE_LIMITER response');
     } catch (_) {
       // Missing/throwing/malformed binding: fall through to the local limiter.
     }
   }
-  return localRateLimit(ip);
+  return localRateLimit(key);
+}
+// An IPv6 client normally controls a whole /64, so limit per /64 instead of per address;
+// otherwise rotating addresses inside one prefix would bypass the limiter. IPv4 and
+// non-IP values are returned unchanged.
+function rateLimitKey(ip) {
+  if (!ip.includes(':')) return ip;
+  const halves = ip.split('%', 1)[0].split('::');
+  if (halves.length > 2) return ip;
+  const head = halves[0] ? halves[0].split(':') : [];
+  let groups = head;
+  if (halves.length === 2) {
+    const tail = halves[1] ? halves[1].split(':') : [];
+    const fill = 8 - head.length - tail.length;
+    if (fill < 1) return ip;
+    groups = [...head, ...new Array(fill).fill('0'), ...tail];
+  }
+  if (groups.length !== 8 || !groups.every((g) => /^[0-9a-f]{1,4}$/i.test(g))) return ip;
+  return `${groups.slice(0, 4).map((g) => g.toLowerCase().replace(/^0+(?=.)/, '')).join(':')}::/64`;
 }
 function localRateLimit(ip) {
   const now = Date.now();
@@ -1083,7 +1107,7 @@ function dnsResponse(body, extraHeaders = {}) {
     headers: {
       'content-type': 'application/dns-message',
       'cache-control': 'no-store',
-      'vary': 'Accept-Encoding',
+      'x-content-type-options': 'nosniff',
       ...extraHeaders
     }
   });
@@ -1093,6 +1117,7 @@ function textResponse(text, status = 200, headers = {}) {
     status,
     headers: {
       'content-type': 'text/plain; charset=utf-8',
+      'x-content-type-options': 'nosniff',
       ...headers
     }
   });
@@ -1102,6 +1127,7 @@ function jsonResponse(data, status = 200, headers = {}) {
     status,
     headers: {
       'content-type': 'application/json; charset=utf-8',
+      'x-content-type-options': 'nosniff',
       ...headers
     }
   });
@@ -1136,6 +1162,7 @@ export const __internals = {
   getDNSCacheTTL,
   patchDNSResponseForAge,
   localRateLimit,
+  rateLimitKey,
   resolveWithParallelRace,
   isBetterDegraded,
   relay,
@@ -1145,9 +1172,20 @@ export const __internals = {
 };
 const UI_RESPONSE_CACHE = new Map();
 const UI_RESPONSE_CACHE_MAX_ENTRIES = 16;
+const UI_RESPONSE_HEADERS = {
+  'content-type': 'text/html; charset=utf-8',
+  'cache-control': 'public, max-age=300',
+  'x-content-type-options': 'nosniff',
+  'referrer-policy': 'no-referrer',
+  'content-security-policy': "default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'none'"
+};
 function renderUI(host) {
   let html = UI_RESPONSE_CACHE.get(host);
-  if (html) return new Response(html, uiResponseInit());
+  if (html) {
+    UI_RESPONSE_CACHE.delete(host);
+    UI_RESPONSE_CACHE.set(host, html);
+    return new Response(html, { headers: UI_RESPONSE_HEADERS });
+  }
   const safeHost = escapeHtml(host);
   const endpoint = `https://${safeHost}${CONFIG.DNS_PATH}`;
   html = `<!DOCTYPE html>
@@ -1170,7 +1208,6 @@ function renderUI(host) {
     </style>
 </head>
 <body class="p-4 md:p-12">
-    <!-- LANGUAGE SWITCHER -->
     <div class="fixed top-6 right-6 z-50">
         <button onclick="document.getElementById('langMenu').classList.toggle('hidden')" class="cyber-glass px-6 py-3 rounded-2xl flex items-center gap-4 text-xs font-bold border-cyan-500/20 hover:scale-[1.02] transition-transform">
             🌐 <span id="currentLang">LANGUAGE</span>
@@ -1195,7 +1232,6 @@ function renderUI(host) {
                 <span id="txtCopy">COPY ENDPOINT</span>
             </button>
         </section>
-        <!-- TUTORIAL SECTION -->
         <div class="mb-16">
             <nav class="flex flex-wrap gap-3 justify-center mb-8">
                 <button onclick="tab('chrome', this)" id="btnC" class="btn-tab px-6 py-3 rounded-2xl text-[11px] font-black uppercase text-slate-400 nav-active">Chrome / Brave / Edge</button>
@@ -1203,7 +1239,6 @@ function renderUI(host) {
                 <button onclick="tab('mobile', this)" id="btnM" class="btn-tab px-6 py-3 rounded-2xl text-[11px] font-black uppercase text-slate-400">Android / iOS</button>
             </nav>
             <section class="min-h-[300px]">
-                <!-- Chrome/Edge Panel -->
                 <div id="chrome" class="panel panel-active cyber-glass p-10 md:p-14 rounded-[3rem]">
                     <h3 class="text-2xl font-black mb-8 text-cyan-100" id="cH">Setup for Chromium Browsers</h3>
                     <div class="space-y-6 text-slate-400 text-sm leading-relaxed" id="cL">
@@ -1214,7 +1249,6 @@ function renderUI(host) {
                         <p>5. Test by visiting a DNS-restricted website.</p>
                     </div>
                 </div>
-                <!-- Firefox Panel -->
                 <div id="firefox" class="panel cyber-glass p-10 md:p-14 rounded-[3rem]">
                     <h3 class="text-2xl font-black mb-8 text-emerald-100" id="fH">Setup for Firefox</h3>
                     <div class="space-y-6 text-slate-400 text-sm leading-relaxed" id="fL">
@@ -1224,7 +1258,6 @@ function renderUI(host) {
                         <p>4. Select <b>"Max Protection"</b> for stronger browser-level DNS privacy.</p>
                     </div>
                 </div>
-                <!-- Mobile/iOS Panel -->
                 <div id="mobile" class="panel cyber-glass p-10 md:p-14 rounded-[3rem]">
                     <h3 class="text-2xl font-black mb-8 text-teal-100" id="mH">Android / iOS Logic</h3>
                     <p class="text-slate-500 text-sm mb-6 italic" id="mD">This resolver is a DoH (HTTPS-based) service, which modern phones handle differently than system-wide settings.</p>
@@ -1235,7 +1268,6 @@ function renderUI(host) {
                 </div>
             </section>
         </div>
-        <!-- SPECIAL EXPLANATION (Critical Point) -->
         <div class="cyber-glass p-8 md:p-12 rounded-[3.5rem] mb-20 border-sky-900/40 relative">
             <h4 class="text-sky-400 font-black text-base md:text-lg mb-6 flex items-center gap-3">
                 ⭐ <span id="whyH">Why ONLY Browser-level DoH? (Crucial Tip)</span>
@@ -1347,17 +1379,5 @@ function renderUI(host) {
 </html>`;
   UI_RESPONSE_CACHE.set(host, html);
   trimMap(UI_RESPONSE_CACHE, UI_RESPONSE_CACHE_MAX_ENTRIES);
-  return new Response(html, uiResponseInit());
-}
-function uiResponseInit() {
-  return {
-    status: 200,
-    headers: {
-      'content-type': 'text/html; charset=utf-8',
-      'cache-control': 'public, max-age=300',
-      'x-content-type-options': 'nosniff',
-      'referrer-policy': 'no-referrer',
-      'content-security-policy': "default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'none';",
-    }
-  };
+  return new Response(html, { headers: UI_RESPONSE_HEADERS });
 }

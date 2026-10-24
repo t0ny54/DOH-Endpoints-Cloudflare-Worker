@@ -1,15 +1,24 @@
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 const PKG_VERSION = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8')).version;
+const PROJECT_DIR = fileURLToPath(new URL('.', import.meta.url));
 const HOST = process.env.WRANGLER_SMOKE_HOST || '127.0.0.1';
 const PORT = Number(process.env.WRANGLER_SMOKE_PORT || 8797);
 const BASE = `http://${HOST}:${PORT}`;
-const npx = process.platform === 'win32' ? 'npx.cmd' : 'npx';
-const child = spawn(npx, [
-  '--no-install',
-  'wrangler',
+const wrangler = join(
+  PROJECT_DIR,
+  'node_modules',
+  '.bin',
+  process.platform === 'win32' ? 'wrangler.cmd' : 'wrangler'
+);
+if (!existsSync(wrangler)) {
+  console.error('Wrangler is not installed locally. Run `npm install` before `npm run test:wrangler`.');
+  process.exit(1);
+}
+const child = spawn(wrangler, [
   'dev',
   '--local',
   '--port',
@@ -17,7 +26,7 @@ const child = spawn(npx, [
   '--ip',
   HOST
 ], {
-  cwd: fileURLToPath(new URL('.', import.meta.url)),
+  cwd: PROJECT_DIR,
   stdio: ['ignore', 'pipe', 'pipe'],
   env: { ...process.env },
   shell: process.platform === 'win32',

@@ -272,6 +272,14 @@ test('compression pointers must target prior parsed label boundaries', () => {
   ]);
   assert.equal(dns.validateDNSResponse(response.buffer, 0x1212, query).ok, false);
 });
+test('compression pointers may target a previously parsed compression pointer', () => {
+  const query = buildQuery(0x1213);
+  const firstOwnerOffset = dns.skipDNSName(query, 12) + 4;
+  const first = rr([0xc0, 0x0c], 1, [1, 2, 3, 4]);
+  const second = rr([0xc0 | ((firstOwnerOffset >> 8) & 0x3f), firstOwnerOffset & 0xff], 1, [5, 6, 7, 8]);
+  const response = buildResponse(query, { answers: [first, second] });
+  assert.equal(dns.validateDNSResponse(response.buffer, 0x1213, query).ok, true);
+});
 test('malformed and boundary-crossing SOA records are rejected', () => {
   const query = buildQuery(0x1313);
   const validSoa = rr(compressedOwner(), 6, [
@@ -421,6 +429,35 @@ test('HTTP errors and content-type failures are classified distinctly from DNS-i
     globalThis.fetch = realFetch;
   }
 });
+test('relay requires the exact DNS media type token and permits valid parameters', async () => {
+  const realFetch = globalThis.fetch;
+  const query = buildQuery(0x1819);
+  const validBody = buildResponse(query, { answers: [aRecord('1.2.3.4')] });
+  try {
+    const goodNode = makeNode('https://content-type-parameters.test/dns-query');
+    globalThis.fetch = async () => new Response(validBody, {
+      status: 200,
+      headers: { 'content-type': ' Application/DNS-Message ; charset=binary' }
+    });
+    const good = await dns.relay(goodNode, query, 0x1819, null);
+    assert.equal(good.rcode, 0);
+
+    const badNode = makeNode('https://content-type-prefix.test/dns-query');
+    globalThis.fetch = async () => new Response(validBody, {
+      status: 200,
+      headers: { 'content-type': 'application/dns-message-fake' }
+    });
+    await assert.rejects(() => dns.relay(badNode, query, 0x1819, null));
+    assert.equal(badNode.lastErrorKind, 'content-type');
+
+    const missingNode = makeNode('https://content-type-missing.test/dns-query');
+    globalThis.fetch = async () => new Response(validBody, { status: 200 });
+    await assert.rejects(() => dns.relay(missingNode, query, 0x1819, null));
+    assert.equal(missingNode.lastErrorKind, 'content-type');
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
 test('NXDOMAIN vs NOERROR race timing respects the grace window', async () => {
   const realFetch = globalThis.fetch;
   const previousGrace = dns.CONFIG.NXDOMAIN_GRACE_MS;
@@ -558,6 +595,23 @@ test('patchDNSResponseForAge treats top-bit TTLs as zero instead of aging them f
   const record = dns.readResourceRecord(aged, dns.skipDNSName(aged, 12) + 4);
   assert.deepEqual([...aged.slice(record.rdataOffset - 6, record.rdataOffset - 2)], [0, 0, 0, 0]);
 });
+test('patchDNSResponseForAge normalizes top-bit TTLs even when age is zero', () => {
+  const query = buildQuery(0x2526, 'example.com');
+  const topBitCname = [0xc0, 0x0c, 0x00, 0x05, 0x00, 0x01, 0xff, 0xff, 0xff, 0xff, 0x00, 0x02, 0xc0, 0x0c];
+  const stored = buildResponse(query, {
+    rcode: 3,
+    answers: [topBitCname],
+    authority: [soaRecord(60, 30)],
+    additional: [aRecord('8.8.8.8', 0xffffffff)]
+  });
+  const fresh = new Uint8Array(dns.patchDNSResponseForAge(stored.buffer, 0x2526, 0, query));
+  const questionEnd = dns.skipDNSName(fresh, 12) + 4;
+  const answer = dns.readResourceRecord(fresh, questionEnd);
+  assert.deepEqual([...fresh.slice(answer.rdataOffset - 6, answer.rdataOffset - 2)], [0, 0, 0, 0]);
+  const authority = dns.readResourceRecord(fresh, answer.rdEnd);
+  const additional = dns.readResourceRecord(fresh, authority.rdEnd);
+  assert.deepEqual([...fresh.slice(additional.rdataOffset - 6, additional.rdataOffset - 2)], [0, 0, 0, 0]);
+});
 test('connection-level fetch failures are classified as network failures and count as failures', async () => {
   const realFetch = globalThis.fetch;
   const node = makeNode('https://network.test/dns-query');
@@ -684,5 +738,20 @@ test('relay still classifies timeouts and ignores race aborts when AbortSignal.a
     AbortSignal.any = realAny;
     globalThis.fetch = realFetch;
     dns.CONFIG.UPSTREAM_TIMEOUT_MS = previousTimeout;
+  }
+});
+test('rateLimitKey groups IPv6 clients by /64 and leaves IPv4 and non-IP values alone', () => {
+  const key = dns.rateLimitKey;
+  assert.equal(key('203.0.113.7'), '203.0.113.7');
+  assert.equal(key('unknown'), 'unknown');
+  const base = key('2001:db8:1:2:aaaa:bbbb:cccc:dddd');
+  assert.equal(base, '2001:db8:1:2::/64');
+  assert.equal(key('2001:0DB8:0001:0002::1'), base);
+  assert.equal(key('2001:db8:1:2::'), base);
+  assert.notEqual(key('2001:db8:1:3::1'), base);
+  assert.equal(key('::1'), '0:0:0:0::/64');
+  assert.equal(key('fe80::1%eth0'), 'fe80:0:0:0::/64');
+  for (const odd of ['1:2:3', '1::2::3', '1:2:3:4:5:6:7:8:9', 'zzzz::1', '::ffff:1.2.3.4']) {
+    assert.equal(key(odd), odd, `${odd} must be returned unchanged`);
   }
 });
