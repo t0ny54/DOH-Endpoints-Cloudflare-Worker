@@ -1,13 +1,11 @@
 # Changelog
 
-## 0.4.19
+## 0.4.22
 
 ### Changed
-- Removed redundant code only; no behavior change. The POST `content-type` check now reuses the shared media-type helper instead of a second hand-written parser, and the unreachable "no query bytes" shortcut in the upstream question matcher is gone (every caller supplies the query).
-- Dropped the meaningless `Vary: Accept-Encoding` header from `Cache-Control: no-store` DNS responses.
-- Merged the three duplicated result constructions at the end of the upstream race into one, and removed a dead non-finite-age guard in TTL aging (callers always pass a finite age). A too-short buffer is now returned before any byte is written.
-- The dashboard response headers are built once at load time instead of on every request.
+- `relay()`: inlined the single-use `raceAbort` intermediate; race-abort detection now reads directly from the combined signal. No behavioral change — aborted losers are still not penalized, and timeouts are still classified via the timeout controller's own signal.
+- Version bumped to 0.4.22 (`Worker.js` `VERSION`, `package.json`); `/health` and the integration/smoke version checks read both dynamically and stay in agreement.
 
 ### Verified
-- Read and audited every file (Worker.js, tests, integration, smoke script, config, docs); a scan found no unused functions, constants or config keys, and no functional bugs.
-- `npm test`: 43 unit tests and the Worker integration suite pass.
+- Every file was read and audited in full (Worker.js, test.mjs, integration.mjs, wrangler-smoke.mjs, package.json, wrangler.toml, README.md, CHANGELOG.md, LICENSE): no dead functions (the one single-use variable was inlined), no configuration conflicts (wrangler.toml 100 req / 60 s matches the local-limiter constants and the `DNS_RATE_LIMITER` binding name), and no functional bugs. Rejecting padded base64url and reporting `x-upstreams: 3` on partial races are documented, RFC 8484-aligned behaviors, covered by the integration and smoke tests — not defects.
+- `node --test test.mjs` (43 tests) and `node integration.mjs` pass with the changes applied.

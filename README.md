@@ -1,6 +1,6 @@
 # 🛡️ DoH — Cloudflare Worker
 
-**Version 0.4.19** · see [`CHANGELOG.md`](CHANGELOG.md)
+**Version 0.4.22** · see [`CHANGELOG.md`](CHANGELOG.md)
 
 A lightweight Cloudflare Worker that exposes a standard **DNS-over-HTTPS** endpoint, races three configured DoH upstreams in parallel, and keeps a two-level DNS cache:
 
@@ -111,7 +111,7 @@ Known name-bearing RDATA is validated within each RR's `RDLENGTH`. In particular
 
 Upstream failure handling classifies every failure as `timeout`, `http` (HTTP status), `content-type` (missing or incompatible media type; normal media-type parameters are allowed), `response-too-large`, `dns-invalid` or `network` (connection-level `fetch()` errors and body-stream errors), and `/health` reports the last kind per upstream as `lastErrorKind` (a degraded SERVFAIL/REFUSED answer records `lastError` as `DNS RCODE n` with no kind). For scoring, a timeout costs 8 points and is counted in `timeout` rather than `fail`; every other failure, including a degraded RCODE answer, costs 12 and is counted in `fail`; a usable NOERROR/NXDOMAIN answer earns 1 point (score range 0-100).
 
-Cache behavior is defensive at both levels: expired L1 entries are removed before use, L1 is true LRU, live in-flight resolutions are never evicted, and expired L2 entries fall through to resolution. L2 reads are stream-limited before buffering and are checked for the expected media type, normalized transaction ID, matching DNS question, valid DNS record structure, cacheable DNS TTL, and consistent timestamp/TTL metadata; malformed entries fall through to upstream resolution. Exceptions from `caches.default.match()` / `put()` or malformed/throwing rate-limit bindings do not break DNS resolution.
+Cache behavior is defensive at both levels: expired L1 entries are removed before use, L1 is true LRU, live in-flight resolutions are never evicted, and expired L2 entries fall through to resolution. L2 reads are stream-limited before buffering and are checked for the expected media type, normalized transaction ID, matching DNS question, valid DNS record structure, cacheable DNS TTL, and consistent timestamp/TTL metadata; malformed entries fall through to upstream resolution. Exceptions from `caches.default.match()` / `put()` or malformed/throwing rate-limit bindings do not break DNS resolution. Upstream responses are parsed exactly once: response validation and cache-TTL computation share a single wire-format pass, so relaying, L2 reads, and cache writes never re-parse a packet that was already analyzed.
 
 ## Testing
 

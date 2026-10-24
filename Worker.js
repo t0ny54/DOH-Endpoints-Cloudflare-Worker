@@ -1,4 +1,4 @@
-const VERSION = '0.4.19';
+const VERSION = '0.4.22';
 const CONFIG = {
   DNS_PATH: '/dns-query',
   EDGE_CACHE_ENABLED: true,
@@ -67,7 +67,7 @@ export default {
     if (url.pathname === '/' || url.pathname === '/index.html') {
       return renderUI(url.host);
     }
-    return textResponse('Not found', 404);
+    return textResponse('Not found', 404, { 'cache-control': 'no-store' });
   }
 };
 async function handleDNS(req, url, ctx) {
@@ -127,7 +127,8 @@ async function handleDNS(req, url, ctx) {
   const job = (async () => {
     const result = await resolveWithParallelRace(RESOLVER_NODES, payload, parsed.id);
     const storedAt = Date.now();
-    const ttlSeconds = getDNSCacheTTL(result.body);
+    // relay() already computed the cache TTL during its single-pass analysis.
+    const ttlSeconds = result.cacheTTL;
     if (ttlSeconds > 0) {
       // The buffer is private to this job (fresh from relay()), so zero the ID in place.
       new Uint8Array(result.body).fill(0, 0, 2);
@@ -142,7 +143,7 @@ async function handleDNS(req, url, ctx) {
         ctx?.waitUntil?.(putEdgeCache(
           cacheKey,
           result.body,
-          ttlSeconds, // already clamped to EDGE_CACHE_MIN/MAX_TTL_SECONDS by getDNSCacheTTL()
+          ttlSeconds, // already clamped to EDGE_CACHE_MIN/MAX_TTL_SECONDS during analysis
           storedAt,
           url.origin
         ));
@@ -477,12 +478,12 @@ async function relay(node, packet, expectedID, signal) {
       latencyMs,
       rcode,
       usable,
-      degraded: !usable
+      degraded: !usable,
+      cacheTTL: validation.cacheTTL
     };
   } catch (err) {
-    const raceAbort = signal?.aborted && signal.reason === 'winner-selected';
     const timeoutAbort = timeoutController.signal.aborted;
-    if (raceAbort) throw err;
+    if (signal?.aborted && signal.reason === 'winner-selected') throw err;
     if (timeoutAbort) {
       node.timeout += 1;
       penalize(node, CONFIG.SCORE_TIMEOUT_DELTA, 'timeout', false);
@@ -502,38 +503,97 @@ function isDNSMessageContentType(value) {
   return String(value || '').split(';', 1)[0].trim().toLowerCase() === 'application/dns-message';
 }
 function validateDNSResponse(responseBuffer, expectedID, queryBytes) {
-  const bytes = new Uint8Array(responseBuffer);
-  if (bytes.length < 12) return { ok: false, error: 'Upstream returned short DNS response' };
+  return analyzeDNSResponse(new Uint8Array(responseBuffer), expectedID, queryBytes);
+}
+// Single-pass DNS response analysis shared by validation and cache-TTL computation.
+// Strict mode (a non-null expectedID or queryBytes) additionally pins the transaction
+// ID, requires exactly one question matching the query on the wire, and rejects
+// trailing bytes; lenient mode (both null) only walks the wire format, which is what
+// cache-TTL computation needs. Either way the packet is parsed exactly once, so
+// relaying, L2 reads, and cache writes never re-parse a packet that was analyzed.
+function analyzeDNSResponse(bytes, expectedID, queryBytes) {
+  const strict = expectedID !== null || queryBytes !== null;
+  if (bytes.length < 12) {
+    return { ok: false, error: 'Upstream returned short DNS response', rcode: 0, cacheTTL: 0 };
+  }
+  if (!strict && bytes.length > CONFIG.MAX_UPSTREAM_DNS_MESSAGE_BYTES) {
+    return { ok: false, error: null, rcode: 0, cacheTTL: 0 };
+  }
   const id = (bytes[0] << 8) | bytes[1];
   const flags = (bytes[2] << 8) | bytes[3];
   const rcode = flags & 0x000f;
-  if (id !== expectedID) return { ok: false, error: 'Upstream response ID mismatch' };
-  if ((flags & 0x8000) === 0) return { ok: false, error: 'Upstream returned a DNS query, not response' };
-  if ((flags & 0x7800) !== 0) return { ok: false, error: 'Unexpected DNS opcode in upstream response' };
+  if (strict && id !== expectedID) {
+    return { ok: false, error: 'Upstream response ID mismatch', rcode, cacheTTL: 0 };
+  }
+  if ((flags & 0x8000) === 0) {
+    return { ok: false, error: 'Upstream returned a DNS query, not response', rcode, cacheTTL: 0 };
+  }
+  if (strict && (flags & 0x7800) !== 0) {
+    return { ok: false, error: 'Unexpected DNS opcode in upstream response', rcode, cacheTTL: 0 };
+  }
   const qdcount = (bytes[4] << 8) | bytes[5];
   const ancount = (bytes[6] << 8) | bytes[7];
   const nscount = (bytes[8] << 8) | bytes[9];
   const arcount = (bytes[10] << 8) | bytes[11];
-  if (qdcount !== 1) return { ok: false, error: 'Unexpected question count in upstream response' };
+  if (strict && qdcount !== 1) {
+    return { ok: false, error: 'Unexpected question count in upstream response', rcode, cacheTTL: 0 };
+  }
   const nameContext = createDNSNameContext();
-  let offset = skipDNSName(bytes, 12, nameContext);
-  if (offset < 0 || offset + 4 > bytes.length) {
-    return { ok: false, error: 'Malformed question in upstream response' };
+  let offset = 12;
+  for (let i = 0; i < qdcount; i++) {
+    offset = skipDNSName(bytes, offset, nameContext);
+    if (offset < 0 || offset + 4 > bytes.length) {
+      return { ok: false, error: 'Malformed question in upstream response', rcode, cacheTTL: 0 };
+    }
+    if (strict && !questionMatchesQuery(bytes, offset, queryBytes)) {
+      return { ok: false, error: 'Upstream response question does not match the query', rcode, cacheTTL: 0 };
+    }
+    offset += 4;
   }
-  if (!questionMatchesQuery(bytes, offset, queryBytes)) {
-    return { ok: false, error: 'Upstream response question does not match the query' };
-  }
-  offset += 4;
-  const rrTotal = ancount + nscount + arcount;
+  let answerMin = Infinity;
+  let authorityMin = Infinity;
+  let soaNegativeMin = Infinity;
+  const authorityEnd = ancount + nscount;
+  const rrTotal = authorityEnd + arcount;
   for (let i = 0; i < rrTotal; i++) {
     const rr = readResourceRecord(bytes, offset, nameContext);
-    if (!rr) return { ok: false, error: 'Malformed resource record in upstream response' };
+    if (!rr) {
+      return { ok: false, error: 'Malformed resource record in upstream response', rcode, cacheTTL: 0 };
+    }
     offset = rr.rdEnd;
+    if (rr.type === 41 || i >= authorityEnd) continue;
+    const rrTTL = effectiveTTL(rr.ttl);
+    if (i < ancount) {
+      answerMin = Math.min(answerMin, rrTTL);
+    } else {
+      authorityMin = Math.min(authorityMin, rrTTL);
+      if (rr.type === 6) {
+        // readResourceRecord() already proved the SOA RDATA ends with its 20 numeric octets.
+        soaNegativeMin = Math.min(soaNegativeMin, effectiveTTL(readUint32(bytes, rr.rdEnd - 4)));
+      }
+    }
   }
-  if (offset !== bytes.length) {
-    return { ok: false, error: 'Trailing bytes in upstream response' };
+  if (strict && offset !== bytes.length) {
+    return { ok: false, error: 'Trailing bytes in upstream response', rcode, cacheTTL: 0 };
   }
-  return { ok: true, rcode };
+  let cacheTTL = 0;
+  // Truncated (TC) answers and non-NOERROR/NXDOMAIN rcodes are relayed but never cached.
+  if ((flags & 0x0200) === 0 && (rcode === 0 || rcode === 3)) {
+    const negativeTTL = soaNegativeMin === Infinity ? Infinity : Math.min(authorityMin, soaNegativeMin);
+    // A negative answer (NXDOMAIN/NODATA) needs an SOA; any answer-section records
+    // (for example the CNAME chain in front of an NXDOMAIN) bound the lifetime too.
+    if (!(negativeTTL === Infinity && (rcode === 3 || ancount === 0))) {
+      const ttl = Math.min(answerMin, negativeTTL);
+      if (Number.isFinite(ttl) && ttl > 0) {
+        cacheTTL = clamp(
+          Math.floor(ttl),
+          CONFIG.EDGE_CACHE_MIN_TTL_SECONDS,
+          CONFIG.EDGE_CACHE_MAX_TTL_SECONDS
+        );
+      }
+    }
+  }
+  return { ok: true, error: null, rcode, cacheTTL };
 }
 function createDNSNameContext() {
   return { nameOffsets: new Set() };
@@ -678,56 +738,7 @@ function cappedTTL(ttlSeconds, maxSeconds) {
   return clamp(Math.floor(ttlSeconds), CONFIG.EDGE_CACHE_MIN_TTL_SECONDS, maxSeconds);
 }
 function getDNSCacheTTL(responseBuffer) {
-  const bytes = new Uint8Array(responseBuffer);
-  if (bytes.length < 12 || bytes.length > CONFIG.MAX_UPSTREAM_DNS_MESSAGE_BYTES) return 0;
-  const flags = (bytes[2] << 8) | bytes[3];
-  if ((flags & 0x8000) === 0) return 0;
-  if ((flags & 0x0200) !== 0) return 0;
-  const rcode = flags & 0x000f;
-  if (rcode !== 0 && rcode !== 3) return 0;
-  const qdcount = (bytes[4] << 8) | bytes[5];
-  const ancount = (bytes[6] << 8) | bytes[7];
-  const nscount = (bytes[8] << 8) | bytes[9];
-  const arcount = (bytes[10] << 8) | bytes[11];
-  const nameContext = createDNSNameContext();
-  let offset = 12;
-  for (let i = 0; i < qdcount; i++) {
-    offset = skipDNSName(bytes, offset, nameContext);
-    if (offset < 0 || offset + 4 > bytes.length) return 0;
-    offset += 4;
-  }
-  let answerMin = Infinity;
-  let authorityMin = Infinity;
-  let soaNegativeMin = Infinity;
-  const authorityEnd = ancount + nscount;
-  const rrTotal = authorityEnd + arcount;
-  for (let i = 0; i < rrTotal; i++) {
-    const rr = readResourceRecord(bytes, offset, nameContext);
-    if (!rr) return 0;
-    offset = rr.rdEnd;
-    if (rr.type === 41 || i >= authorityEnd) continue;
-    const rrTTL = effectiveTTL(rr.ttl);
-    if (i < ancount) {
-      answerMin = Math.min(answerMin, rrTTL);
-    } else {
-      authorityMin = Math.min(authorityMin, rrTTL);
-      if (rr.type === 6) {
-        // readResourceRecord() already proved the SOA RDATA ends with its 20 numeric octets.
-        soaNegativeMin = Math.min(soaNegativeMin, effectiveTTL(readUint32(bytes, rr.rdEnd - 4)));
-      }
-    }
-  }
-  const negativeTTL = soaNegativeMin === Infinity ? Infinity : Math.min(authorityMin, soaNegativeMin);
-  // A negative answer (NXDOMAIN/NODATA) needs an SOA; any answer-section records
-  // (for example the CNAME chain in front of an NXDOMAIN) bound the lifetime too.
-  if (negativeTTL === Infinity && (rcode === 3 || ancount === 0)) return 0;
-  const ttl = Math.min(answerMin, negativeTTL);
-  if (!Number.isFinite(ttl) || ttl <= 0) return 0;
-  return clamp(
-    Math.floor(ttl),
-    CONFIG.EDGE_CACHE_MIN_TTL_SECONDS,
-    CONFIG.EDGE_CACHE_MAX_TTL_SECONDS
-  );
+  return analyzeDNSResponse(new Uint8Array(responseBuffer), null, null).cacheTTL;
 }
 function readResourceRecord(bytes, offset, context = null) {
   const nameEnd = skipDNSName(bytes, offset, context);
@@ -967,10 +978,9 @@ async function getEdgeCache(key, queryID, origin, queryBytes) {
     // Cache values are stored with their DNS transaction ID zeroed. Recheck the full
     // DNS structure, matching question, and effective DNS TTL to avoid serving corrupt
     // or mismatched cache content even when its metadata looks plausible.
-    const validation = validateDNSResponse(body, 0, queryBytes);
-    if (!validation.ok) return null;
-    const dnsTTL = getDNSCacheTTL(body);
-    if (dnsTTL <= 0 || ttlSeconds > dnsTTL) return null;
+    const analysis = validateDNSResponse(body, 0, queryBytes);
+    if (!analysis.ok) return null;
+    if (analysis.cacheTTL <= 0 || ttlSeconds > analysis.cacheTTL) return null;
     const ageSeconds = Math.floor((now - storedAt) / 1000);
     if (ageSeconds >= ttlSeconds) return null;
     return {
