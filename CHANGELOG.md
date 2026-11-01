@@ -1,11 +1,30 @@
-# Changelog
+## 0.4.24
 
-## 0.4.22
+### Fixed
+- Dashboard language-button drift: the static HTML rendered `LANGUAGE` inside the
+  `#currentLang` span while the English row of the `I18N` table (applied on load)
+  reads `ENGLISH`, so the page changed wording on first load and contradicted the
+  documented invariant that static English copy and `I18N.en` never drift apart.
+  The static span now renders `ENGLISH`.
 
 ### Changed
-- `relay()`: inlined the single-use `raceAbort` intermediate; race-abort detection now reads directly from the combined signal. No behavioral change — aborted losers are still not penalized, and timeouts are still classified via the timeout controller's own signal.
-- Version bumped to 0.4.22 (`Worker.js` `VERSION`, `package.json`); `/health` and the integration/smoke version checks read both dynamically and stay in agreement.
+- `getEdgeCache()` validates the cheap `x-doh-stored-at` / `x-doh-ttl` metadata
+  before buffering a cached L2 body, so expired or malformed entries no longer pay
+  for a body read they discard. No observable behavior change.
+- `integration.mjs`: the static-vs-`I18N.en` consistency check now also covers the
+  language button, main title, subtitle, endpoint label, and copy button
+  (`currentLang`/`curL`, `mainTitle`/`main`, `subTag`/`sub`, `labelUrl`/`urlL`,
+  `txtCopy`/`cpT`).
+- Version bumped to 0.4.24 (`Worker.js` `VERSION`, `package.json`); `/health` and
+  the integration/smoke version checks read both dynamically and stay in agreement.
 
 ### Verified
-- Every file was read and audited in full (Worker.js, test.mjs, integration.mjs, wrangler-smoke.mjs, package.json, wrangler.toml, README.md, CHANGELOG.md, LICENSE): no dead functions (the one single-use variable was inlined), no configuration conflicts (wrangler.toml 100 req / 60 s matches the local-limiter constants and the `DNS_RATE_LIMITER` binding name), and no functional bugs. Rejecting padded base64url and reporting `x-upstreams: 3` on partial races are documented, RFC 8484-aligned behaviors, covered by the integration and smoke tests — not defects.
-- `node --test test.mjs` (43 tests) and `node integration.mjs` pass with the changes applied.
+- Full re-audit of every project file (`Worker.js`, `test.mjs`, `integration.mjs`,
+  `wrangler-smoke.mjs`, `package.json`, `wrangler.toml`, `README.md`, `CHANGELOG.md`,
+  `LICENSE`): no functional bugs beyond the drift fixed above, no configuration
+  conflicts, no dead production code. The lenient branch of `analyzeDNSResponse()`
+  is intentionally retained (unit-suite load-bearing).
+- Baseline `node --test test.mjs` (43 tests) and `node integration.mjs` pass; all
+  changes are behavior-preserving except the `LANGUAGE` -> `ENGLISH` fix, and the
+  extended consistency assertions were verified against the shipped HTML and
+  `I18N.en` strings.

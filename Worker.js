@@ -1,4 +1,4 @@
-const VERSION = '0.4.22';
+const VERSION = '0.4.24';
 const CONFIG = {
   DNS_PATH: '/dns-query',
   EDGE_CACHE_ENABLED: true,
@@ -393,7 +393,7 @@ async function resolveWithParallelRace(nodes, packet, expectedID) {
     throw err;
   } finally {
     clearGrace();
-    abortAttempts(controllers);
+    abortAttempts(controllers, active);
   }
 }
 function isBetterDegraded(value, node, bestValue, bestNode) {
@@ -404,9 +404,9 @@ function isBetterDegraded(value, node, bestValue, bestNode) {
   if (node.score !== bestNode.score) return node.score > bestNode.score;
   return value.latencyMs < bestValue.latencyMs;
 }
-function abortAttempts(controllers) {
-  for (const controller of controllers.values()) {
-    try { controller.abort('winner-selected'); } catch (_) {}
+function abortAttempts(controllers, active) {
+  for (const node of active.keys()) {
+    try { controllers.get(node)?.abort('winner-selected'); } catch (_) {}
   }
 }
 function upstreamError(message, kind) {
@@ -649,9 +649,9 @@ function questionMatchesQuery(responseBytes, responseNameEnd, queryBytes) {
   return true;
 }
 function combineSignals(signal, timeoutSignal) {
-  const signals = signal ? [signal, timeoutSignal] : [timeoutSignal];
-  if (typeof AbortSignal.any === 'function') return AbortSignal.any(signals);
-  return anySignal(signals);
+  if (!signal) return timeoutSignal;
+  if (typeof AbortSignal.any === 'function') return AbortSignal.any([signal, timeoutSignal]);
+  return anySignal([signal, timeoutSignal]);
 }
 function anySignal(signals) {
   const controller = new AbortController();
@@ -736,9 +736,6 @@ function setCache(key, body, ttlSeconds, storedAt = Date.now(), expiresAtMs = nu
 function cappedTTL(ttlSeconds, maxSeconds) {
   if (!Number.isFinite(ttlSeconds)) return 0;
   return clamp(Math.floor(ttlSeconds), CONFIG.EDGE_CACHE_MIN_TTL_SECONDS, maxSeconds);
-}
-function getDNSCacheTTL(responseBuffer) {
-  return analyzeDNSResponse(new Uint8Array(responseBuffer), null, null).cacheTTL;
 }
 function readResourceRecord(bytes, offset, context = null) {
   const nameEnd = skipDNSName(bytes, offset, context);
@@ -947,19 +944,9 @@ async function getEdgeCache(key, queryID, origin, queryBytes) {
     if (!hit || hit.status !== 200 || !isDNSMessageContentType(hit.headers.get('content-type'))) {
       return null;
     }
-    // Stream-limit the read before buffering. Cache entries are an optimization, not
-    // trusted resolver output, so validate the packet and its metadata before serving.
-    let body;
-    try {
-      body = (await readCappedBody(
-        hit,
-        CONFIG.MAX_UPSTREAM_DNS_MESSAGE_BYTES,
-        'L2 cache entry too large'
-      )).buffer;
-    } catch (_) {
-      return null;
-    }
-    if (body.byteLength < 12) return null;
+    // Cache entries are an optimization, not trusted resolver output. Validate the
+    // cheap metadata headers before paying for the (stream-limited) body read, so
+    // expired or malformed entries are discarded without buffering their payload.
     const storedHeader = hit.headers.get('x-doh-stored-at');
     const ttlHeader = hit.headers.get('x-doh-ttl');
     const storedAt = storedHeader ? Number(storedHeader) : NaN;
@@ -975,6 +962,17 @@ async function getEdgeCache(key, queryID, origin, queryBytes) {
     ) {
       return null;
     }
+    let body;
+    try {
+      body = (await readCappedBody(
+        hit,
+        CONFIG.MAX_UPSTREAM_DNS_MESSAGE_BYTES,
+        'L2 cache entry too large'
+      )).buffer;
+    } catch (_) {
+      return null;
+    }
+    if (body.byteLength < 12) return null;
     // Cache values are stored with their DNS transaction ID zeroed. Recheck the full
     // DNS structure, matching question, and effective DNS TTL to avoid serving corrupt
     // or mismatched cache content even when its metadata looks plausible.
@@ -1169,7 +1167,6 @@ export const __internals = {
   skipDNSName,
   readResourceRecord,
   makeCacheKey,
-  getDNSCacheTTL,
   patchDNSResponseForAge,
   localRateLimit,
   rateLimitKey,
@@ -1220,7 +1217,7 @@ function renderUI(host) {
 <body class="p-4 md:p-12">
     <div class="fixed top-6 right-6 z-50">
         <button onclick="document.getElementById('langMenu').classList.toggle('hidden')" class="cyber-glass px-6 py-3 rounded-2xl flex items-center gap-4 text-xs font-bold border-cyan-500/20 hover:scale-[1.02] transition-transform">
-            🌐 <span id="currentLang">LANGUAGE</span>
+            🌐 <span id="currentLang">ENGLISH</span>
         </button>
         <div id="langMenu" class="hidden absolute right-0 mt-3 cyber-glass p-2 rounded-2xl w-44 shadow-2xl border-slate-800">
             <button onclick="changeLang('en')" class="w-full text-left p-3 hover:bg-sky-600 rounded-xl text-xs mb-1">ENGLISH</button>

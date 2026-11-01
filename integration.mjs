@@ -276,6 +276,18 @@ for (const [id, tag] of [['cH','h3'],['cL','div'],['fH','h3'],['fL','div'],['mH'
   assert.ok(stat && dyn, `dashboard copy for ${id} not found`);
   assert.equal(norm(dyn[1]), norm(stat[1]), `static and I18N.en text differ for ${id}`);
 }
+for (const [id, key, tag] of [
+  ['currentLang','curL','span'],
+  ['mainTitle','main','h1'],
+  ['subTag','sub','p'],
+  ['labelUrl','urlL','span'],
+  ['txtCopy','cpT','span']
+]) {
+  const stat = uiHtml.match(new RegExp(`id="${id}"[^>]*>([\\s\\S]*?)</${tag}>`));
+  const dyn = uiHtml.match(new RegExp(`\\b${key}: '((?:[^'\\\\]|\\\\.)*)'`));
+  assert.ok(stat && dyn, `dashboard copy for ${key} not found`);
+  assert.equal(norm(dyn[1]), norm(stat[1]), `static and I18N.en text differ for ${key}`);
+}
 // Rate-limit rejections advertise the configured window.
 dns.APP_STATE.throttle.clear();
 r=await worker.fetch(req('/dns-query',{method:'POST',headers:{'CF-Connecting-IP':'retry','content-type':'application/dns-message'},body:q1}),{DNS_RATE_LIMITER:{limit:async()=>({success:false})}});

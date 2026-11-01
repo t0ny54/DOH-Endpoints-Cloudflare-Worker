@@ -57,6 +57,9 @@ function soaRecord(ttl = 60, minimum = 30) {
     minimum >>> 24, (minimum >>> 16) & 0xff, (minimum >>> 8) & 0xff, minimum & 0xff
   ];
 }
+function cacheTTL(responseBuffer) {
+  return dns.validateDNSResponse(responseBuffer, null, null).cacheTTL;
+}
 function buildResponse(query, { rcode = 0, answers = [], authority = [], additional = [] } = {}) {
   const header = [
     query[0], query[1], 0x80, 0x80 | rcode,
@@ -113,33 +116,33 @@ test('validateDNSResponse accepts NXDOMAIN and rejects non-zero opcodes', () => 
   badOp[2] = 0x88;
   assert.equal(dns.validateDNSResponse(badOp.buffer, 5, query).ok, false);
 });
-test('getDNSCacheTTL honors min answer TTL', () => {
+test('lenient cacheTTL honors min answer TTL', () => {
   const query = buildQuery(7);
   const res = buildResponse(query, { answers: [aRecord('1.2.3.4', 120)] });
-  assert.equal(dns.getDNSCacheTTL(res.buffer), 120);
+  assert.equal(cacheTTL(res.buffer), 120);
 });
-test('getDNSCacheTTL caches NXDOMAIN only with SOA, using the lowest authority TTL capped by SOA MINIMUM', () => {
+test('lenient cacheTTL caches NXDOMAIN only with SOA, using the lowest authority TTL capped by SOA MINIMUM', () => {
   const query = buildQuery(7);
   const bare = buildResponse(query, { rcode: 3 });
-  assert.equal(dns.getDNSCacheTTL(bare.buffer), 0);
+  assert.equal(cacheTTL(bare.buffer), 0);
   const withSoa = buildResponse(query, { rcode: 3, authority: [soaRecord(60, 30)] });
-  assert.equal(dns.getDNSCacheTTL(withSoa.buffer), 30);
+  assert.equal(cacheTTL(withSoa.buffer), 30);
   const shortSoaTTL = buildResponse(query, { rcode: 3, authority: [soaRecord(20, 500)] });
-  assert.equal(dns.getDNSCacheTTL(shortSoaTTL.buffer), 20);
+  assert.equal(cacheTTL(shortSoaTTL.buffer), 20);
   const shortOtherAuthority = buildResponse(query, {
     rcode: 3,
     authority: [soaRecord(60, 30), [0xc0, 0x0c, 0x00, 0x2f, 0x00, 0x01, 0x00, 0x00, 0x00, 0x0a,
       0x00, 0x06, 0xc0, 0x0c, 0x00, 0x02, 0x40, 0x00]]
   });
-  assert.equal(dns.getDNSCacheTTL(shortOtherAuthority.buffer), 10);
+  assert.equal(cacheTTL(shortOtherAuthority.buffer), 10);
 });
-test('getDNSCacheTTL treats TTLs with the top bit set as zero (RFC 2181 section 8)', () => {
+test('lenient cacheTTL treats top-bit TTLs as zero (RFC 2181 section 8)', () => {
   const query = buildQuery(7);
-  assert.equal(dns.getDNSCacheTTL(buildResponse(query, { answers: [aRecord('1.2.3.4', 0x7fffffff)] }).buffer), 86_400);
-  assert.equal(dns.getDNSCacheTTL(buildResponse(query, { answers: [aRecord('1.2.3.4', 0x80000000)] }).buffer), 0);
-  assert.equal(dns.getDNSCacheTTL(buildResponse(query, { answers: [aRecord('1.2.3.4', 0xffffffff)] }).buffer), 0);
+  assert.equal(cacheTTL(buildResponse(query, { answers: [aRecord('1.2.3.4', 0x7fffffff)] }).buffer), 86_400);
+  assert.equal(cacheTTL(buildResponse(query, { answers: [aRecord('1.2.3.4', 0x80000000)] }).buffer), 0);
+  assert.equal(cacheTTL(buildResponse(query, { answers: [aRecord('1.2.3.4', 0xffffffff)] }).buffer), 0);
   const badMinimum = buildResponse(query, { rcode: 3, authority: [soaRecord(60, 0x80000000)] });
-  assert.equal(dns.getDNSCacheTTL(badMinimum.buffer), 0);
+  assert.equal(cacheTTL(badMinimum.buffer), 0);
 });
 test('patchDNSResponseForAge rewrites the ID, ages record TTLs, restores question case and leaves OPT alone', () => {
   const stored = buildResponse(buildQuery(0, 'example.com'), {
@@ -163,12 +166,12 @@ test('patchDNSResponseForAge rewrites the ID, ages record TTLs, restores questio
   const fresh = new Uint8Array(dns.patchDNSResponseForAge(stored.buffer, 1, 0, null));
   assert.equal(ttlAt(fresh), 300);
 });
-test('getDNSCacheTTL refuses to cache SERVFAIL and truncated answers', () => {
+test('lenient cacheTTL refuses SERVFAIL and truncated answers', () => {
   const query = buildQuery(7);
-  assert.equal(dns.getDNSCacheTTL(buildResponse(query, { rcode: 2 }).buffer), 0);
+  assert.equal(cacheTTL(buildResponse(query, { rcode: 2 }).buffer), 0);
   const tc = buildResponse(query, { answers: [aRecord('1.2.3.4')] });
   tc[2] |= 0x02;
-  assert.equal(dns.getDNSCacheTTL(tc.buffer), 0);
+  assert.equal(cacheTTL(tc.buffer), 0);
 });
 test('isBetterDegraded prefers SERVFAIL, then score, then latency', () => {
   const mk = (rcode, latencyMs) => ({ rcode, latencyMs });
@@ -343,7 +346,7 @@ test('DNSSEC-heavy and IPv6/other-type responses remain valid and cacheable', ()
   });
   const validated = dns.validateDNSResponse(response.buffer, 0x1414, query);
   assert.equal(validated.ok, true);
-  assert.equal(dns.getDNSCacheTTL(response.buffer), 120);
+  assert.equal(cacheTTL(response.buffer), 120);
 });
 test('expanded compressed names are rejected when they exceed the DNS 255-octet name limit', () => {
   const labels = new Array(4).fill(null).map(() => 'a'.repeat(63));
@@ -627,20 +630,20 @@ test('connection-level fetch failures are classified as network failures and cou
     globalThis.fetch = realFetch;
   }
 });
-test('getDNSCacheTTL bounds a negative answer by its answer-section CNAME chain as well as the SOA', () => {
+test('lenient cacheTTL bounds a negative answer by its answer-section CNAME chain as well as the SOA', () => {
   const query = buildQuery(0, 'example.com');
   const cname = (ttl) => [0xc0, 0x0c, 0x00, 0x05, 0x00, 0x01,
     ttl >>> 24, (ttl >>> 16) & 0xff, (ttl >>> 8) & 0xff, ttl & 0xff, 0x00, 0x02, 0xc0, 0x0c];
   const shortCname = buildResponse(query, { rcode: 3, answers: [cname(10)], authority: [soaRecord(60, 30)] });
-  assert.equal(dns.getDNSCacheTTL(shortCname.buffer), 10);
+  assert.equal(cacheTTL(shortCname.buffer), 10);
   const longCname = buildResponse(query, { rcode: 3, answers: [cname(900)], authority: [soaRecord(60, 30)] });
-  assert.equal(dns.getDNSCacheTTL(longCname.buffer), 30);
+  assert.equal(cacheTTL(longCname.buffer), 30);
   const topBitCname = buildResponse(query, { rcode: 3, answers: [cname(0xffffffff)], authority: [soaRecord(60, 30)] });
-  assert.equal(dns.getDNSCacheTTL(topBitCname.buffer), 0);
+  assert.equal(cacheTTL(topBitCname.buffer), 0);
   const cnameToNodata = buildResponse(query, { answers: [cname(10)], authority: [soaRecord(60, 30)] });
-  assert.equal(dns.getDNSCacheTTL(cnameToNodata.buffer), 10);
+  assert.equal(cacheTTL(cnameToNodata.buffer), 10);
   const cnameToNodataShortSoa = buildResponse(query, { answers: [cname(900)], authority: [soaRecord(60, 30)] });
-  assert.equal(dns.getDNSCacheTTL(cnameToNodataShortSoa.buffer), 30);
+  assert.equal(cacheTTL(cnameToNodataShortSoa.buffer), 30);
 });
 test('a timeout records lastError and lastErrorKind through penalize() alone and scores 8 points', async () => {
   const realFetch = globalThis.fetch;
