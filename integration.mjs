@@ -8,6 +8,19 @@ function encodeName(name) {
 function query(id, name='example.com', type=1, cls=1) {
   return Uint8Array.from([id>>8,id&255,0,0,0,1,0,0,0,0,0,0,...encodeName(name),type>>8,type&255,cls>>8,cls&255]);
 }
+// A valid query padded to an exact size with an EDNS OPT record (RFC 7830 padding option).
+function paddedQuery(id, name, total) {
+  const base = [...query(id, name)];
+  base[11] = 1;                             // one additional record
+  const padLen = total - base.length - 15;  // OPT header (11 bytes) + option header (4 bytes)
+  return Uint8Array.from([
+    ...base,
+    0, 0, 41, 0x10, 0x00, 0, 0, 0, 0,       // root owner, type OPT, class 4096, TTL 0
+    ((padLen + 4) >> 8) & 255, (padLen + 4) & 255,
+    0, 12, (padLen >> 8) & 255, padLen & 255, // option code 12 (padding), length
+    ...new Array(padLen).fill(0)
+  ]);
+}
 function answerFor(q, ip='1.2.3.4', ttl=60, rcode=0) {
   const b = [...q];
   b[2]=0x81; b[3]=rcode;
@@ -67,7 +80,10 @@ globalThis.fetch = async (url, opts={}) => {
 };
 const rateOK = { DNS_RATE_LIMITER: { limit: async()=>({success:true}) } };
 const req = (path, opts={}) => new Request('https://dns.example.test'+path, opts);
-let r = await worker.fetch(req('/')); assert.equal(r.status,200); assert.match(await r.text(), /DNS over HTTPS/);
+let r = await worker.fetch(req('/')); assert.equal(r.status,200); const rootHtml = await r.text(); assert.match(rootHtml, /DNS over HTTPS/);
+assert.match(rootHtml, /id="linkInp" value="https:\/\/dns\.example\.test\/dns-query"/);
+// Plain-HTTP origins (wrangler dev) must advertise http, not a broken https URL.
+assert.match(await (await worker.fetch(new Request('http://127.0.0.1:8797/'))).text(), /id="linkInp" value="http:\/\/127\.0\.0\.1:8797\/dns-query"/);
 r = await worker.fetch(req('/health')); assert.equal(r.status,200); assert.equal((await r.json()).version,PKG_VERSION);
 r = await worker.fetch(req('/missing')); assert.equal(r.status,404);
 r = await worker.fetch(req('/dns-query',{method:'PUT',headers:{'CF-Connecting-IP':'1'}}), rateOK); assert.equal(r.status,405);
@@ -99,6 +115,16 @@ const healthAfterFail=await (await worker.fetch(req('/health'))).json();
 assert.ok(healthAfterFail.upstreams.every(u=>u.lastErrorKind==='network'));
 const huge='A'.repeat(5463); r=await worker.fetch(req('/dns-query?dns='+huge,{method:'GET',headers:{'CF-Connecting-IP':'huge'}}), rateOK); assert.equal(r.status,413);
 r=await worker.fetch(req('/dns-query?dns=%%%',{method:'GET',headers:{'CF-Connecting-IP':'badb64'}}), rateOK); assert.equal(r.status,400);
+// GET size boundary: the longest accepted payload is 4,096 bytes (5,462 characters); one byte more is rejected.
+{
+  const maxB64 = Buffer.from(paddedQuery(0x7790, 'boundary.example', 4096)).toString('base64url');
+  assert.equal(maxB64.length, 5462);
+  r = await worker.fetch(req('/dns-query?dns='+maxB64,{method:'GET',headers:{'CF-Connecting-IP':'max-get'}}), rateOK);
+  assert.notEqual(r.status,413); assert.notEqual(r.status,400);
+  const overB64 = Buffer.from(paddedQuery(0x7791, 'boundary.example', 4097)).toString('base64url');
+  r = await worker.fetch(req('/dns-query?dns='+overB64,{method:'GET',headers:{'CF-Connecting-IP':'over-get'}}), rateOK);
+  assert.equal(r.status,413);
+}
 mode='slow'; upstreamCalls=0;
 const coalesceQ=query(0x3333,'coalesce.example');
 const p1=worker.fetch(req('/dns-query',{method:'POST',headers:{'CF-Connecting-IP':'c1','content-type':'application/dns-message'},body:coalesceQ}),rateOK);
@@ -268,6 +294,8 @@ dns.APP_STATE.cache.clear(); dns.APP_STATE.throttle.clear();
 r=await worker.fetch(req('/index.html')); assert.equal(r.status,200);
 const uiHtml = await r.text();
 assert.match(uiHtml,/document\.documentElement\.lang = c;/);
+// A combining mark glued onto a Latin word is a typo (it corrupted "DNS" in the Persian copy).
+assert.doesNotMatch(uiHtml, /[A-Za-z][\u064B-\u065F\u0670]/);
 // The English copy exists twice (static HTML and I18N.en); they must not drift apart.
 const norm = (h) => h.replace(/>\s+</g,'><').replace(/&gt;/g,'>').trim();
 for (const [id, tag] of [['cH','h3'],['cL','div'],['fH','h3'],['fL','div'],['mH','h3'],['mD','p'],['mL','div'],['whyH','span'],['whyT','div']]) {
@@ -295,7 +323,7 @@ assert.equal(r.status,429); assert.equal(r.headers.get('retry-after'),String(dns
 // L1 filled by another request while this one waits for the (asynchronous) L2 lookup: no upstream work.
 dns.APP_STATE.cache.clear(); cacheStore.clear(); upstreamCalls=0; mode='ok';
 const lateQ=query(0x778c,'late-l1.example');
-const lateKey=await dns.makeCacheKey(lateQ);
+const lateKey=dns.localCacheKey(lateQ);
 const lateBody=answerFor(lateQ,'5.6.7.8',60); lateBody[0]=0; lateBody[1]=0;
 const realCaches=globalThis.caches;
 globalThis.caches={default:{

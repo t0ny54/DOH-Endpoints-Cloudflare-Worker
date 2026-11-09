@@ -1,4 +1,5 @@
-const VERSION = '0.4.24';
+const VERSION = '0.4.26';
+const MAX_DNS_MESSAGE_BYTES = 4096;
 const CONFIG = {
   DNS_PATH: '/dns-query',
   EDGE_CACHE_ENABLED: true,
@@ -12,8 +13,10 @@ const CONFIG = {
   RATE_LIMIT_MAX_REQUESTS: 100,
   MAX_THROTTLE_ENTRIES: 2048,
   STATE_SWEEP_INTERVAL_MS: 60_000,
-  MAX_DNS_MESSAGE_BYTES: 4096,
-  MAX_GET_DNS_CHARS: 5462,
+  MAX_DNS_MESSAGE_BYTES,
+  // Longest unpadded base64url string whose decoded length is at most MAX_DNS_MESSAGE_BYTES
+  // (5,462 characters for 4,096 bytes). Derived, so the two limits cannot drift apart.
+  MAX_GET_DNS_CHARS: Math.ceil((4 * (MAX_DNS_MESSAGE_BYTES + 1)) / 3) - 1,
   MAX_UPSTREAM_DNS_MESSAGE_BYTES: 65_535,
   UPSTREAM_TIMEOUT_MS: 1200,
   NXDOMAIN_GRACE_MS: 200,
@@ -65,7 +68,7 @@ export default {
       });
     }
     if (url.pathname === '/' || url.pathname === '/index.html') {
-      return renderUI(url.host);
+      return renderUI(url.origin);
     }
     return textResponse('Not found', 404, { 'cache-control': 'no-store' });
   }
@@ -87,18 +90,22 @@ async function handleDNS(req, url, ctx) {
   if (!parsed.ok) {
     return textResponse(parsed.error, 400, { 'cache-control': 'no-store' });
   }
-  const cacheKey = await makeCacheKey(payload);
-  const local = serveLocal(cacheKey, parsed, payload);
+  // L1 and in-flight state use the exact normalized query bytes (no hash on the hot path, and
+  // distinct questions can never share an entry). The L2 Cache API key is derived from the same bytes.
+  const localKey = localCacheKey(payload);
+  const local = serveLocal(localKey, parsed, payload);
   if (local) return local;
+  let edgeKey = null;
   if (CONFIG.EDGE_CACHE_ENABLED) {
-    const edgeHit = await getEdgeCache(cacheKey, parsed.id, url.origin, payload);
+    edgeKey = await makeCacheKey(payload);
+    const edgeHit = await getEdgeCache(edgeKey, parsed.id, url.origin, payload);
     if (edgeHit) {
       const promotedTTL = cappedTTL(
         edgeHit.ttlSeconds - edgeHit.ageSeconds,
         CONFIG.LOCAL_CACHE_MAX_TTL_SECONDS
       );
       setCache(
-        cacheKey,
+        localKey,
         edgeHit.body,
         promotedTTL,
         edgeHit.storedAt,
@@ -115,7 +122,7 @@ async function handleDNS(req, url, ctx) {
     }
     // The L2 lookup above is asynchronous: another request may have finished (L1 filled,
     // in-flight entry removed) or started a lookup in the meantime.
-    const raced = serveLocal(cacheKey, parsed, payload);
+    const raced = serveLocal(localKey, parsed, payload);
     if (raced) return raced;
   }
   if (APP_STATE.inflight.size >= CONFIG.MAX_INFLIGHT_ENTRIES) {
@@ -134,14 +141,14 @@ async function handleDNS(req, url, ctx) {
       new Uint8Array(result.body).fill(0, 0, 2);
       const localTTL = cappedTTL(ttlSeconds, CONFIG.LOCAL_CACHE_MAX_TTL_SECONDS);
       setCache(
-        cacheKey,
+        localKey,
         result.body,
         localTTL,
         storedAt
       );
       if (CONFIG.EDGE_CACHE_ENABLED) {
         ctx?.waitUntil?.(putEdgeCache(
-          cacheKey,
+          edgeKey,
           result.body,
           ttlSeconds, // already clamped to EDGE_CACHE_MIN/MAX_TTL_SECONDS during analysis
           storedAt,
@@ -151,7 +158,7 @@ async function handleDNS(req, url, ctx) {
     }
     return { ...result, storedAt };
   })();
-  APP_STATE.inflight.set(cacheKey, job);
+  APP_STATE.inflight.set(localKey, job);
   try {
     const result = await job;
     const responseBody = patchDNSResponseForAge(result.body, parsed.id, 0, payload);
@@ -163,13 +170,13 @@ async function handleDNS(req, url, ctx) {
   } catch (err) {
     return upstreamFailureResponse(err);
   } finally {
-    if (APP_STATE.inflight.get(cacheKey) === job) APP_STATE.inflight.delete(cacheKey);
+    if (APP_STATE.inflight.get(localKey) === job) APP_STATE.inflight.delete(localKey);
   }
 }
-function serveLocal(cacheKey, parsed, queryBytes) {
-  const hit = getCache(cacheKey);
+function serveLocal(key, parsed, queryBytes) {
+  const hit = getCache(key);
   if (hit) return l1HitResponse(hit, parsed, queryBytes);
-  const job = APP_STATE.inflight.get(cacheKey);
+  const job = APP_STATE.inflight.get(key);
   return job ? joinInflight(job, parsed, queryBytes) : null;
 }
 function winnerHeaders(result, headers) {
@@ -280,24 +287,23 @@ async function readCappedBody(source, maxBytes, tooLargeMessage) {
   }
   return out;
 }
+// Callers cap the input at CONFIG.MAX_GET_DNS_CHARS first, which bounds the decoded length at
+// MAX_DNS_MESSAGE_BYTES, so no separate size check is needed here.
 function decodeBase64Url(input) {
   if (!input || !/^[A-Za-z0-9_-]+$/.test(input)) {
     throw httpError('Invalid base64url DNS query', 400);
   }
   let normalized = input.replace(/-/g, '+').replace(/_/g, '/');
   normalized += '='.repeat((4 - (normalized.length % 4)) % 4);
+  let decoded;
   try {
-    const decoded = atob(normalized);
-    const bytes = new Uint8Array(decoded.length);
-    for (let i = 0; i < decoded.length; i++) bytes[i] = decoded.charCodeAt(i);
-    if (bytes.byteLength > CONFIG.MAX_DNS_MESSAGE_BYTES) {
-      throw httpError('DNS message too large', 413);
-    }
-    return bytes;
-  } catch (err) {
-    if (err && err.status) throw err;
+    decoded = atob(normalized);
+  } catch (_) {
     throw httpError('Invalid base64url DNS query', 400);
   }
+  const bytes = new Uint8Array(decoded.length);
+  for (let i = 0; i < decoded.length; i++) bytes[i] = decoded.charCodeAt(i);
+  return bytes;
 }
 function parseDNSQuestion(bytes) {
   if (bytes.byteLength < 12) {
@@ -516,9 +522,6 @@ function analyzeDNSResponse(bytes, expectedID, queryBytes) {
   if (bytes.length < 12) {
     return { ok: false, error: 'Upstream returned short DNS response', rcode: 0, cacheTTL: 0 };
   }
-  if (!strict && bytes.length > CONFIG.MAX_UPSTREAM_DNS_MESSAGE_BYTES) {
-    return { ok: false, error: null, rcode: 0, cacheTTL: 0 };
-  }
   const id = (bytes[0] << 8) | bytes[1];
   const flags = (bytes[2] << 8) | bytes[3];
   const rcode = flags & 0x000f;
@@ -701,12 +704,23 @@ function normalizeUncompressedQuestionName(bytes) {
     offset += 1 + len;
   }
 }
-async function makeCacheKey(packet) {
+// Wire bytes used for cache identity: transaction ID zeroed and ASCII letters in an
+// uncompressed question name folded to lower case. Always returns a fresh buffer.
+function normalizeQueryForKey(packet) {
   const normalized = packet.slice();
   normalized[0] = 0;
   normalized[1] = 0;
   normalizeUncompressedQuestionName(normalized);
-  const digest = await crypto.subtle.digest('SHA-256', normalized);
+  return normalized;
+}
+// Exact key for the isolate-local maps (L1 cache and in-flight jobs): the normalized bytes
+// themselves. Two different questions can never collide, and no async digest is needed.
+function localCacheKey(packet) {
+  return String.fromCharCode.apply(null, normalizeQueryForKey(packet));
+}
+// Key for the data-center-local L2 Cache API entry (SHA-256 of the normalized bytes).
+async function makeCacheKey(packet) {
+  const digest = await crypto.subtle.digest('SHA-256', normalizeQueryForKey(packet));
   const view = new Uint8Array(digest, 0, 16);
   let out = '';
   for (let i = 0; i < view.length; i++) out += view[i].toString(16).padStart(2, '0');
@@ -882,6 +896,12 @@ function effectiveTTL(ttl) {
 function readUint32(bytes, offset) {
   return (((bytes[offset] * 0x100 + bytes[offset + 1]) * 0x100 + bytes[offset + 2]) * 0x100 + bytes[offset + 3]) >>> 0;
 }
+function writeUint32(bytes, offset, value) {
+  bytes[offset] = (value >>> 24) & 0xff;
+  bytes[offset + 1] = (value >>> 16) & 0xff;
+  bytes[offset + 2] = (value >>> 8) & 0xff;
+  bytes[offset + 3] = value & 0xff;
+}
 function restoreQuestionCase(target, query) {
   const lower = (v) => (v >= 65 && v <= 90 ? v + 32 : v);
   const maxLen = Math.min(query.length, target.length);
@@ -898,6 +918,10 @@ function restoreQuestionCase(target, query) {
     offset += 1 + len;
   }
 }
+// Cache hits re-walk the stored packet to age its TTLs. Every stored packet was fully
+// validated before it was cached (relay() for L1, validateDNSResponse() for L2), so this
+// pass only needs record boundaries: it skips RDATA revalidation and allocates no
+// name-offset set, which matters because it runs on every cache hit.
 function patchDNSResponseForAge(responseBuffer, queryID, ageSeconds, queryBytes) {
   const copy = new Uint8Array(responseBuffer).slice();
   if (copy.length < 12) return copy.buffer;
@@ -910,26 +934,24 @@ function patchDNSResponseForAge(responseBuffer, queryID, ageSeconds, queryBytes)
   const ancount = (copy[6] << 8) | copy[7];
   const nscount = (copy[8] << 8) | copy[9];
   const arcount = (copy[10] << 8) | copy[11];
-  const nameContext = createDNSNameContext();
   let offset = 12;
   for (let i = 0; i < qdcount; i++) {
-    offset = skipDNSName(copy, offset, nameContext);
+    offset = skipDNSName(copy, offset);
     if (offset < 0 || offset + 4 > copy.length) return copy.buffer;
     offset += 4;
   }
   const rrTotal = ancount + nscount + arcount;
   for (let i = 0; i < rrTotal; i++) {
-    const rr = readResourceRecord(copy, offset, nameContext);
-    if (!rr) return copy.buffer;
-    if (rr.type !== 41) {
-      const remaining = Math.max(0, effectiveTTL(rr.ttl) - age);
-      const ttlOffset = rr.rdataOffset - 6;
-      copy[ttlOffset] = (remaining >>> 24) & 0xff;
-      copy[ttlOffset + 1] = (remaining >>> 16) & 0xff;
-      copy[ttlOffset + 2] = (remaining >>> 8) & 0xff;
-      copy[ttlOffset + 3] = remaining & 0xff;
+    const nameEnd = skipDNSName(copy, offset);
+    if (nameEnd < 0 || nameEnd + 10 > copy.length) return copy.buffer;
+    const type = (copy[nameEnd] << 8) | copy[nameEnd + 1];
+    const rdEnd = nameEnd + 10 + ((copy[nameEnd + 8] << 8) | copy[nameEnd + 9]);
+    if (rdEnd > copy.length) return copy.buffer;
+    if (type !== 41) {
+      const remaining = Math.max(0, effectiveTTL(readUint32(copy, nameEnd + 4)) - age);
+      writeUint32(copy, nameEnd + 4, remaining);
     }
-    offset = rr.rdEnd;
+    offset = rdEnd;
   }
   return copy.buffer;
 }
@@ -972,7 +994,6 @@ async function getEdgeCache(key, queryID, origin, queryBytes) {
     } catch (_) {
       return null;
     }
-    if (body.byteLength < 12) return null;
     // Cache values are stored with their DNS transaction ID zeroed. Recheck the full
     // DNS structure, matching question, and effective DNS TTL to avoid serving corrupt
     // or mismatched cache content even when its metadata looks plausible.
@@ -1166,6 +1187,7 @@ export const __internals = {
   validateDNSResponse,
   skipDNSName,
   readResourceRecord,
+  localCacheKey,
   makeCacheKey,
   patchDNSResponseForAge,
   localRateLimit,
@@ -1186,15 +1208,14 @@ const UI_RESPONSE_HEADERS = {
   'referrer-policy': 'no-referrer',
   'content-security-policy': "default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'none'"
 };
-function renderUI(host) {
-  let html = UI_RESPONSE_CACHE.get(host);
+function renderUI(origin) {
+  let html = UI_RESPONSE_CACHE.get(origin);
   if (html) {
-    UI_RESPONSE_CACHE.delete(host);
-    UI_RESPONSE_CACHE.set(host, html);
+    UI_RESPONSE_CACHE.delete(origin);
+    UI_RESPONSE_CACHE.set(origin, html);
     return new Response(html, { headers: UI_RESPONSE_HEADERS });
   }
-  const safeHost = escapeHtml(host);
-  const endpoint = `https://${safeHost}${CONFIG.DNS_PATH}`;
+  const endpoint = `${escapeHtml(origin)}${CONFIG.DNS_PATH}`;
   html = `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1314,7 +1335,7 @@ function renderUI(host) {
                 cH: 'تنظیمات در کروم، اج و بریو', cL: '<p>۱. در تنظیمات مرورگر کلمه DNS را جستجو کنید.</p><p>۲. وارد بخش Security شوید.</p><p>۳. گزینه «Use Secure DNS» را انتخاب کنید.</p><p>۴. آدرس سرور را در فیلد Custom وارد کنید.</p><p>۵. با جستجوی یک سایت محدود، نتیجه را تست کنید.</p>',
                 fH: 'تنظیمات در مرورگر فایرفاکس', fL: '<p>۱. در فایرفاکس وارد Settings شوید و DNS over HTTPS را جستجو کنید.</p><p>۲. گزینه Custom را انتخاب کنید.</p><p>۳. URL سرویس DoH را وارد کنید.</p><p>۴. برای حداکثر محافظت، گزینه Max Protection را فعال کنید.</p>',
                 mH: 'استراتژی راه‌اندازی در موبایل', mD: 'گوشی‌ها معمولاً در تنظیمات سیستمی به دنبال hostname برای DoT هستند؛ برای این سرویس DoH، بهترین روش در مرورگر است:',
-                mL: '<p><b>داخل مرورگر:</b> بهترین راه تنظیم مستقیم در بخش Secure DNSِ کروم یا فایرفاکس است.</p><p><b>برای اپ‌ها:</b> از اپ‌های <b>Intra</b> یا <b>RethinkDNS</b> کمک بگیرید و نوع DNS را DoH تنظیم کنید.</p>',
+                mL: '<p><b>داخل مرورگر:</b> بهترین راه تنظیم مستقیم در بخش Secure DNS کروم یا فایرفاکس است.</p><p><b>برای اپ‌ها:</b> از اپ‌های <b>Intra</b> یا <b>RethinkDNS</b> کمک بگیرید و نوع DNS را DoH تنظیم کنید.</p>',
                 whyH: 'چرا معمولاً فقط در مرورگر؟',
                 whyT: '<p>بسیاری از تنظیمات سیستمی ویندوز یا اندروید، معمولاً <b>DoT (پورت ۸۵۳)</b> یا فرمت hostname را می‌خواهند و URL کامل HTTPS را نمی‌پذیرند.</p><p>این سرویس برای مرورگرها و Port 443 طراحی شده است و بهترین مکان استفاده از آن در داخل مرورگر است.</p>',
                 curL: 'فارسی (FA)'
@@ -1384,7 +1405,7 @@ function renderUI(host) {
     </script>
 </body>
 </html>`;
-  UI_RESPONSE_CACHE.set(host, html);
+  UI_RESPONSE_CACHE.set(origin, html);
   trimMap(UI_RESPONSE_CACHE, UI_RESPONSE_CACHE_MAX_ENTRIES);
   return new Response(html, { headers: UI_RESPONSE_HEADERS });
 }

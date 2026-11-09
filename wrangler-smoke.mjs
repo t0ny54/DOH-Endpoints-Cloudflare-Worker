@@ -54,16 +54,25 @@ async function waitForServer(timeoutMs = 20_000) {
   }
   throw new Error(`Wrangler dev server did not become ready: ${lastError?.message || 'unknown error'}\n${logs}`);
 }
+// Signals the whole Wrangler process tree, then resolves once Wrangler has exited (or after a
+// bounded wait), so the script never returns while workerd is still shutting down.
 function stopWrangler() {
-  if (!child.pid) return;
-  try {
-    if (process.platform === 'win32') {
-      // child.kill() would only stop the cmd.exe shell and leave node/workerd running.
-      spawnSync('taskkill', ['/pid', String(child.pid), '/T', '/F'], { stdio: 'ignore' });
-    } else {
-      process.kill(-child.pid, 'SIGTERM');
+  return new Promise((resolve) => {
+    if (!child.pid || child.exitCode !== null || child.signalCode !== null) return resolve();
+    const timer = setTimeout(resolve, 5_000);
+    child.once('exit', () => { clearTimeout(timer); resolve(); });
+    try {
+      if (process.platform === 'win32') {
+        // child.kill() would only stop the cmd.exe shell and leave node/workerd running.
+        spawnSync('taskkill', ['/pid', String(child.pid), '/T', '/F'], { stdio: 'ignore' });
+      } else {
+        process.kill(-child.pid, 'SIGTERM');
+      }
+    } catch (_) {
+      clearTimeout(timer);
+      resolve();
     }
-  } catch (_) {}
+  });
 }
 try {
   const health = await (await waitForServer()).json();
@@ -73,6 +82,8 @@ try {
   const root = await fetch(`${BASE}/`);
   assert.equal(root.status, 200);
   assert.match(root.headers.get('content-type') || '', /^text\/html/i);
+  // Served over plain HTTP by wrangler dev: the advertised endpoint must use the same scheme.
+  assert.ok((await root.text()).includes(`value="${BASE}/dns-query"`), 'dashboard endpoint must match the served origin');
   const badDNS = await fetch(`${BASE}/dns-query?dns=not_base64!`, {
     headers: { 'CF-Connecting-IP': 'wrangler-smoke' }
   });
@@ -84,5 +95,5 @@ try {
   assert.equal(wrongMethod.status, 405);
   console.log('WRANGLER DEV SMOKE TEST: PASS');
 } finally {
-  stopWrangler();
+  await stopWrangler();
 }

@@ -758,3 +758,64 @@ test('rateLimitKey groups IPv6 clients by /64 and leaves IPv4 and non-IP values 
     assert.equal(key(odd), odd, `${odd} must be returned unchanged`);
   }
 });
+
+test('patchDNSResponseForAge ages every record of a DNSSEC-heavy answer and leaves all RDATA bytes unchanged', () => {
+  const query = buildQuery(0x2727, 'example.com', 28);
+  const owner = compressedOwner();
+  const stored = buildResponse(query, {
+    answers: [
+      rr(owner, 28, aaaaRData(), 120),
+      rr(owner, 15, mxRData(), 180),
+      rr(owner, 33, srvRData(), 240),
+      rr(owner, 43, dsRData(), 300),
+      rr(owner, 46, rrsigRData(), 300),
+      rr(owner, 48, dnskeyRData(), 300),
+      rr(owner, 47, nsecRData(), 300)
+    ],
+    authority: [soaRecord(60, 30)],
+    additional: [optRecord()]
+  });
+  const age = 25;
+  const aged = new Uint8Array(dns.patchDNSResponseForAge(stored.buffer, 0x2727, age, query));
+  // Lengths never change, so both buffers share record offsets.
+  const records = (bytes) => {
+    const out = [];
+    let offset = dns.skipDNSName(bytes, 12) + 4;
+    for (let i = 0; i < 9; i++) {
+      const rec = dns.readResourceRecord(bytes, offset);
+      out.push({
+        type: rec.type,
+        ttl: rec.ttl,
+        rdata: [...bytes.slice(rec.rdataOffset, rec.rdEnd)]
+      });
+      offset = rec.rdEnd;
+    }
+    return out;
+  };
+  const before = records(stored);
+  const after = records(aged);
+  assert.equal(after.length, before.length);
+  for (let i = 0; i < before.length; i++) {
+    assert.deepEqual(after[i].rdata, before[i].rdata, `RDATA of record ${i} (type ${before[i].type}) changed`);
+    if (before[i].type === 41) {
+      assert.equal(after[i].ttl, before[i].ttl, 'OPT record flags must not be aged');
+    } else {
+      assert.equal(after[i].ttl, Math.max(0, before[i].ttl - age), `TTL of record ${i} (type ${before[i].type})`);
+    }
+  }
+  assert.deepEqual([...aged.slice(0, 2)], [0x27, 0x27]);
+  assert.deepEqual([...aged.slice(4, 12)], [...stored.slice(4, 12)]);
+});
+
+test('localCacheKey ignores transaction ID and ASCII case, but separates distinct questions exactly', () => {
+  const key = dns.localCacheKey;
+  assert.equal(key(buildQuery(1, 'example.com')), key(buildQuery(999, 'EXAMPLE.COM')));
+  assert.notEqual(key(buildQuery(1, 'a.bc')), key(buildQuery(1, 'ab.c')));
+  assert.notEqual(key(buildQuery(1, 'example.com', 1)), key(buildQuery(1, 'example.com', 28)));
+  assert.notEqual(key(buildQuery(1, 'example.com', 1, 1)), key(buildQuery(1, 'example.com', 1, 3)));
+  const packet = buildQuery(0x3030, 'MiXeD.com');
+  const before = [...packet];
+  key(packet);
+  assert.deepEqual([...packet], before, 'key derivation must not mutate its input');
+});
+
