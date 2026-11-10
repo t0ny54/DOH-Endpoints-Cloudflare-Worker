@@ -1,4 +1,4 @@
-const VERSION = '0.4.26';
+const VERSION = '0.4.27';
 const MAX_DNS_MESSAGE_BYTES = 4096;
 const CONFIG = {
   DNS_PATH: '/dns-query',
@@ -91,13 +91,15 @@ async function handleDNS(req, url, ctx) {
     return textResponse(parsed.error, 400, { 'cache-control': 'no-store' });
   }
   // L1 and in-flight state use the exact normalized query bytes (no hash on the hot path, and
-  // distinct questions can never share an entry). The L2 Cache API key is derived from the same bytes.
-  const localKey = localCacheKey(payload);
+  // distinct questions can never share an entry). The L2 Cache API key is derived from the same
+  // normalized buffer, so the query is normalized once per request.
+  const normalized = normalizeQueryForKey(payload);
+  const localKey = localKeyFromNormalized(normalized);
   const local = serveLocal(localKey, parsed, payload);
   if (local) return local;
   let edgeKey = null;
   if (CONFIG.EDGE_CACHE_ENABLED) {
-    edgeKey = await makeCacheKey(payload);
+    edgeKey = await edgeKeyFromNormalized(normalized);
     const edgeHit = await getEdgeCache(edgeKey, parsed.id, url.origin, payload);
     if (edgeHit) {
       const promotedTTL = cappedTTL(
@@ -556,6 +558,10 @@ function analyzeDNSResponse(bytes, expectedID, queryBytes) {
   let answerMin = Infinity;
   let authorityMin = Infinity;
   let soaNegativeMin = Infinity;
+  // RFC 6891 section 6.1.3: the top 8 bits of the OPT record's TTL extend the 4-bit header
+  // RCODE. Only the first OPT record in the additional section counts.
+  let extendedRcode = 0;
+  let sawOPT = false;
   const authorityEnd = ancount + nscount;
   const rrTotal = authorityEnd + arcount;
   for (let i = 0; i < rrTotal; i++) {
@@ -564,7 +570,14 @@ function analyzeDNSResponse(bytes, expectedID, queryBytes) {
       return { ok: false, error: 'Malformed resource record in upstream response', rcode, cacheTTL: 0 };
     }
     offset = rr.rdEnd;
-    if (rr.type === 41 || i >= authorityEnd) continue;
+    if (rr.type === 41) {
+      if (i >= authorityEnd && !sawOPT) {
+        sawOPT = true;
+        extendedRcode = rr.ttl >>> 24;
+      }
+      continue;
+    }
+    if (i >= authorityEnd) continue;
     const rrTTL = effectiveTTL(rr.ttl);
     if (i < ancount) {
       answerMin = Math.min(answerMin, rrTTL);
@@ -579,13 +592,14 @@ function analyzeDNSResponse(bytes, expectedID, queryBytes) {
   if (strict && offset !== bytes.length) {
     return { ok: false, error: 'Trailing bytes in upstream response', rcode, cacheTTL: 0 };
   }
+  const fullRcode = rcode | (extendedRcode << 4);
   let cacheTTL = 0;
   // Truncated (TC) answers and non-NOERROR/NXDOMAIN rcodes are relayed but never cached.
-  if ((flags & 0x0200) === 0 && (rcode === 0 || rcode === 3)) {
+  if ((flags & 0x0200) === 0 && (fullRcode === 0 || fullRcode === 3)) {
     const negativeTTL = soaNegativeMin === Infinity ? Infinity : Math.min(authorityMin, soaNegativeMin);
     // A negative answer (NXDOMAIN/NODATA) needs an SOA; any answer-section records
     // (for example the CNAME chain in front of an NXDOMAIN) bound the lifetime too.
-    if (!(negativeTTL === Infinity && (rcode === 3 || ancount === 0))) {
+    if (!(negativeTTL === Infinity && (fullRcode === 3 || ancount === 0))) {
       const ttl = Math.min(answerMin, negativeTTL);
       if (Number.isFinite(ttl) && ttl > 0) {
         cacheTTL = clamp(
@@ -596,7 +610,7 @@ function analyzeDNSResponse(bytes, expectedID, queryBytes) {
       }
     }
   }
-  return { ok: true, error: null, rcode, cacheTTL };
+  return { ok: true, error: null, rcode: fullRcode, cacheTTL };
 }
 function createDNSNameContext() {
   return { nameOffsets: new Set() };
@@ -715,16 +729,22 @@ function normalizeQueryForKey(packet) {
 }
 // Exact key for the isolate-local maps (L1 cache and in-flight jobs): the normalized bytes
 // themselves. Two different questions can never collide, and no async digest is needed.
-function localCacheKey(packet) {
-  return String.fromCharCode.apply(null, normalizeQueryForKey(packet));
+function localKeyFromNormalized(normalized) {
+  return String.fromCharCode.apply(null, normalized);
 }
 // Key for the data-center-local L2 Cache API entry (SHA-256 of the normalized bytes).
-async function makeCacheKey(packet) {
-  const digest = await crypto.subtle.digest('SHA-256', normalizeQueryForKey(packet));
+async function edgeKeyFromNormalized(normalized) {
+  const digest = await crypto.subtle.digest('SHA-256', normalized);
   const view = new Uint8Array(digest, 0, 16);
   let out = '';
   for (let i = 0; i < view.length; i++) out += view[i].toString(16).padStart(2, '0');
   return out;
+}
+function localCacheKey(packet) {
+  return localKeyFromNormalized(normalizeQueryForKey(packet));
+}
+async function makeCacheKey(packet) {
+  return edgeKeyFromNormalized(normalizeQueryForKey(packet));
 }
 function getCache(key) {
   const item = APP_STATE.cache.get(key);

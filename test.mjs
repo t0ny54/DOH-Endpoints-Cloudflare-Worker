@@ -819,3 +819,39 @@ test('localCacheKey ignores transaction ID and ASCII case, but separates distinc
   assert.deepEqual([...packet], before, 'key derivation must not mutate its input');
 });
 
+
+test('OPT extended RCODE is combined with the header RCODE (RFC 6891 section 6.1.3)', async () => {
+  const query = buildQuery(0x4242);
+  // OPT with TTL high byte 0x01: extended RCODE 1 << 4 | 0 = 16 (BADVERS).
+  const badVersOpt = [0x00, 0x00, 0x29, 0x10, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00];
+  const noAnswer = buildResponse(query, { additional: [badVersOpt] });
+  const v = dns.validateDNSResponse(noAnswer.buffer, 0x4242, query);
+  assert.equal(v.ok, true);
+  assert.equal(v.rcode, 16);
+  assert.equal(v.cacheTTL, 0);
+  // A BADVERS answer that still carries records must not be cached as a NOERROR answer.
+  const withAnswer = buildResponse(query, { answers: [aRecord('1.2.3.4', 300)], additional: [badVersOpt] });
+  const va = dns.validateDNSResponse(withAnswer.buffer, 0x4242, query);
+  assert.equal(va.rcode, 16);
+  assert.equal(va.cacheTTL, 0);
+  // Extended bits of zero leave the header RCODE untouched (NXDOMAIN stays 3).
+  const plainOpt = [0x00, 0x00, 0x29, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+  assert.equal(dns.validateDNSResponse(buildResponse(query, { rcode: 3, additional: [plainOpt] }).buffer, 0x4242, query).rcode, 3);
+  // Relay treats the extended RCODE as a degraded answer, not a usable one.
+  const realFetch = globalThis.fetch;
+  const node = makeNode('https://badvers.test/dns-query');
+  globalThis.fetch = async () => new Response(noAnswer, {
+    status: 200,
+    headers: { 'content-type': 'application/dns-message' }
+  });
+  try {
+    const result = await dns.relay(node, query, 0x4242, null);
+    assert.equal(result.rcode, 16);
+    assert.equal(result.usable, false);
+    assert.equal(result.degraded, true);
+    assert.equal(node.fail, 1);
+    assert.equal(node.lastError, 'DNS RCODE 16');
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
