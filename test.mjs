@@ -92,7 +92,7 @@ test('skipDNSName follows backward pointers, rejects out-of-bounds pointers and 
   assert.equal(dns.skipDNSName(Uint8Array.from([0xc0, 0x00]), 0), -1);
   assert.equal(dns.skipDNSName(Uint8Array.from([1, 0x61, 0xc0, 0x02, 0x00]), 0), -1);
 });
-test('validateDNSResponse rejects matching-ID fakes and mismatched questions', () => {
+test('validateDNSResponse rejects a header-only fake and a response to a different question', () => {
   const query = buildQuery(0x1234);
   const fake = Uint8Array.from([0x12, 0x34, 0x80, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff]);
   assert.equal(dns.validateDNSResponse(fake.buffer, 0x1234, query).ok, false);
@@ -852,6 +852,142 @@ test('OPT extended RCODE is combined with the header RCODE (RFC 6891 section 6.1
     assert.equal(node.fail, 1);
     assert.equal(node.lastError, 'DNS RCODE 16');
   } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+// Coverage for documented checks that the earlier tests did not reach.
+
+test('strict validation pins the transaction ID and rejects a query posing as a response', () => {
+  const query = buildQuery(0x3131, 'example.com');
+  const good = buildResponse(query, { answers: [aRecord('1.2.3.4')] });
+  assert.equal(dns.validateDNSResponse(good.buffer, 0x3131, query).ok, true);
+  assert.match(dns.validateDNSResponse(good.buffer, 0x3132, query).error, /ID mismatch/);
+  const asQuery = Uint8Array.from(good);
+  asQuery[2] &= 0x7f;
+  assert.match(dns.validateDNSResponse(asQuery.buffer, 0x3131, query).error, /not response/);
+});
+
+test('responses shorter than a DNS header or with a cut-off question are rejected', () => {
+  const query = buildQuery(0x4141, 'example.com');
+  assert.match(dns.validateDNSResponse(new Uint8Array(11).buffer, 0x4141, query).error, /short DNS response/);
+  const truncated = Uint8Array.from([0x41, 0x41, 0x81, 0x80, 0, 1, 0, 0, 0, 0, 0, 0, 7, 0x65, 0x78]);
+  assert.match(dns.validateDNSResponse(truncated.buffer, 0x4141, query).error, /Malformed question/);
+});
+
+test('parseDNSQuestion rejects non-query opcodes, wrong section counts and cut-off questions', () => {
+  const opcode = buildQuery(1);
+  opcode[2] = 0x08;
+  assert.equal(dns.parseDNSQuestion(opcode).error, 'Unsupported DNS opcode');
+  const counts = buildQuery(2);
+  counts[5] = 2;
+  assert.equal(dns.parseDNSQuestion(counts).error, 'Invalid DNS query section counts');
+  assert.equal(dns.parseDNSQuestion(buildQuery(3).slice(0, 15)).error, 'Incomplete DNS question');
+});
+
+test('relay classifies a wrong-ID answer as dns-invalid and penalizes that upstream', async () => {
+  const realFetch = globalThis.fetch;
+  const query = buildQuery(0x4141);
+  const forged = buildResponse(buildQuery(0x4142), { answers: [aRecord('6.6.6.6')] });
+  const node = makeNode('https://forged.test/dns-query');
+  globalThis.fetch = async () => new Response(forged, {
+    status: 200,
+    headers: { 'content-type': 'application/dns-message' }
+  });
+  try {
+    await assert.rejects(() => dns.relay(node, query, 0x4141, null));
+    assert.deepEqual([node.fail, node.score, node.lastErrorKind], [1, 88, 'dns-invalid']);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test('relay refuses an upstream whose declared length exceeds the DNS maximum', async () => {
+  const realFetch = globalThis.fetch;
+  const node = makeNode('https://declared-large.test/dns-query');
+  globalThis.fetch = async () => new Response(new Uint8Array(8), {
+    status: 200,
+    headers: { 'content-type': 'application/dns-message', 'content-length': '70000' }
+  });
+  try {
+    await assert.rejects(() => dns.relay(node, buildQuery(0x4343), 0x4343, null));
+    assert.equal(node.lastErrorKind, 'response-too-large');
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test('a body-stream failure during an upstream read is classified as a network failure', async () => {
+  const realFetch = globalThis.fetch;
+  const node = makeNode('https://reset.test/dns-query');
+  globalThis.fetch = async () => new Response(new ReadableStream({
+    start(controller) { controller.error(new Error('connection reset')); }
+  }), { status: 200, headers: { 'content-type': 'application/dns-message' } });
+  try {
+    await assert.rejects(() => dns.relay(node, buildQuery(0x4444), 0x4444, null));
+    assert.deepEqual([node.lastErrorKind, node.lastError], ['network', 'connection reset']);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+const wwwName = [3, 0x77, 0x77, 0x77, 0];
+const charString = (s) => [s.length, ...Buffer.from(s, 'ascii')];
+function answerAccepted(type, rdata) {
+  const query = buildQuery(0x5151);
+  const response = buildResponse(query, { answers: [rr(compressedOwner(), type, rdata)] });
+  return dns.validateDNSResponse(response.buffer, 0x5151, query).ok;
+}
+
+test('record-type validators accept well-formed RDATA and reject truncated or inconsistent RDATA', () => {
+  const cases = [
+    ['MINFO (14)', 14, [...wwwName, ...wwwName], [...wwwName]],
+    ['RP (17)', 17, [...wwwName, ...wwwName], [...wwwName]],
+    ['PX (26)', 26, [0, 10, ...wwwName, ...wwwName], [0, 10, ...wwwName]],
+    ['NAPTR (35)', 35,
+      [0, 10, 0, 20, ...charString('u'), ...charString('E2U+sip'), ...charString('!^.*$!sip:x!'), ...wwwName],
+      [0, 10, 0, 20, ...charString('u')]],
+    ['CAA (257)', 257, [0, 5, ...Buffer.from('issue'), ...Buffer.from('ca.test')], [0, 9, ...Buffer.from('issue')]],
+    ['URI (256)', 256, [0, 1, 0, 2, ...Buffer.from('ftp://x')], [0, 1]],
+    ['TLSA (52)', 52, [3, 1, 1, 0xaa, 0xbb], [3, 1]],
+    ['SVCB (64)', 64, [0, 1, ...wwwName, 0, 1, 0, 0, 0, 3, 0, 2, 1, 0xbb], [0, 1, ...wwwName, 0, 3, 0, 0, 0, 1, 0, 0]],
+    ['HTTPS (65)', 65, [0, 1, ...wwwName], [0, 1]],
+    ['NSEC3 (50)', 50, [1, 0, 0, 1, 0, 1, 0xaa, 0, 1, 0x40], [1, 0, 0, 1, 0, 1, 0xaa, 0, 5, 0x40]],
+    ['NSEC3PARAM (51)', 51, [1, 0, 0, 1, 0], [1, 0, 0, 1, 0, 0xff]]
+  ];
+  for (const [label, type, valid, invalid] of cases) {
+    assert.equal(answerAccepted(type, valid), true, `${label}: well-formed RDATA must validate`);
+    assert.equal(answerAccepted(type, invalid), false, `${label}: malformed RDATA must be rejected`);
+  }
+});
+
+test('unknown record types stay opaque once their owner name and RDATA length are proven', () => {
+  assert.equal(answerAccepted(65280, [1, 2, 3]), true);
+});
+
+test('skipDNSName rejects a name cut off before its terminator and reserved label-length bits', () => {
+  assert.equal(dns.skipDNSName(Uint8Array.from([1, 0x61]), 0), -1);
+  assert.equal(dns.skipDNSName(Uint8Array.from([5, 0x61]), 0), -1);
+  assert.equal(dns.skipDNSName(Uint8Array.from([0x40, 0x00]), 0), -1);
+});
+
+test('the AbortSignal fallback honours a race signal that is already aborted', async () => {
+  const realFetch = globalThis.fetch;
+  const realAny = AbortSignal.any;
+  globalThis.fetch = (_url, { signal } = {}) => new Promise((_resolve, reject) => {
+    const fail = () => reject(new DOMException('Aborted', 'AbortError'));
+    if (signal?.aborted) fail();
+    else signal?.addEventListener('abort', fail, { once: true });
+  });
+  AbortSignal.any = undefined;
+  try {
+    const node = makeNode('https://prearmed-abort.test/dns-query');
+    const lost = new AbortController();
+    lost.abort('winner-selected');
+    await assert.rejects(() => dns.relay(node, buildQuery(0x4646), 0x4646, lost.signal));
+    assert.deepEqual([node.fail, node.timeout, node.score], [0, 0, 100]);
+  } finally {
+    AbortSignal.any = realAny;
     globalThis.fetch = realFetch;
   }
 });

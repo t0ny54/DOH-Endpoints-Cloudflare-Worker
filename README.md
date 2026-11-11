@@ -1,6 +1,6 @@
 # 🛡️ DoH — Cloudflare Worker
 
-**Version 0.4.27** · see [`CHANGELOG.md`](CHANGELOG.md)
+**Version 0.4.29** · see [`CHANGELOG.md`](CHANGELOG.md)
 
 A lightweight Cloudflare Worker that exposes a standard **DNS-over-HTTPS** endpoint, races three configured DoH upstreams in parallel, and keeps a two-level DNS cache:
 
@@ -11,8 +11,7 @@ L2: Cloudflare Cache API (data-center-local)
 
 The three configured DoH upstreams are listed in [Configured upstreams](#-configured-dns-over-https-upstreams).
 
-
-### Cloudflare limits and how this build uses them
+## Cloudflare limits and how this build uses them
 
 Cloudflare's current Workers Free limits are 100,000 requests/day, 10 ms CPU time/invocation, 128 MB memory, 50 subrequests/invocation, and 6 simultaneous outgoing connections per invocation. Free requests reset at midnight UTC. See the Cloudflare Workers Limits documentation.
 
@@ -29,13 +28,13 @@ This Worker deliberately stays far below those ceilings on ordinary DNS traffic:
 
 The resolver logic launches all three configured upstreams immediately on every cold-cache lookup (`UPSTREAM_TIMEOUT_MS`, 1200 ms per upstream). The first valid `NOERROR` response wins, and the other in-flight upstream requests are aborted. If the first usable answer is `NXDOMAIN`, the Worker keeps racing for a short grace period (`NXDOMAIN_GRACE_MS`, 200 ms) so a single stale or filtered upstream cannot cause false negatives. If every upstream returns a syntactically valid degraded response such as `SERVFAIL` or `REFUSED`, the best degraded response is returned deterministically (SERVFAIL preferred, then the highest-scored upstream, then the fastest); if all three requests fail or return invalid DNS data, the Worker returns `502`. In-flight duplicate work is bounded at 128 entries (new cold resolutions are rejected with 503 when the map is full; live jobs are never evicted, so request coalescing is never broken mid-flight), and upstream response buffering is capped at 65,535 bytes. Maximum concurrent upstream connections from this Worker are 3, below Cloudflare's documented limit of 6.
 
-### Two-level DNS cache
+## Two-level DNS cache
 
 The Worker intentionally does **not** enable the global Workers Cache feature in `wrangler.toml`. That feature can return a cached response without executing the Worker, which would put the cache in front of the `/dns-query` rate limiter. Instead, the Worker uses the Cache API after rate limiting, so every `/dns-query` request still reaches the rate-limit check.
 
 The Cache API is data-center-local and does not replicate entries automatically between data centers. It is also generally not effective on `*.workers.dev` hostnames, so deploy on a custom domain/route to get L2 hits; on `workers.dev` the Worker still works and simply relies on L1 plus upstream resolution. That is still useful for hot DNS traffic because repeated queries at the same edge location can avoid an upstream lookup entirely.
 
-Both DoH GET and POST requests are keyed on the normalized DNS wire query: the transaction ID is ignored, and ASCII QNAME case is folded when the question name is uncompressed, so `example.com`, `EXAMPLE.com`, and mixed-case variants can share a cache entry, and the same question can share an entry across GET and POST. The isolate-local L1 cache and in-flight coalescing use those normalized bytes directly as their key, so two different questions can never collide and no hashing runs on the hot path. The data-center-local L2 Cache API key is the SHA-256 of the same bytes. Each L1 entry keeps its key, which is bounded by the 4 KiB message limit and is typically a few dozen bytes. When a cached answer is served, the question section is rewritten to the exact letter case the requesting client sent, so DNS 0x20-style case randomization still validates.
+Both DoH GET and POST requests are keyed on the normalized DNS wire query: the transaction ID is ignored, and ASCII QNAME case is folded when the question name is uncompressed, so `example.com`, `EXAMPLE.com`, and mixed-case variants can share a cache entry, and the same question can share an entry across GET and POST. The isolate-local L1 cache and in-flight coalescing use those normalized bytes directly as their key, so two different questions can never collide and no hashing runs on the hot path. The data-center-local L2 Cache API key is the first 128 bits of the SHA-256 of the same bytes. Each L1 entry keeps its key, which is bounded by the 4 KiB message limit and is typically a few dozen bytes. When a cached answer is served, the question section is rewritten to the exact letter case the requesting client sent, so DNS 0x20-style case randomization still validates.
 
 Only DNS answers that are safe to reuse are cached: `NOERROR` and `NXDOMAIN` responses that are not truncated (TC) and are at most 65,535 bytes. Negative answers (`NXDOMAIN`/`NODATA`) are cached only when they carry an SOA record. The negative cache TTL is the lowest TTL in the authority section, capped by the SOA `MINIMUM` field, so it is never longer than the RFC 2308 value `min(SOA TTL, SOA MINIMUM)`. If the answer section is not empty (for example the CNAME chain in front of an `NXDOMAIN`, or a CNAME that ends in `NODATA`), the lowest answer TTL bounds the cache lifetime as well, so a cached CNAME is never served past its own TTL. For an ordinary positive answer the TTL is the lowest answer-section TTL. Following RFC 2181 §8, a TTL with the most significant bit set (above 2,147,483,647) is treated as 0, so an answer carrying one is relayed but not cached. The same rule applies whenever a response is emitted, even when its age is zero: a record whose TTL has the top bit set (for example a CNAME in an NXDOMAIN answer, or an additional-section record) is returned with TTL 0 instead of being counted down from about 136 years. `SERVFAIL`, `REFUSED` and similar responses are relayed to the client (marked `x-dns-degraded: 1`) but never cached.
 
@@ -43,11 +42,11 @@ L1 is checked again after the (asynchronous) L2 lookup, and so is the in-flight 
 
 Responses cached internally use DNS TTL-derived expiration. The response transaction ID is rewritten for each client, and cached DNS record TTLs are reduced by cache age before being returned. `Cache-Control: no-store` remains on the client-facing response so the Worker controls the DNS cache instead of creating an uncontrolled browser/HTTP cache layer.
 
-### Rate limiting
+## Rate limiting
 
 `/dns-query` is limited to **100 requests per 60 seconds per client** through the native `DNS_RATE_LIMITER` binding in `wrangler.toml`. A lightweight per-isolate fallback limiter (bounded to 2048 IPs, evicting the least recently seen) is used when the binding is missing, throws, or returns an invalid response (the request is then limited locally rather than rejected or allowed unconditionally). The client key is the `CF-Connecting-IP` address, except that IPv6 addresses are grouped by their /64 prefix (the block a single IPv6 subscriber normally controls), so rotating addresses inside one prefix cannot bypass the limit; IPv4 addresses are used as-is. Both the native binding and the local fallback use this key. Rejected requests get `429` with `Retry-After` set to the window length (60 seconds with the shipped settings). Both limiter paths send the same `Retry-After` (the full window length), because the native binding does not expose a reset time. Cloudflare documents the native Rate Limiting API as low-latency; its counters are scoped to the relevant Cloudflare location rather than being one globally exact counter.
 
-### Request-size protection
+## Request-size protection
 
 DoH DNS messages are normally tiny, so this Worker rejects client messages larger than 4 KiB. It checks `Content-Length` before reading a POST when available and also stream-limits chunked/unknown-length bodies. Upstream resolver responses are independently capped at **65,535 bytes** (the DNS wire-format maximum) and are stream-limited before buffering. These limits avoid spending memory/CPU on oversized abuse traffic while still allowing large legitimate DNSSEC/EDNS answers. Client-facing error text is limited to deliberate, fixed messages: an unexpected failure while reading a request body is reported as a generic `Invalid DNS query` (`400`) rather than echoing internal error text.
 
@@ -129,7 +128,7 @@ npm run test:all
 
 The integration and smoke tests read the expected version from `package.json` and compare it with `/health`. A release therefore bumps the version in `package.json`, the `VERSION` constant in `Worker.js`, the version line at the top of this README, and `CHANGELOG.md` together.
 
-The unit suite (46 tests) covers DNS wire parsing and compression-pointer validation, every RR section and name-bearing RDATA, SOA structure, TTL and cacheability rules (negative-cache TTL, CNAME bounds, RFC 2181 top-bit TTLs), the OPT extended RCODE, response patching, L1 expiry and LRU eviction, resolver scoring, upstream failure classification, the NXDOMAIN grace race, L2-to-L1 promotion, the local rate limiter, IPv6 /64 grouping, and cache-key normalization.
+The unit suite covers DNS wire parsing and compression-pointer validation, transaction-ID and question matching, every RR section and name-bearing RDATA (including the MINFO, RP, PX, NAPTR, CAA, URI, TLSA, SVCB/HTTPS, NSEC3 and NSEC3PARAM validators), SOA structure, TTL and cacheability rules (negative-cache TTL, CNAME bounds, RFC 2181 top-bit TTLs), the OPT extended RCODE, response patching, L1 expiry and LRU eviction, resolver scoring, upstream failure classification, the NXDOMAIN grace race, L2-to-L1 promotion, the local rate limiter, IPv6 /64 grouping, and cache-key normalization.
 
 The integration suite exercises the exported `fetch()` handler end to end: routing, GET and POST DoH, request and body size limits (including the exact GET boundary), L1 and L2 caching and expiry, request coalescing, the in-flight saturation path, native and local rate limiting, upstream failure modes, degraded answers, cache API failures, and the dashboard copy, endpoint and security-header checks.
 
@@ -155,7 +154,6 @@ x-dns-degraded: 1   (only when the answer is SERVFAIL/REFUSED/etc.)
 
 The `/health` endpoint reports the version, the three configured resolver scores, counters and last error (`lastError`, `lastErrorKind`), the parallel-race strategy, rate-limit settings, plus L1/L2 cache and in-flight state. Resolver scores are informational and used only to break ties between degraded (SERVFAIL/REFUSED) answers; they do not change which upstreams are queried.
 
-
 ## Important limitation
 
 This is **DNS encryption**, not a VPN. It protects DNS traffic between the client and this Worker, but it does not hide destination IP addresses or guarantee bypass of IP, SNI, TLS, QUIC, or other network-level filtering.
@@ -173,7 +171,6 @@ The Worker uses these three DoH endpoints simultaneously for each uncached DNS l
 | 1 | `https://freedns.koyeb.app/dns-query` |
 | 2 | `https://dns-pi.vercel.app/api/doh/dns-query` |
 | 3 | `https://dns.mydoh.workers.dev/dns-query` |
-
 
 ## Supporting the Project
 

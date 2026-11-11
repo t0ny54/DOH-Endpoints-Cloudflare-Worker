@@ -354,4 +354,51 @@ assert.equal(dns.APP_STATE.throttle.size,1);
 r=await worker.fetch(req('/dns-query',{method:'POST',headers:{'CF-Connecting-IP':'2001:db8:9:a::1','content-type':'application/dns-message'},body:q1}));
 assert.equal(r.status,200);
 dns.CONFIG.RATE_LIMIT_MAX_REQUESTS=prevMax; dns.APP_STATE.throttle.clear(); dns.APP_STATE.cache.clear();
+// ---- Paths the earlier scenarios did not reach ----
+// A base64url value of an impossible length is a client error, not a crash.
+r = await worker.fetch(req('/dns-query?dns=A',{method:'GET',headers:{'CF-Connecting-IP':'b64-length'}}), rateOK);
+assert.equal(r.status,400); assert.equal(await r.text(),'Invalid base64url DNS query');
+// A POST split into several chunks (still under the limit) is reassembled before parsing.
+mode='ok'; upstreamCalls=0; dns.APP_STATE.cache.clear(); cacheStore.clear();
+const splitQ=query(0x7790,'split-body.example');
+const splitBody=new ReadableStream({start(controller){ for (const part of [splitQ.slice(0,5),splitQ.slice(5,20),splitQ.slice(20)]) controller.enqueue(part); controller.close(); }});
+r=await worker.fetch(req('/dns-query',{method:'POST',headers:{'CF-Connecting-IP':'split-body','content-type':'application/dns-message'},body:splitBody,duplex:'half'}),rateOK);
+assert.equal(r.status,200); out=new Uint8Array(await r.arrayBuffer()); assert.equal((out[0]<<8)|out[1],0x7790); assert.equal(upstreamCalls,3);
+// A joiner of a failed shared lookup receives 502 without starting its own upstream work.
+{
+  const integrationUpstream=globalThis.fetch;
+  let slowFailures=0;
+  globalThis.fetch=async()=>{ slowFailures++; await new Promise(resolve=>setTimeout(resolve,30)); throw new Error('down'); };
+  dns.APP_STATE.cache.clear(); cacheStore.clear();
+  const joinQ=query(0x7791,'joiner-failure.example');
+  const joinPost=(ip)=>worker.fetch(req('/dns-query',{method:'POST',headers:{'CF-Connecting-IP':ip,'content-type':'application/dns-message'},body:joinQ}),rateOK);
+  const [j1,j2]=await Promise.all([joinPost('join-a'),joinPost('join-b')]);
+  globalThis.fetch=integrationUpstream;
+  assert.equal(j1.status,502); assert.equal(j2.status,502); assert.equal(j2.headers.get('x-upstreams'),'3');
+  assert.equal(slowFailures,3);
+  assert.equal(dns.APP_STATE.inflight.size,0);
+}
+// Oversized and mistyped L2 entries are ignored, and the query resolves upstream.
+for (const [label, entry, ttlHeaders] of [
+  ['oversized', new Uint8Array(70_000), { 'content-type':'application/dns-message' }],
+  ['mistyped', null, { 'content-type':'text/html' }]
+]) {
+  dns.APP_STATE.cache.clear(); cacheStore.clear(); mode='ok'; upstreamCalls=0;
+  const badQ=query(0x7792,`${label}-l2.example`);
+  const badKey=await dns.makeCacheKey(badQ);
+  const badBody=entry ?? answerFor(badQ,'8.8.8.8',60);
+  cacheStore.set(`https://dns.example.test/__doh-cache/v1/${badKey}`, new Response(badBody, {
+    status:200,
+    headers:{...ttlHeaders,'x-doh-stored-at':String(Date.now()),'x-doh-ttl':'60'}
+  }));
+  r=await worker.fetch(req('/dns-query',{method:'POST',headers:{'CF-Connecting-IP':`${label}-l2`,'content-type':'application/dns-message'},body:badQ}),rateOK);
+  assert.equal(r.status,200, label); assert.equal(r.headers.get('x-cache'),'MISS', label); assert.equal(upstreamCalls,3, label);
+}
+// L2 writes are attempted even when the handler runs without an execution context.
+dns.APP_STATE.cache.clear(); cacheStore.clear(); mode='ok'; upstreamCalls=0;
+r=await worker.fetch(req('/dns-query',{method:'POST',headers:{'CF-Connecting-IP':'no-ctx','content-type':'application/dns-message'},body:query(0x7794,'no-context-write.example')}),rateOK);
+assert.equal(r.status,200);
+for(let waited=0; cacheStore.size===0 && waited<200; waited+=5) await new Promise(resolve=>setTimeout(resolve,5));
+assert.equal(cacheStore.size,1);
+dns.APP_STATE.cache.clear(); cacheStore.clear();
 console.log('INTEGRATION TESTS: PASS');

@@ -1,4 +1,4 @@
-const VERSION = '0.4.27';
+const VERSION = '0.4.29';
 const MAX_DNS_MESSAGE_BYTES = 4096;
 const CONFIG = {
   DNS_PATH: '/dns-query',
@@ -149,13 +149,16 @@ async function handleDNS(req, url, ctx) {
         storedAt
       );
       if (CONFIG.EDGE_CACHE_ENABLED) {
-        ctx?.waitUntil?.(putEdgeCache(
+        // putEdgeCache() never rejects, and it is started here whether or not a context exists.
+        // waitUntil() only keeps it alive after the response is sent.
+        const write = putEdgeCache(
           edgeKey,
           result.body,
           ttlSeconds, // already clamped to EDGE_CACHE_MIN/MAX_TTL_SECONDS during analysis
           storedAt,
           url.origin
-        ));
+        );
+        ctx?.waitUntil?.(write);
       }
     }
     return { ...result, storedAt };
@@ -249,18 +252,15 @@ async function readDNSPayload(req, url) {
   return readCappedBody(
     req,
     CONFIG.MAX_DNS_MESSAGE_BYTES,
-    'DNS message too large'
+    () => httpError('DNS message too large', 413)
   );
 }
-async function readCappedBody(source, maxBytes, tooLargeMessage) {
+// makeTooLarge() supplies the error to throw when the body exceeds maxBytes, so each caller
+// keeps its own classification without a second try/catch.
+async function readCappedBody(source, maxBytes, makeTooLarge) {
   const reader = source.body?.getReader();
-  if (!reader) {
-    const buffer = await source.arrayBuffer();
-    if (buffer.byteLength > maxBytes) {
-      throw httpError(tooLargeMessage, 413);
-    }
-    return new Uint8Array(buffer);
-  }
+  // Without a body there is no message to cap: an empty buffer is the whole answer.
+  if (!reader) return new Uint8Array(0);
   const chunks = [];
   let total = 0;
   try {
@@ -270,8 +270,10 @@ async function readCappedBody(source, maxBytes, tooLargeMessage) {
       if (!value || value.byteLength === 0) continue;
       total += value.byteLength;
       if (total > maxBytes) {
-        try { await reader.cancel('message-too-large'); } catch (_) {}
-        throw httpError(tooLargeMessage, 413);
+        // Release the stream without waiting on it: cancel() on a shared (tee'd) body settles
+        // only after every branch is cancelled, and this request fails either way.
+        reader.cancel('message-too-large').catch(() => {});
+        throw makeTooLarge();
       }
       chunks.push(value);
     }
@@ -454,19 +456,11 @@ async function relay(node, packet, expectedID, signal) {
       discardBody(res);
       throw upstreamError('Upstream DNS response too large', 'response-too-large');
     }
-    let bodyBytes;
-    try {
-      bodyBytes = await readCappedBody(
-        res,
-        CONFIG.MAX_UPSTREAM_DNS_MESSAGE_BYTES,
-        'Upstream DNS response too large'
-      );
-    } catch (err) {
-      if (err?.status === 413) {
-        throw upstreamError('Upstream DNS response too large', 'response-too-large');
-      }
-      throw err;
-    }
+    const bodyBytes = await readCappedBody(
+      res,
+      CONFIG.MAX_UPSTREAM_DNS_MESSAGE_BYTES,
+      () => upstreamError('Upstream DNS response too large', 'response-too-large')
+    );
     const body = bodyBytes.buffer;
     const validation = validateDNSResponse(body, expectedID, packet);
     if (!validation.ok) {
@@ -732,7 +726,8 @@ function normalizeQueryForKey(packet) {
 function localKeyFromNormalized(normalized) {
   return String.fromCharCode.apply(null, normalized);
 }
-// Key for the data-center-local L2 Cache API entry (SHA-256 of the normalized bytes).
+// Key for the data-center-local L2 Cache API entry: the first 128 bits of SHA-256 over the
+// normalized bytes, rendered as 32 hex characters.
 async function edgeKeyFromNormalized(normalized) {
   const digest = await crypto.subtle.digest('SHA-256', normalized);
   const view = new Uint8Array(digest, 0, 16);
@@ -938,9 +933,9 @@ function restoreQuestionCase(target, query) {
     offset += 1 + len;
   }
 }
-// Cache hits re-walk the stored packet to age its TTLs. Every stored packet was fully
-// validated before it was cached (relay() for L1, validateDNSResponse() for L2), so this
-// pass only needs record boundaries: it skips RDATA revalidation and allocates no
+// Cache hits re-walk the stored packet to age its TTLs. Every packet reaches either cache
+// only after relay() has fully validated it, and an L2 read revalidates it before use, so
+// this pass only needs record boundaries: it skips RDATA revalidation and allocates no
 // name-offset set, which matters because it runs on every cache hit.
 function patchDNSResponseForAge(responseBuffer, queryID, ageSeconds, queryBytes) {
   const copy = new Uint8Array(responseBuffer).slice();
@@ -983,7 +978,9 @@ async function getEdgeCache(key, queryID, origin, queryBytes) {
     const cache = caches.default;
     const cacheKey = makeEdgeCacheRequest(origin, key);
     const hit = await cache.match(cacheKey);
-    if (!hit || hit.status !== 200 || !isDNSMessageContentType(hit.headers.get('content-type'))) {
+    if (!hit) return null;
+    if (hit.status !== 200 || !isDNSMessageContentType(hit.headers.get('content-type'))) {
+      discardBody(hit);
       return null;
     }
     // Cache entries are an optimization, not trusted resolver output. Validate the
@@ -1002,6 +999,7 @@ async function getEdgeCache(key, queryID, origin, queryBytes) {
       || ttlSeconds <= 0
       || ttlSeconds > CONFIG.EDGE_CACHE_MAX_TTL_SECONDS
     ) {
+      discardBody(hit);
       return null;
     }
     let body;
@@ -1009,7 +1007,7 @@ async function getEdgeCache(key, queryID, origin, queryBytes) {
       body = (await readCappedBody(
         hit,
         CONFIG.MAX_UPSTREAM_DNS_MESSAGE_BYTES,
-        'L2 cache entry too large'
+        () => new Error('L2 cache entry too large')
       )).buffer;
     } catch (_) {
       return null;
