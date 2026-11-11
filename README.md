@@ -1,6 +1,6 @@
 # 🛡️ DoH — Cloudflare Worker
 
-**Version 0.4.29** · see [`CHANGELOG.md`](CHANGELOG.md)
+**Version 0.4.33** · see [`CHANGELOG.md`](CHANGELOG.md)
 
 A lightweight Cloudflare Worker that exposes a standard **DNS-over-HTTPS** endpoint, races three configured DoH upstreams in parallel, and keeps a two-level DNS cache:
 
@@ -26,7 +26,7 @@ This Worker deliberately stays far below those ceilings on ordinary DNS traffic:
 | Degraded upstream fallback | 1 match | 3 in parallel |
 | Total upstream failure | 1 match | 3 in parallel; returns 502 |
 
-The resolver logic launches all three configured upstreams immediately on every cold-cache lookup (`UPSTREAM_TIMEOUT_MS`, 1200 ms per upstream). The first valid `NOERROR` response wins, and the other in-flight upstream requests are aborted. If the first usable answer is `NXDOMAIN`, the Worker keeps racing for a short grace period (`NXDOMAIN_GRACE_MS`, 200 ms) so a single stale or filtered upstream cannot cause false negatives. If every upstream returns a syntactically valid degraded response such as `SERVFAIL` or `REFUSED`, the best degraded response is returned deterministically (SERVFAIL preferred, then the highest-scored upstream, then the fastest); if all three requests fail or return invalid DNS data, the Worker returns `502`. In-flight duplicate work is bounded at 128 entries (new cold resolutions are rejected with 503 when the map is full; live jobs are never evicted, so request coalescing is never broken mid-flight), and upstream response buffering is capped at 65,535 bytes. Maximum concurrent upstream connections from this Worker are 3, below Cloudflare's documented limit of 6.
+The resolver logic launches all three configured upstreams immediately on every cold-cache lookup (`UPSTREAM_TIMEOUT_MS`, 1200 ms per upstream). The first complete `NOERROR` response wins, and the other in-flight upstream requests are aborted. A truncated (TC) answer is incomplete, so it never wins while another upstream can still return a complete answer; it is relayed only if no complete answer arrives. If the first usable answer is `NXDOMAIN`, the Worker keeps racing for a short grace period (`NXDOMAIN_GRACE_MS`, 200 ms) so a single stale or filtered upstream cannot cause false negatives. If every upstream returns a syntactically valid degraded response such as `SERVFAIL` or `REFUSED`, the best degraded response is returned deterministically (SERVFAIL preferred, then the highest-scored upstream, then the fastest, and an exact tie goes to the upstream listed first in `DOH_UPSTREAMS`, so arrival order never decides); if all three requests fail or return invalid DNS data, the Worker returns `502`. In-flight duplicate work is bounded at 128 entries (new cold resolutions are rejected with 503 when the map is full; live jobs are never evicted, so request coalescing is never broken mid-flight), and upstream response buffering is capped at 65,535 bytes. Maximum concurrent upstream connections from this Worker are 3, below Cloudflare's documented limit of 6.
 
 ## Two-level DNS cache
 
@@ -68,7 +68,7 @@ After deployment:
 https://YOUR-DOMAIN.example/dns-query
 ```
 
-The Worker also serves a small English/Persian/Chinese setup dashboard at `/` (also reachable as `/index.html`; it loads Tailwind from `cdn.tailwindcss.com`, while the DoH endpoint itself has no external dependency; the endpoint it displays is built from the origin that served the page, so a plain-HTTP development server such as `wrangler dev` shows an `http://` URL; choosing a language also updates the page's `lang` attribute; the English text is identical in the static HTML and in the language table, so the page does not change wording on load) and a JSON status page at `/health`. The dashboard is served with `Content-Security-Policy` (scripts only from itself, inline scripts and `cdn.tailwindcss.com`), `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer` and `Cache-Control: public, max-age=300`. Every other response (DNS, `/health`, errors) is sent with `X-Content-Type-Options: nosniff`.
+The Worker also serves a small English/Persian/Chinese setup dashboard at `/` (also reachable as `/index.html`; it is fully self-contained, with its styles and script inlined and no third-party requests, while the DoH endpoint itself has no external dependency; the endpoint it displays is built from the origin that served the page, so a plain-HTTP development server such as `wrangler dev` shows an `http://` URL; choosing a language also updates the page's `lang` attribute and is remembered in `localStorage`; the English text is identical in the static HTML and in the language table, so the page does not change wording on load) and a JSON status page at `/health`. The dashboard is served with a `Content-Security-Policy` of `default-src 'none'` in which its one inline script and its one inline stylesheet are allowed by their SHA-256 hashes (no `'unsafe-inline'` and no third-party hosts). The hashes are computed from the shipped text when the policy is first built, so they stay in step with the page. The dashboard also sends `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer` and `Cache-Control: public, max-age=300`. Every other response (DNS, `/health`, errors) is sent with `X-Content-Type-Options: nosniff`.
 
 ## DoH methods
 
@@ -119,7 +119,7 @@ Cache behavior is defensive at both levels: expired L1 entries are removed befor
 Run the included unit tests, Worker-level integration tests, and the optional real `wrangler dev` smoke test:
 
 ```bash
-npm install   # Node.js >= 20
+npm install   # Node.js >= 20.3 (native AbortSignal.any)
 npm test
 npm run test:wrangler
 # or:
@@ -130,7 +130,7 @@ The integration and smoke tests read the expected version from `package.json` an
 
 The unit suite covers DNS wire parsing and compression-pointer validation, transaction-ID and question matching, every RR section and name-bearing RDATA (including the MINFO, RP, PX, NAPTR, CAA, URI, TLSA, SVCB/HTTPS, NSEC3 and NSEC3PARAM validators), SOA structure, TTL and cacheability rules (negative-cache TTL, CNAME bounds, RFC 2181 top-bit TTLs), the OPT extended RCODE, response patching, L1 expiry and LRU eviction, resolver scoring, upstream failure classification, the NXDOMAIN grace race, L2-to-L1 promotion, the local rate limiter, IPv6 /64 grouping, and cache-key normalization.
 
-The integration suite exercises the exported `fetch()` handler end to end: routing, GET and POST DoH, request and body size limits (including the exact GET boundary), L1 and L2 caching and expiry, request coalescing, the in-flight saturation path, native and local rate limiting, upstream failure modes, degraded answers, cache API failures, and the dashboard copy, endpoint and security-header checks.
+The integration suite exercises the exported `fetch()` handler end to end: routing, GET and POST DoH, request and body size limits (including the exact GET boundary), L1 and L2 caching and expiry, request coalescing, the in-flight saturation path, native and local rate limiting, upstream failure modes, degraded answers, cache API failures, and the dashboard copy, endpoint, security-header checks, and dashboard self-containment (no external resources or inline event handlers, CSP hashes that match the served inline script and style, every element the script looks up, and every ARIA reference resolving to an element).
 
 `wrangler-smoke.mjs` starts the actual local Wrangler `dev` runtime (Cloudflare's `workerd` through Wrangler/Miniflare), then probes `/health`, `/` (including that the dashboard endpoint matches the plain-HTTP origin), an invalid DoH request, and an unsupported method without contacting the public DoH upstreams. When it finishes, the script signals the whole Wrangler process group (Linux/macOS, or the process tree on Windows via `taskkill /T /F`) and waits, with a bounded timeout, for Wrangler to exit before returning. The script checks for the project-local Wrangler binary first and prints an install instruction immediately if it is missing. If Wrangler exits early after launch, the script prints its output instead of waiting for the 20-second startup timeout. The Rate Limiting binding is locally simulated during `wrangler dev`; it is not a test of production-wide Cloudflare counters. See the [Cloudflare local-development documentation](https://developers.cloudflare.com/workers/local-development/) and [Rate Limiting API documentation](https://developers.cloudflare.com/workers/runtime-apis/bindings/rate-limit/).
 

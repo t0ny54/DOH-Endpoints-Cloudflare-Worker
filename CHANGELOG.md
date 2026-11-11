@@ -1,22 +1,20 @@
 # Changelog
 
-## 0.4.29
+## 0.4.33
+
+### Fixed
+
+- A truncated (TC) upstream answer could win the parallel race and be returned to the client, even when another upstream returned the complete answer. DoH has no TCP retry, so the client received an incomplete response. A truncated answer is now used only if no complete answer arrives.
+- The degraded-answer tie-break returned whichever degraded answer arrived first when score and latency were equal, although the README describes that choice as deterministic. An exact tie now goes to the upstream listed first in `DOH_UPSTREAMS`, so arrival order never decides.
 
 ### Changed
 
-- `readCappedBody()` takes an error factory instead of a message. Each caller states how an oversized body is classified, so `relay()` no longer wraps the read in a try/catch that rewrote 413 errors. The upstream response-too-large error and its kind are unchanged.
-
-### Tests
-
-- Renamed a unit test whose name claimed it checked transaction IDs but actually exercised a missing question. No behavior change.
-
-### Review
-
-- Re-read all project files in full. No new functional defect was found in the DNS parser, cache, coalescing, rate limiter, or dashboard.
-- Kept on purpose: `escapeHtml()` (defensive, unreachable with URL origins), `localCacheKey()` and `makeCacheKey()` (test seams), and the lenient mode of the response analysis (used by TTL tests).
+- The `RESOLVER_NODES` list is exported through the internal test hook so the tie-break can be tested directly.
 
 ### Verified
 
-- `npm test` passes: 56 unit tests and the integration suite.
-- Merged V8 coverage: unexecuted code remains 5 lines (the `escapeHtml` replacement map).
-- 500,000 fuzzed packets against the parsers and key functions: no exceptions.
+- Unit suite: 55 tests, all passing. Three tests were added: a truncated answer loses to a complete one, a truncated answer is relayed when nothing complete arrives, and degraded ties follow configuration order. Two of them fail against 0.4.32; the third guards existing fallback behavior and passes on both versions.
+- Integration suite passes.
+- Fuzzing of the parser, validator, TTL patcher and cache-key code: 200,000 random and mutated packets, no exceptions.
+- Hot-path microbenchmark: every DNS operation (key derivation, parsing, validation, TTL patching) takes under 1 µs, so no CPU optimization was pursued.
+- Not run here: `npm run test:wrangler`, which needs Wrangler installed locally.

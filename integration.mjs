@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import worker, { __internals as dns } from './Worker.js';
+const localKey = (packet) => dns.localKeyFromNormalized(dns.normalizeQueryForKey(packet));
+const edgeKey = (packet) => dns.edgeKeyFromNormalized(dns.normalizeQueryForKey(packet));
 const PKG_VERSION = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8')).version;
 function encodeName(name) {
   return [...name.split('.').flatMap(x => [x.length, ...Buffer.from(x)]), 0];
@@ -117,10 +119,13 @@ const huge='A'.repeat(5463); r=await worker.fetch(req('/dns-query?dns='+huge,{me
 r=await worker.fetch(req('/dns-query?dns=%%%',{method:'GET',headers:{'CF-Connecting-IP':'badb64'}}), rateOK); assert.equal(r.status,400);
 // GET size boundary: the longest accepted payload is 4,096 bytes (5,462 characters); one byte more is rejected.
 {
+  // Run the accepted case against a healthy upstream so it proves a full resolve, not just the absence of 413/400.
+  mode='ok'; upstreamCalls=0; dns.APP_STATE.cache.clear(); cacheStore.clear();
   const maxB64 = Buffer.from(paddedQuery(0x7790, 'boundary.example', 4096)).toString('base64url');
   assert.equal(maxB64.length, 5462);
   r = await worker.fetch(req('/dns-query?dns='+maxB64,{method:'GET',headers:{'CF-Connecting-IP':'max-get'}}), rateOK);
-  assert.notEqual(r.status,413); assert.notEqual(r.status,400);
+  assert.equal(r.status,200); assert.equal(r.headers.get('x-cache'),'MISS');
+  out=new Uint8Array(await r.arrayBuffer()); assert.equal((out[0]<<8)|out[1],0x7790);
   const overB64 = Buffer.from(paddedQuery(0x7791, 'boundary.example', 4097)).toString('base64url');
   r = await worker.fetch(req('/dns-query?dns='+overB64,{method:'GET',headers:{'CF-Connecting-IP':'over-get'}}), rateOK);
   assert.equal(r.status,413);
@@ -165,7 +170,7 @@ assert.ok(dns.APP_STATE.inflight.size === 0);
 dns.CONFIG.UPSTREAM_TIMEOUT_MS=previousTimeout;
 mode='ok'; dns.APP_STATE.cache.clear(); cacheStore.clear(); upstreamCalls=0;
 const expiredQuery=query(0x7781,'expired-l2.example');
-const expiredKey=await dns.makeCacheKey(expiredQuery);
+const expiredKey=await edgeKey(expiredQuery);
 const expiredBody = answerFor(expiredQuery,'8.8.8.8',60);
 expiredBody[0]=0; expiredBody[1]=0;
 cacheStore.set(`https://dns.example.test/__doh-cache/v1/${expiredKey}`, new Response(
@@ -248,7 +253,7 @@ assert.equal(r.status,413);
 r=await worker.fetch(req('/dns-query',{method:'POST',headers:{'CF-Connecting-IP':'client-empty','content-type':'application/dns-message'}}),rateOK);
 assert.equal(r.status,400); assert.equal(upstreamCalls,0);
 const malformedL2Q=query(0x778a,'malformed-l2.example');
-const malformedL2Key=await dns.makeCacheKey(malformedL2Q);
+const malformedL2Key=await edgeKey(malformedL2Q);
 cacheStore.set(`https://dns.example.test/__doh-cache/v1/${malformedL2Key}`, new Response(answerFor(malformedL2Q,'8.8.4.4',60),{status:200,headers:{'content-type':'application/dns-message'}}));
 r=await worker.fetch(req('/dns-query',{method:'POST',headers:{'CF-Connecting-IP':'malformed-l2','content-type':'application/dns-message'},body:malformedL2Q}),rateOK);
 assert.equal(r.status,200); assert.equal(r.headers.get('x-cache'),'MISS'); assert.equal(upstreamCalls,3);
@@ -258,7 +263,7 @@ const expectedL2Q=query(0x778d,'expected-l2.example');
 const wrongQuestion= query(0,'wrong-question.example');
 const wrongQuestionBody=answerFor(wrongQuestion,'8.8.4.4',60);
 wrongQuestionBody[0]=0; wrongQuestionBody[1]=0;
-const expectedL2Key=await dns.makeCacheKey(expectedL2Q);
+const expectedL2Key=await edgeKey(expectedL2Q);
 cacheStore.set(`https://dns.example.test/__doh-cache/v1/${expectedL2Key}`,new Response(wrongQuestionBody,{
   status:200,
   headers:{
@@ -323,7 +328,7 @@ assert.equal(r.status,429); assert.equal(r.headers.get('retry-after'),String(dns
 // L1 filled by another request while this one waits for the (asynchronous) L2 lookup: no upstream work.
 dns.APP_STATE.cache.clear(); cacheStore.clear(); upstreamCalls=0; mode='ok';
 const lateQ=query(0x778c,'late-l1.example');
-const lateKey=dns.localCacheKey(lateQ);
+const lateKey=localKey(lateQ);
 const lateBody=answerFor(lateQ,'5.6.7.8',60); lateBody[0]=0; lateBody[1]=0;
 const realCaches=globalThis.caches;
 globalThis.caches={default:{
@@ -385,7 +390,7 @@ for (const [label, entry, ttlHeaders] of [
 ]) {
   dns.APP_STATE.cache.clear(); cacheStore.clear(); mode='ok'; upstreamCalls=0;
   const badQ=query(0x7792,`${label}-l2.example`);
-  const badKey=await dns.makeCacheKey(badQ);
+  const badKey=await edgeKey(badQ);
   const badBody=entry ?? answerFor(badQ,'8.8.8.8',60);
   cacheStore.set(`https://dns.example.test/__doh-cache/v1/${badKey}`, new Response(badBody, {
     status:200,
@@ -401,4 +406,40 @@ assert.equal(r.status,200);
 for(let waited=0; cacheStore.size===0 && waited<200; waited+=5) await new Promise(resolve=>setTimeout(resolve,5));
 assert.equal(cacheStore.size,1);
 dns.APP_STATE.cache.clear(); cacheStore.clear();
+// ---- Dashboard: self-contained, hash-pinned CSP, and every element the script reaches exists ----
+{
+  const page = await worker.fetch(req('/'));
+  const csp = page.headers.get('content-security-policy');
+  assert.ok(csp, 'dashboard must send a Content-Security-Policy');
+  assert.doesNotMatch(csp, /unsafe-inline|unsafe-eval|tailwind|https?:/, 'CSP must not allow inline wildcards or third-party hosts');
+  assert.match(csp, /default-src 'none'/);
+  assert.match(csp, /frame-ancestors 'none'/);
+  const html = await page.text();
+  assert.doesNotMatch(html, /<script\s[^>]*src=/i, 'dashboard must not load external scripts');
+  assert.doesNotMatch(html, /<link[^>]*rel="stylesheet"/i, 'dashboard must not load external stylesheets');
+  assert.doesNotMatch(html, /\son[a-z]+\s*=/i, 'dashboard must not use inline event-handler attributes');
+  const sha256Source = async (text) => `'sha256-${Buffer.from(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text))).toString('base64')}'`;
+  const inlineScript = html.match(/<script>([\s\S]*?)<\/script>/)[1];
+  const inlineStyle = html.match(/<style>([\s\S]*?)<\/style>/)[1];
+  assert.ok(csp.includes(`script-src ${await sha256Source(inlineScript)}`), 'script-src must pin the inline script hash');
+  assert.ok(csp.includes(`style-src ${await sha256Source(inlineStyle)}`), 'style-src must pin the inline style hash');
+  // Every element the script reaches by id must exist, or the first click would throw in the browser.
+  const scriptIds = new Set([...inlineScript.matchAll(/\$\('([^']+)'\)/g)].map((m) => m[1]));
+  assert.ok(scriptIds.size >= 20, 'expected the script to look up the dashboard elements');
+  // Copy feedback is shown on the button; a blocking alert() must not come back.
+  assert.doesNotMatch(inlineScript, /\balert\(/, 'dashboard must not use alert()');
+  // Every ARIA reference from a tab or panel must point at an element that exists.
+  for (const [, target] of html.matchAll(/aria-(?:controls|labelledby)="([^"]+)"/g)) {
+    assert.match(html, new RegExp(`id="${target}"`), `aria reference to missing #${target}`);
+  }
+  for (const id of scriptIds) assert.match(html, new RegExp(`id="${id}"`), `script needs #${id}`);
+  // Panels, tabs and language options carry the exact class tokens the script queries.
+  const classLists = [...html.matchAll(/class="([^"]*)"/g)].map((m) => m[1].split(' '));
+  for (const cls of ['panel', 'tab-btn', 'lang-option']) {
+    assert.ok(classLists.some((tokens) => tokens.includes(cls)), `missing class .${cls}`);
+  }
+  assert.equal(classLists.filter((tokens) => tokens.includes('panel')).length, 3, 'exactly three tab panels');
+  assert.match(html, /id="langMenu"[^>]*\shidden>/, 'language menu starts hidden');
+  assert.match(html, /id="firefox"[^>]*\shidden>/, 'only the Chromium panel starts visible');
+}
 console.log('INTEGRATION TESTS: PASS');

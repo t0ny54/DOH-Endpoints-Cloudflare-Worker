@@ -1,4 +1,4 @@
-const VERSION = '0.4.29';
+const VERSION = '0.4.33';
 const MAX_DNS_MESSAGE_BYTES = 4096;
 const CONFIG = {
   DNS_PATH: '/dns-query',
@@ -282,7 +282,11 @@ async function readCappedBody(source, maxBytes, makeTooLarge) {
   }
   // Copy so the returned buffer is exactly message-sized (a pooled chunk may be a
   // subarray view of a larger buffer, and callers use `.buffer` downstream).
-  if (chunks.length === 1) return chunks[0].slice();
+  if (chunks.length === 1) {
+    const only = chunks[0];
+    // A chunk that already spans its whole buffer needs no copy; the callers read `.buffer`.
+    return only.byteOffset === 0 && only.byteLength === only.buffer.byteLength ? only : only.slice();
+  }
   const out = new Uint8Array(total);
   let offset = 0;
   for (const chunk of chunks) {
@@ -352,6 +356,8 @@ async function resolveWithParallelRace(nodes, packet, expectedID) {
   let fallbackNode = null;
   let nxdomain = null;
   let nxdomainDeadline = 0;
+  // A truncated (TC) answer is incomplete. It is kept only if no complete answer arrives.
+  let partial = null;
   const startAttempt = (node) => {
     const controller = new AbortController();
     controllers.set(node, controller);
@@ -380,6 +386,10 @@ async function resolveWithParallelRace(nodes, packet, expectedID) {
       active.delete(result.node);
       if (result.ok) {
         const value = result.value;
+        if (value.usable && value.truncated) {
+          partial = partial || value;
+          continue;
+        }
         if (value.usable && value.rcode === 0) {
           return { ...value, attempts: nodes.length };
         }
@@ -396,7 +406,7 @@ async function resolveWithParallelRace(nodes, packet, expectedID) {
         }
       }
     }
-    const best = nxdomain || fallback;
+    const best = nxdomain || partial || fallback;
     if (best) return { ...best, attempts: nodes.length };
     const err = new Error('All DNS upstreams failed');
     err.attempts = nodes.length;
@@ -412,7 +422,9 @@ function isBetterDegraded(value, node, bestValue, bestNode) {
     if (bestValue.rcode === 2) return false;
   }
   if (node.score !== bestNode.score) return node.score > bestNode.score;
-  return value.latencyMs < bestValue.latencyMs;
+  if (value.latencyMs !== bestValue.latencyMs) return value.latencyMs < bestValue.latencyMs;
+  // Exact tie: the earlier-configured upstream wins, so the choice never depends on arrival order.
+  return RESOLVER_NODES.indexOf(node) < RESOLVER_NODES.indexOf(bestNode);
 }
 function abortAttempts(controllers, active) {
   for (const node of active.keys()) {
@@ -480,6 +492,7 @@ async function relay(node, packet, expectedID, signal) {
       latencyMs,
       rcode,
       usable,
+      truncated: (bodyBytes[2] & 0x02) !== 0,
       degraded: !usable,
       cacheTTL: validation.cacheTTL
     };
@@ -659,27 +672,10 @@ function questionMatchesQuery(responseBytes, responseNameEnd, queryBytes) {
   }
   return true;
 }
+// AbortSignal.any is native in Workers and in Node >= 20.3 (see package.json engines).
 function combineSignals(signal, timeoutSignal) {
   if (!signal) return timeoutSignal;
-  if (typeof AbortSignal.any === 'function') return AbortSignal.any([signal, timeoutSignal]);
-  return anySignal([signal, timeoutSignal]);
-}
-function anySignal(signals) {
-  const controller = new AbortController();
-  function abortFrom(signal) {
-    if (!controller.signal.aborted) {
-      controller.abort(signal.reason || 'aborted');
-    }
-  }
-  for (const signal of signals) {
-    if (!signal) continue;
-    if (signal.aborted) {
-      abortFrom(signal);
-      break;
-    }
-    signal.addEventListener('abort', () => abortFrom(signal), { once: true });
-  }
-  return controller.signal;
+  return AbortSignal.any([signal, timeoutSignal]);
 }
 function reward(node, latencyMs) {
   node.ok += 1;
@@ -734,12 +730,6 @@ async function edgeKeyFromNormalized(normalized) {
   let out = '';
   for (let i = 0; i < view.length; i++) out += view[i].toString(16).padStart(2, '0');
   return out;
-}
-function localCacheKey(packet) {
-  return localKeyFromNormalized(normalizeQueryForKey(packet));
-}
-async function makeCacheKey(packet) {
-  return edgeKeyFromNormalized(normalizeQueryForKey(packet));
 }
 function getCache(key) {
   const item = APP_STATE.cache.get(key);
@@ -1205,13 +1195,15 @@ export const __internals = {
   validateDNSResponse,
   skipDNSName,
   readResourceRecord,
-  localCacheKey,
-  makeCacheKey,
+  normalizeQueryForKey,
+  localKeyFromNormalized,
+  edgeKeyFromNormalized,
   patchDNSResponseForAge,
   localRateLimit,
   rateLimitKey,
   resolveWithParallelRace,
   isBetterDegraded,
+  RESOLVER_NODES,
   relay,
   getCache,
   setCache,
@@ -1219,122 +1211,85 @@ export const __internals = {
 };
 const UI_RESPONSE_CACHE = new Map();
 const UI_RESPONSE_CACHE_MAX_ENTRIES = 16;
-const UI_RESPONSE_HEADERS = {
+const UI_STATIC_HEADERS = {
   'content-type': 'text/html; charset=utf-8',
   'cache-control': 'public, max-age=300',
   'x-content-type-options': 'nosniff',
-  'referrer-policy': 'no-referrer',
-  'content-security-policy': "default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'none'"
+  'referrer-policy': 'no-referrer'
 };
-function renderUI(origin) {
-  let html = UI_RESPONSE_CACHE.get(origin);
-  if (html) {
-    UI_RESPONSE_CACHE.delete(origin);
-    UI_RESPONSE_CACHE.set(origin, html);
-    return new Response(html, { headers: UI_RESPONSE_HEADERS });
-  }
-  const endpoint = `${escapeHtml(origin)}${CONFIG.DNS_PATH}`;
-  html = `<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Secure DNS over HTTPS (DoH) Pro</title>
-    <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🛡️</text></svg>">
-    <script src="https://cdn.tailwindcss.com"></script>
-    <style>
-        body { background: #020617; color: #cbd5e1; font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; overflow-x: hidden; }
-        .cyber-glass { background: rgba(15, 23, 42, 0.7); backdrop-filter: blur(15px); border: 1px solid rgba(0, 243, 255, 0.08); }
-        .lang-fa { direction: rtl; }
-        .nav-active { background: #0ea5e9; color: white !important; border-color: #38bdf8 !important; box-shadow: 0 0 15px rgba(14, 165, 233, 0.3); }
-        .panel { display: none; } .panel-active { display: block; animation: fadeInUp 0.3s ease-out; }
-        @keyframes fadeInUp { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
-        code { color: #22d3ee; font-family: monospace; background: #000; padding: 3px 7px; border-radius: 6px; }
-        .btn-tab { transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1); border: 1px solid #1e293b; }
-    </style>
-</head>
-<body class="p-4 md:p-12">
-    <div class="fixed top-6 right-6 z-50">
-        <button onclick="document.getElementById('langMenu').classList.toggle('hidden')" class="cyber-glass px-6 py-3 rounded-2xl flex items-center gap-4 text-xs font-bold border-cyan-500/20 hover:scale-[1.02] transition-transform">
-            🌐 <span id="currentLang">ENGLISH</span>
-        </button>
-        <div id="langMenu" class="hidden absolute right-0 mt-3 cyber-glass p-2 rounded-2xl w-44 shadow-2xl border-slate-800">
-            <button onclick="changeLang('en')" class="w-full text-left p-3 hover:bg-sky-600 rounded-xl text-xs mb-1">ENGLISH</button>
-            <button onclick="changeLang('fa')" class="w-full text-right p-3 hover:bg-emerald-600 rounded-xl text-xs mb-1">فارسی</button>
-            <button onclick="changeLang('zh')" class="w-full text-left p-3 hover:bg-teal-600 rounded-xl text-xs">简体中文</button>
-        </div>
-    </div>
-    <div class="max-w-4xl mx-auto">
-        <header class="text-center py-16 md:py-24">
-            <h1 class="text-5xl md:text-7xl font-black text-transparent bg-clip-text bg-gradient-to-r from-cyan-400 via-sky-300 to-emerald-400" id="mainTitle">Secure DNS over HTTPS</h1>
-            <p id="subTag" class="mt-8 text-slate-500 font-bold uppercase tracking-[0.3em] text-[10px] md:text-xs">Edge Resolve Network • Parallel DoH Resolution</p>
-        </header>
-        <section class="cyber-glass rounded-[3rem] p-8 md:p-14 mb-10 text-center">
-            <div class="mb-6">
-                <span class="text-[11px] font-black text-cyan-500 tracking-widest uppercase mb-4 block" id="labelUrl">Endpoint URL</span>
-                <input id="linkInp" value="${endpoint}" readonly class="w-full bg-black/40 border border-slate-800 p-5 rounded-2xl text-cyan-300 font-mono text-center text-sm outline-none focus:border-cyan-500/60">
-            </div>
-            <button onclick="copyURL()" class="bg-cyan-600 hover:bg-cyan-400 text-black font-black px-12 py-5 rounded-2xl transition-all shadow-xl active:scale-95">
-                <span id="txtCopy">COPY ENDPOINT</span>
-            </button>
-        </section>
-        <div class="mb-16">
-            <nav class="flex flex-wrap gap-3 justify-center mb-8">
-                <button onclick="tab('chrome', this)" id="btnC" class="btn-tab px-6 py-3 rounded-2xl text-[11px] font-black uppercase text-slate-400 nav-active">Chrome / Brave / Edge</button>
-                <button onclick="tab('firefox', this)" id="btnF" class="btn-tab px-6 py-3 rounded-2xl text-[11px] font-black uppercase text-slate-400">Firefox</button>
-                <button onclick="tab('mobile', this)" id="btnM" class="btn-tab px-6 py-3 rounded-2xl text-[11px] font-black uppercase text-slate-400">Android / iOS</button>
-            </nav>
-            <section class="min-h-[300px]">
-                <div id="chrome" class="panel panel-active cyber-glass p-10 md:p-14 rounded-[3rem]">
-                    <h3 class="text-2xl font-black mb-8 text-cyan-100" id="cH">Setup for Chromium Browsers</h3>
-                    <div class="space-y-6 text-slate-400 text-sm leading-relaxed" id="cL">
-                        <p>1. Open Browser <b>Settings</b> and type "DNS" in the search box.</p>
-                        <p>2. Select <b>Security</b> &gt; Scroll to <b>Use Secure DNS</b>.</p>
-                        <p>3. Choose <b>"With Custom"</b> provider.</p>
-                        <p>4. Paste your DoH endpoint URL from the copy-box above.</p>
-                        <p>5. Test by visiting a DNS-restricted website.</p>
-                    </div>
-                </div>
-                <div id="firefox" class="panel cyber-glass p-10 md:p-14 rounded-[3rem]">
-                    <h3 class="text-2xl font-black mb-8 text-emerald-100" id="fH">Setup for Firefox</h3>
-                    <div class="space-y-6 text-slate-400 text-sm leading-relaxed" id="fL">
-                        <p>1. Open Firefox <code>Settings</code> and scroll down to <b>Network Settings</b>.</p>
-                        <p>2. Click <b>Settings...</b> and check <b>"Enable DNS over HTTPS"</b> at the bottom.</p>
-                        <p>3. Set provider to <b>Custom</b> and paste your unique URL.</p>
-                        <p>4. Select <b>"Max Protection"</b> for stronger browser-level DNS privacy.</p>
-                    </div>
-                </div>
-                <div id="mobile" class="panel cyber-glass p-10 md:p-14 rounded-[3rem]">
-                    <h3 class="text-2xl font-black mb-8 text-teal-100" id="mH">Android / iOS Logic</h3>
-                    <p class="text-slate-500 text-sm mb-6 italic" id="mD">This resolver is a DoH (HTTPS-based) service, which modern phones handle differently than system-wide settings.</p>
-                    <div class="space-y-6 text-slate-400 text-sm" id="mL">
-                        <p><b>A) For Mobile Browsers:</b> Open Browser settings (Chrome/Firefox/Edge) on your phone and follow the desktop steps. <b>This is the best and fastest way.</b></p>
-                        <p><b>B) For System-wide Apps:</b> We recommend using <b>RethinkDNS</b> or <b>Intra</b> apps. In these apps, set the DNS type to DoH and provide your unique DoH endpoint link.</p>
-                    </div>
-                </div>
-            </section>
-        </div>
-        <div class="cyber-glass p-8 md:p-12 rounded-[3.5rem] mb-20 border-sky-900/40 relative">
-            <h4 class="text-sky-400 font-black text-base md:text-lg mb-6 flex items-center gap-3">
-                ⭐ <span id="whyH">Why ONLY Browser-level DoH? (Crucial Tip)</span>
-            </h4>
-            <div class="space-y-6 text-[13px] md:text-[14px] text-slate-400 leading-loose" id="whyT">
-                <p>Most operating systems (Windows settings, Android "Private DNS", or Apple Profiles) natively expect <b>DNS-over-TLS (DoT)</b> which runs on Port 853. Since this worker is built on <code>https://</code> and Port 443, it is not directly usable in these native settings.</p>
-                <p><b>The Issue:</b> You <u>cannot</u> paste an <code>https://</code> link into many native DNS settings. It will usually result in an "Invalid Hostname" error. Systems there expect a hostname or DoT endpoint, not a full HTTPS resolver URL.</p>
-                <p><b>The Solution:</b> Browsers (Chrome, Edge, Firefox) have their own independent DoH clients. They are compatible with Port 443 workers and provide browser-level encrypted DNS. DoH is therefore best configured directly in the browser.</p>
-            </div>
-        </div>
-        <footer class="mt-32 pb-20 border-t border-slate-900 flex flex-col md:flex-row justify-between items-center opacity-60 gap-8">
-            <div>
-                <span class="text-[10px] font-black tracking-widest text-cyan-600 block mb-1">Secure DNS over HTTPS v${VERSION}</span>
-                <p class="text-[9px] uppercase">Built with Edge-Computing Infrastructure</p>
-            </div>
-            <div class="flex gap-10 font-bold text-[10px] uppercase">
-                <a href="https://github.com/t0ny54/DOH-Endpoints-Cloudflare-Worker" class="hover:text-cyan-400" target="_blank" rel="noreferrer">GitHub</a>
-            </div>
-        </footer>
-    </div>
-    <script>
+// The dashboard is fully self-contained: its only script and style are the inline blocks below.
+// The CSP pins each one by SHA-256 hash, so no 'unsafe-inline' and no third-party origin is needed.
+const UI_STYLE = `
+*,*::before,*::after{box-sizing:border-box;border:0 solid}
+[hidden]{display:none!important}
+body{margin:0;min-height:100vh;padding:1rem;background:#020617;color:#cbd5e1;font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;line-height:1.5;overflow-x:hidden}
+@media (min-width:768px){body{padding:3rem}}
+body.lang-fa{direction:rtl}
+button,input{font:inherit;color:inherit;margin:0;background:none}
+button{cursor:pointer}
+h1,h3,h4,p{margin:0}
+b{font-weight:700}
+code{color:#22d3ee;background:#000;padding:3px 7px;border-radius:6px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+a{color:inherit;text-decoration:none}
+button:focus-visible,a:focus-visible{outline:2px solid #22d3ee;outline-offset:2px}
+.wrap{max-width:56rem;margin:0 auto}
+.glass{background:rgba(15,23,42,.7);-webkit-backdrop-filter:blur(15px);backdrop-filter:blur(15px);border:1px solid rgba(0,243,255,.08)}
+.stack>*+*{margin-top:1.5rem}
+.label{display:block;margin-bottom:1rem;font-size:11px;font-weight:900;letter-spacing:.1em;text-transform:uppercase;color:#06b6d4}
+.lang-switch{position:fixed;top:1.5rem;right:1.5rem;z-index:50}
+.lang-btn{display:flex;align-items:center;gap:1rem;padding:.75rem 1.5rem;border-radius:1rem;border-color:rgba(6,182,212,.2);font-size:.75rem;font-weight:700;transition:transform .2s}
+.lang-btn:hover{transform:scale(1.02)}
+.lang-menu{position:absolute;right:0;width:11rem;margin-top:.75rem;padding:.5rem;border-radius:1rem;border-color:#1e293b;box-shadow:0 25px 50px -12px rgba(0,0,0,.5)}
+.lang-option{display:block;width:100%;margin-bottom:.25rem;padding:.75rem;border-radius:.75rem;font-size:.75rem;text-align:left;transition:background-color .2s}
+.lang-option:last-child{margin-bottom:0}
+.lang-option[lang="fa"]{text-align:right}
+.lang-option:hover{color:#fff}
+.lang-option[data-lang="en"]:hover{background:#0284c7}
+.lang-option[data-lang="fa"]:hover{background:#059669}
+.lang-option[data-lang="zh"]:hover{background:#0d9488}
+.hero{padding:4rem 0;text-align:center}
+@media (min-width:768px){.hero{padding:6rem 0}}
+.hero h1{font-size:3rem;font-weight:900;line-height:1.1;background-image:linear-gradient(to right,#22d3ee,#7dd3fc,#34d399);-webkit-background-clip:text;background-clip:text;color:transparent}
+@media (min-width:768px){.hero h1{font-size:4.5rem}}
+.tagline{margin-top:2rem;font-size:10px;font-weight:700;letter-spacing:.3em;text-transform:uppercase;color:#64748b}
+@media (min-width:768px){.tagline{font-size:12px}}
+.card{margin-bottom:2.5rem;padding:2rem;border-radius:3rem;text-align:center}
+@media (min-width:768px){.card{padding:3.5rem}}
+.endpoint-field{margin-bottom:1.5rem}
+.endpoint-input{width:100%;padding:1.25rem;border:1px solid #1e293b;border-radius:1rem;background:rgba(0,0,0,.4);color:#67e8f9;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.875rem;text-align:center;outline:none}
+.endpoint-input:focus{border-color:rgba(6,182,212,.6)}
+.copy-btn{padding:1.25rem 3rem;border-radius:1rem;background:#0891b2;color:#000;font-weight:900;box-shadow:0 20px 25px -5px rgba(0,0,0,.4);transition:all .2s}
+.copy-btn:hover{background:#22d3ee}
+.copy-btn:active{transform:scale(.95)}
+.tabs-wrap{margin-bottom:4rem}
+.tabs{display:flex;flex-wrap:wrap;justify-content:center;gap:.75rem;margin-bottom:2rem}
+.tab-btn{padding:.75rem 1.5rem;border:1px solid #1e293b;border-radius:1rem;font-size:11px;font-weight:900;text-transform:uppercase;color:#94a3b8;transition:all .25s cubic-bezier(.4,0,.2,1)}
+.tab-btn.is-active{background:#0ea5e9;color:#fff;border-color:#38bdf8;box-shadow:0 0 15px rgba(14,165,233,.3)}
+.panels{min-height:300px}
+.panel{padding:2.5rem;border-radius:3rem}
+@media (min-width:768px){.panel{padding:3.5rem}}
+.panel:not([hidden]){animation:fadeInUp .3s ease-out}
+.panel-title{margin-bottom:2rem;font-size:1.5rem;font-weight:900}
+.t-cyan{color:#cffafe}
+.t-emerald{color:#d1fae5}
+.t-teal{color:#ccfbf1}
+.panel-desc{margin-bottom:1.5rem;font-size:.875rem;font-style:italic;color:#64748b}
+.body-text{font-size:.875rem;line-height:1.625;color:#94a3b8}
+.card-why{margin-bottom:5rem;padding:2rem;border-radius:3.5rem;border-color:rgba(12,74,110,.4);position:relative}
+@media (min-width:768px){.card-why{padding:3rem}}
+.why-title{display:flex;align-items:center;gap:.75rem;margin-bottom:1.5rem;font-size:1rem;font-weight:900;color:#38bdf8}
+@media (min-width:768px){.why-title{font-size:1.125rem}}
+.why-body{font-size:13px;line-height:2;color:#94a3b8}
+@media (min-width:768px){.why-body{font-size:14px}}
+.footer{display:flex;flex-direction:column;align-items:center;justify-content:space-between;gap:2rem;margin-top:8rem;padding-bottom:5rem;border-top:1px solid #0f172a;opacity:.6}
+@media (min-width:768px){.footer{flex-direction:row}}
+.footer-version{display:block;margin-bottom:.25rem;font-size:10px;font-weight:900;letter-spacing:.1em;color:#0891b2}
+.footer-note{font-size:9px;text-transform:uppercase}
+.footer-links{display:flex;gap:2.5rem;font-size:10px;font-weight:700;text-transform:uppercase}
+.footer-links a:hover{color:#22d3ee}
+@keyframes fadeInUp{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
+`;
+const UI_SCRIPT = `
         const I18N = {
             en: {
                 main: 'Secure DNS over HTTPS', sub: 'Edge Resolve Network • Parallel DoH Resolution',
@@ -1370,60 +1325,206 @@ function renderUI(origin) {
                 curL: '简体中文'
             }
         };
-        function getStoredLanguage() {
-            let stored = 'en';
-            try { stored = localStorage.getItem('doc_v6') || 'en'; } catch (_) {}
-            return I18N[stored] ? stored : 'en';
-        }
-        function changeLang(c) {
-            if (!I18N[c]) c = 'en';
-            try { localStorage.setItem('doc_v6', c); } catch (_) {}
-            const l = I18N[c];
-            document.documentElement.lang = c;
-            document.body.classList.toggle('lang-fa', c === 'fa');
-            document.getElementById('currentLang').innerText = l.curL;
-            document.getElementById('mainTitle').innerText = l.main;
-            document.getElementById('subTag').innerText = l.sub;
-            document.getElementById('labelUrl').innerText = l.urlL;
-            document.getElementById('txtCopy').innerText = l.cpT;
-            document.getElementById('btnC').innerText = l.tabC;
-            document.getElementById('btnF').innerText = l.tabF;
-            document.getElementById('btnM').innerText = l.tabM;
-            document.getElementById('cH').innerText = l.cH;
-            document.getElementById('cL').innerHTML = l.cL;
-            document.getElementById('fH').innerText = l.fH;
-            document.getElementById('fL').innerHTML = l.fL;
-            document.getElementById('mH').innerText = l.mH;
-            document.getElementById('mD').innerText = l.mD;
-            document.getElementById('mL').innerHTML = l.mL;
-            document.getElementById('whyH').innerText = l.whyH;
-            document.getElementById('whyT').innerHTML = l.whyT;
-            document.getElementById('langMenu').classList.add('hidden');
-        }
-        function tab(id, el) {
-            document.querySelectorAll('.panel-active').forEach(p => { p.classList.remove('panel-active'); p.classList.add('panel'); });
-            document.querySelectorAll('.btn-tab').forEach(b => b.classList.remove('nav-active'));
-            document.getElementById(id).classList.add('panel-active');
-            document.getElementById(id).classList.remove('panel');
-            el.classList.add('nav-active');
-        }
-        async function copyURL() {
-            const el = document.getElementById('linkInp');
-            const lang = getStoredLanguage();
-            const msg = I18N[lang]?.copied || 'LINK CAPTURED!';
-            try {
-                await navigator.clipboard.writeText(el.value);
-            } catch (_) {
-                el.select();
-                document.execCommand('copy');
-            }
-            alert(msg);
-        }
-        window.onload = () => changeLang(getStoredLanguage());
-    </script>
+const LANG_KEY = 'doc_v6';
+const $ = (id) => document.getElementById(id);
+function getStoredLanguage() {
+    let stored = 'en';
+    try { stored = localStorage.getItem(LANG_KEY) || 'en'; } catch (_) {}
+    return I18N[stored] ? stored : 'en';
+}
+function setLangMenu(open) {
+    $('langMenu').hidden = !open;
+    $('langToggle').setAttribute('aria-expanded', String(open));
+}
+function changeLang(c) {
+    if (!I18N[c]) c = 'en';
+    try { localStorage.setItem(LANG_KEY, c); } catch (_) {}
+    const l = I18N[c];
+    document.documentElement.lang = c;
+    document.body.classList.toggle('lang-fa', c === 'fa');
+    $('currentLang').innerText = l.curL;
+    $('mainTitle').innerText = l.main;
+    $('subTag').innerText = l.sub;
+    $('labelUrl').innerText = l.urlL;
+    $('txtCopy').innerText = l.cpT;
+    $('btnC').innerText = l.tabC;
+    $('btnF').innerText = l.tabF;
+    $('btnM').innerText = l.tabM;
+    $('cH').innerText = l.cH;
+    $('cL').innerHTML = l.cL;
+    $('fH').innerText = l.fH;
+    $('fL').innerHTML = l.fL;
+    $('mH').innerText = l.mH;
+    $('mD').innerText = l.mD;
+    $('mL').innerHTML = l.mL;
+    $('whyH').innerText = l.whyH;
+    $('whyT').innerHTML = l.whyT;
+    setLangMenu(false);
+}
+function tab(id, btn) {
+    document.querySelectorAll('.panel').forEach((p) => { p.hidden = p.id !== id; });
+    document.querySelectorAll('.tab-btn').forEach((b) => {
+        const on = b === btn;
+        b.classList.toggle('is-active', on);
+        b.setAttribute('aria-selected', String(on));
+    });
+}
+let copyTimer = null;
+async function copyURL() {
+    let ok = false;
+    try {
+        await navigator.clipboard.writeText($('linkInp').value);
+        ok = true;
+    } catch (_) {
+        $('linkInp').select();
+        ok = document.execCommand('copy');
+    }
+    if (!ok) return;
+    $('txtCopy').innerText = I18N[getStoredLanguage()].copied;
+    clearTimeout(copyTimer);
+    copyTimer = setTimeout(() => { $('txtCopy').innerText = I18N[getStoredLanguage()].cpT; }, 2000);
+}
+document.querySelectorAll('.tab-btn').forEach((btn) => {
+    btn.addEventListener('click', () => tab(btn.dataset.tab, btn));
+});
+document.querySelectorAll('.lang-option').forEach((btn) => {
+    btn.addEventListener('click', () => changeLang(btn.dataset.lang));
+});
+$('langToggle').addEventListener('click', () => setLangMenu($('langMenu').hidden));
+document.addEventListener('click', (e) => {
+    if (!e.target.closest('.lang-switch')) setLangMenu(false);
+});
+document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') setLangMenu(false);
+});
+$('copyBtn').addEventListener('click', copyURL);
+changeLang(getStoredLanguage());
+`;
+let uiHeadersPromise = null;
+async function sha256Source(text) {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
+  return `'sha256-${btoa(String.fromCharCode(...new Uint8Array(digest)))}'`;
+}
+function uiHeaders() {
+  uiHeadersPromise ??= Promise.all([sha256Source(UI_STYLE), sha256Source(UI_SCRIPT)]).then(([style, script]) => ({
+    ...UI_STATIC_HEADERS,
+    'content-security-policy': [
+      "default-src 'none'",
+      `script-src ${script}`,
+      `style-src ${style}`,
+      "img-src data:",
+      "base-uri 'none'",
+      "form-action 'none'",
+      "frame-ancestors 'none'"
+    ].join('; ')
+  })).catch((err) => {
+    uiHeadersPromise = null; // let a later request retry instead of failing for the isolate's lifetime
+    throw err;
+  });
+  return uiHeadersPromise;
+}
+async function renderUI(origin) {
+  const headers = await uiHeaders();
+  let html = UI_RESPONSE_CACHE.get(origin);
+  if (html) {
+    UI_RESPONSE_CACHE.delete(origin);
+    UI_RESPONSE_CACHE.set(origin, html);
+  } else {
+    html = buildUIHtml(origin);
+    UI_RESPONSE_CACHE.set(origin, html);
+    trimMap(UI_RESPONSE_CACHE, UI_RESPONSE_CACHE_MAX_ENTRIES);
+  }
+  return new Response(html, { headers });
+}
+function buildUIHtml(origin) {
+  const endpoint = `${escapeHtml(origin)}${CONFIG.DNS_PATH}`;
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Secure DNS over HTTPS (DoH) Pro</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🛡️</text></svg>">
+    <style>${UI_STYLE}</style>
+</head>
+<body>
+    <div class="lang-switch">
+        <button type="button" id="langToggle" class="glass lang-btn" aria-haspopup="true" aria-expanded="false">
+            🌐 <span id="currentLang">ENGLISH</span>
+        </button>
+        <div id="langMenu" class="glass lang-menu" hidden>
+            <button type="button" class="lang-option" data-lang="en">ENGLISH</button>
+            <button type="button" class="lang-option" data-lang="fa" lang="fa">فارسی</button>
+            <button type="button" class="lang-option" data-lang="zh">简体中文</button>
+        </div>
+    </div>
+    <div class="wrap">
+        <header class="hero">
+            <h1 id="mainTitle">Secure DNS over HTTPS</h1>
+            <p id="subTag" class="tagline">Edge Resolve Network • Parallel DoH Resolution</p>
+        </header>
+        <section class="glass card">
+            <div class="endpoint-field">
+                <span class="label" id="labelUrl">Endpoint URL</span>
+                <input id="linkInp" value="${endpoint}" readonly class="endpoint-input">
+            </div>
+            <button type="button" id="copyBtn" class="copy-btn"><span id="txtCopy">COPY ENDPOINT</span></button>
+        </section>
+        <div class="tabs-wrap">
+            <nav class="tabs" role="tablist">
+                <button type="button" id="btnC" class="tab-btn is-active" role="tab" aria-selected="true" aria-controls="chrome" data-tab="chrome">Chrome / Brave / Edge</button>
+                <button type="button" id="btnF" class="tab-btn" role="tab" aria-selected="false" aria-controls="firefox" data-tab="firefox">Firefox</button>
+                <button type="button" id="btnM" class="tab-btn" role="tab" aria-selected="false" aria-controls="mobile" data-tab="mobile">Android / iOS</button>
+            </nav>
+            <section class="panels">
+                <div id="chrome" class="glass panel" role="tabpanel" aria-labelledby="btnC">
+                    <h3 id="cH" class="panel-title t-cyan">Setup for Chromium Browsers</h3>
+                    <div id="cL" class="body-text stack">
+                        <p>1. Open Browser <b>Settings</b> and type "DNS" in the search box.</p>
+                        <p>2. Select <b>Security</b> &gt; Scroll to <b>Use Secure DNS</b>.</p>
+                        <p>3. Choose <b>"With Custom"</b> provider.</p>
+                        <p>4. Paste your DoH endpoint URL from the copy-box above.</p>
+                        <p>5. Test by visiting a DNS-restricted website.</p>
+                    </div>
+                </div>
+                <div id="firefox" class="glass panel" role="tabpanel" aria-labelledby="btnF" hidden>
+                    <h3 id="fH" class="panel-title t-emerald">Setup for Firefox</h3>
+                    <div id="fL" class="body-text stack">
+                        <p>1. Open Firefox <code>Settings</code> and scroll down to <b>Network Settings</b>.</p>
+                        <p>2. Click <b>Settings...</b> and check <b>"Enable DNS over HTTPS"</b> at the bottom.</p>
+                        <p>3. Set provider to <b>Custom</b> and paste your unique URL.</p>
+                        <p>4. Select <b>"Max Protection"</b> for stronger browser-level DNS privacy.</p>
+                    </div>
+                </div>
+                <div id="mobile" class="glass panel" role="tabpanel" aria-labelledby="btnM" hidden>
+                    <h3 id="mH" class="panel-title t-teal">Android / iOS Logic</h3>
+                    <p id="mD" class="panel-desc">This resolver is a DoH (HTTPS-based) service, which modern phones handle differently than system-wide settings.</p>
+                    <div id="mL" class="body-text stack">
+                        <p><b>A) For Mobile Browsers:</b> Open Browser settings (Chrome/Firefox/Edge) on your phone and follow the desktop steps. <b>This is the best and fastest way.</b></p>
+                        <p><b>B) For System-wide Apps:</b> We recommend using <b>RethinkDNS</b> or <b>Intra</b> apps. In these apps, set the DNS type to DoH and provide your unique DoH endpoint link.</p>
+                    </div>
+                </div>
+            </section>
+        </div>
+        <div class="glass card-why">
+            <h4 class="why-title">⭐ <span id="whyH">Why ONLY Browser-level DoH? (Crucial Tip)</span></h4>
+            <div id="whyT" class="why-body stack">
+                <p>Most operating systems (Windows settings, Android "Private DNS", or Apple Profiles) natively expect <b>DNS-over-TLS (DoT)</b> which runs on Port 853. Since this worker is built on <code>https://</code> and Port 443, it is not directly usable in these native settings.</p>
+                <p><b>The Issue:</b> You <u>cannot</u> paste an <code>https://</code> link into many native DNS settings. It will usually result in an "Invalid Hostname" error. Systems there expect a hostname or DoT endpoint, not a full HTTPS resolver URL.</p>
+                <p><b>The Solution:</b> Browsers (Chrome, Edge, Firefox) have their own independent DoH clients. They are compatible with Port 443 workers and provide browser-level encrypted DNS. DoH is therefore best configured directly in the browser.</p>
+            </div>
+        </div>
+        <footer class="footer">
+            <div>
+                <span class="footer-version">Secure DNS over HTTPS v${VERSION}</span>
+                <p class="footer-note">Built with Edge-Computing Infrastructure</p>
+            </div>
+            <nav class="footer-links">
+                <a href="https://github.com/t0ny54/DOH-Endpoints-Cloudflare-Worker" target="_blank" rel="noreferrer">GitHub</a>
+            </nav>
+        </footer>
+    </div>
+    <script>${UI_SCRIPT}</script>
 </body>
 </html>`;
-  UI_RESPONSE_CACHE.set(origin, html);
-  trimMap(UI_RESPONSE_CACHE, UI_RESPONSE_CACHE_MAX_ENTRIES);
-  return new Response(html, { headers: UI_RESPONSE_HEADERS });
 }

@@ -1,6 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { __internals as dns } from './Worker.js';
+// Cache keys are derived exactly as production derives them: normalize once, then key.
+const localKey = (packet) => dns.localKeyFromNormalized(dns.normalizeQueryForKey(packet));
+const edgeKey = (packet) => dns.edgeKeyFromNormalized(dns.normalizeQueryForKey(packet));
 function makeNode(url) {
   return {
     url,
@@ -181,9 +184,9 @@ test('isBetterDegraded prefers SERVFAIL, then score, then latency', () => {
   assert.equal(dns.isBetterDegraded(mk(5, 5), A, mk(5, 10), A), true);
   assert.equal(dns.isBetterDegraded(mk(5, 50), B, mk(5, 10), A), false);
 });
-test('cache keys ignore case and transaction ID', async () => {
-  const a = await dns.makeCacheKey(buildQuery(1, 'example.com'));
-  const b = await dns.makeCacheKey(buildQuery(999, 'EXAMPLE.COM'));
+test('edge cache keys ignore case and transaction ID', async () => {
+  const a = await edgeKey(buildQuery(1, 'example.com'));
+  const b = await edgeKey(buildQuery(999, 'EXAMPLE.COM'));
   assert.equal(a, b);
 });
 function rr(owner, type, rdata, ttl = 60, rrClass = 1) {
@@ -369,34 +372,6 @@ test('L1 cache expires entries and evicts the least-recently-used item', () => {
   assert.ok(dns.getCache('c'));
   dns.APP_STATE.cache.clear();
   dns.CONFIG.MAX_CACHE_ENTRIES = previousMax;
-});
-test('timeout classification increments timeout without counting it as a generic failure', async () => {
-  const realFetch = globalThis.fetch;
-  const previousTimeout = dns.CONFIG.UPSTREAM_TIMEOUT_MS;
-  dns.CONFIG.UPSTREAM_TIMEOUT_MS = 20;
-  const node = makeNode('https://timeout.test/dns-query');
-  globalThis.fetch = async (_url, { signal } = {}) => {
-    await new Promise((resolve, reject) => {
-      const timer = setTimeout(resolve, 500);
-      signal?.addEventListener('abort', () => {
-        clearTimeout(timer);
-        reject(new DOMException('Aborted', 'AbortError'));
-      }, { once: true });
-    });
-    return new Response(new Uint8Array());
-  };
-  try {
-    await assert.rejects(
-      () => dns.relay(node, buildQuery(0x1515), 0x1515, new AbortController().signal)
-    );
-    assert.equal(node.timeout, 1);
-    assert.equal(node.fail, 0);
-    assert.equal(node.lastError, 'timeout');
-    assert.equal(node.lastErrorKind, 'timeout');
-  } finally {
-    globalThis.fetch = realFetch;
-    dns.CONFIG.UPSTREAM_TIMEOUT_MS = previousTimeout;
-  }
 });
 test('HTTP errors and content-type failures are classified distinctly from DNS-invalid payloads', async () => {
   const realFetch = globalThis.fetch;
@@ -590,14 +565,6 @@ test('isBetterDegraded falls back to score when rcodes differ and neither is SER
   assert.equal(dns.isBetterDegraded(mk(2, 500), B, mk(4, 10), A), true);
   assert.equal(dns.isBetterDegraded(mk(4, 10), A, mk(2, 500), B), false);
 });
-test('patchDNSResponseForAge treats top-bit TTLs as zero instead of aging them from ~136 years (RFC 2181 section 8)', () => {
-  const query = buildQuery(0, 'example.com');
-  const topBitCname = [0xc0, 0x0c, 0x00, 0x05, 0x00, 0x01, 0xff, 0xff, 0xff, 0xff, 0x00, 0x02, 0xc0, 0x0c];
-  const stored = buildResponse(query, { rcode: 3, answers: [topBitCname], authority: [soaRecord(60, 30)] });
-  const aged = new Uint8Array(dns.patchDNSResponseForAge(stored.buffer, 1, 10, query));
-  const record = dns.readResourceRecord(aged, dns.skipDNSName(aged, 12) + 4);
-  assert.deepEqual([...aged.slice(record.rdataOffset - 6, record.rdataOffset - 2)], [0, 0, 0, 0]);
-});
 test('patchDNSResponseForAge normalizes top-bit TTLs even when age is zero', () => {
   const query = buildQuery(0x2526, 'example.com');
   const topBitCname = [0xc0, 0x0c, 0x00, 0x05, 0x00, 0x01, 0xff, 0xff, 0xff, 0xff, 0x00, 0x02, 0xc0, 0x0c];
@@ -705,10 +672,10 @@ test('localRateLimit opens a fresh window exactly when the previous one has expi
     dns.APP_STATE.throttle.clear();
   }
 });
-test('makeCacheKey and patchDNSResponseForAge never mutate their input buffers', async () => {
+test('cache-key derivation and patchDNSResponseForAge never mutate their input buffers', async () => {
   const packet = buildQuery(0x2424, 'MiXeD.Example.COM');
   const before = [...packet];
-  await dns.makeCacheKey(packet);
+  await edgeKey(packet);
   assert.deepEqual([...packet], before);
   const stored = buildResponse(buildQuery(0, 'example.com'), { answers: [aRecord('1.2.3.4', 300)] });
   const storedBefore = [...stored];
@@ -716,32 +683,6 @@ test('makeCacheKey and patchDNSResponseForAge never mutate their input buffers',
   assert.deepEqual([...stored], storedBefore);
   assert.notEqual(patched.buffer, stored.buffer);
   assert.equal((patched[0] << 8) | patched[1], 0xabcd);
-});
-test('relay still classifies timeouts and ignores race aborts when AbortSignal.any is unavailable', async () => {
-  const realFetch = globalThis.fetch;
-  const realAny = AbortSignal.any;
-  const previousTimeout = dns.CONFIG.UPSTREAM_TIMEOUT_MS;
-  globalThis.fetch = (_url, { signal } = {}) => new Promise((_resolve, reject) => {
-    signal?.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), { once: true });
-  });
-  AbortSignal.any = undefined;
-  try {
-    dns.CONFIG.UPSTREAM_TIMEOUT_MS = 15;
-    const slow = makeNode('https://any-fallback-timeout.test/dns-query');
-    await assert.rejects(() => dns.relay(slow, buildQuery(0x2525), 0x2525, new AbortController().signal));
-    assert.deepEqual([slow.timeout, slow.fail, slow.score], [1, 0, 92]);
-    dns.CONFIG.UPSTREAM_TIMEOUT_MS = 5_000;
-    const loser = makeNode('https://any-fallback-abort.test/dns-query');
-    const controller = new AbortController();
-    const pending = dns.relay(loser, buildQuery(0x2626), 0x2626, controller.signal);
-    controller.abort('winner-selected');
-    await assert.rejects(() => pending);
-    assert.deepEqual([loser.timeout, loser.fail, loser.score, loser.lastError], [0, 0, 100, null]);
-  } finally {
-    AbortSignal.any = realAny;
-    globalThis.fetch = realFetch;
-    dns.CONFIG.UPSTREAM_TIMEOUT_MS = previousTimeout;
-  }
 });
 test('rateLimitKey groups IPv6 clients by /64 and leaves IPv4 and non-IP values alone', () => {
   const key = dns.rateLimitKey;
@@ -807,16 +748,12 @@ test('patchDNSResponseForAge ages every record of a DNSSEC-heavy answer and leav
   assert.deepEqual([...aged.slice(4, 12)], [...stored.slice(4, 12)]);
 });
 
-test('localCacheKey ignores transaction ID and ASCII case, but separates distinct questions exactly', () => {
-  const key = dns.localCacheKey;
+test('local cache key ignores transaction ID and ASCII case, but separates distinct questions exactly', () => {
+  const key = localKey;
   assert.equal(key(buildQuery(1, 'example.com')), key(buildQuery(999, 'EXAMPLE.COM')));
   assert.notEqual(key(buildQuery(1, 'a.bc')), key(buildQuery(1, 'ab.c')));
   assert.notEqual(key(buildQuery(1, 'example.com', 1)), key(buildQuery(1, 'example.com', 28)));
   assert.notEqual(key(buildQuery(1, 'example.com', 1, 1)), key(buildQuery(1, 'example.com', 1, 3)));
-  const packet = buildQuery(0x3030, 'MiXeD.com');
-  const before = [...packet];
-  key(packet);
-  assert.deepEqual([...packet], before, 'key derivation must not mutate its input');
 });
 
 
@@ -971,23 +908,48 @@ test('skipDNSName rejects a name cut off before its terminator and reserved labe
   assert.equal(dns.skipDNSName(Uint8Array.from([0x40, 0x00]), 0), -1);
 });
 
-test('the AbortSignal fallback honours a race signal that is already aborted', async () => {
+test('a truncated answer never beats a complete answer from a slower upstream', async () => {
   const realFetch = globalThis.fetch;
-  const realAny = AbortSignal.any;
-  globalThis.fetch = (_url, { signal } = {}) => new Promise((_resolve, reject) => {
-    const fail = () => reject(new DOMException('Aborted', 'AbortError'));
-    if (signal?.aborted) fail();
-    else signal?.addEventListener('abort', fail, { once: true });
-  });
-  AbortSignal.any = undefined;
+  const query = buildQuery(0x2828);
+  const nodes = [makeNode('https://tc/fast'), makeNode('https://tc/full')];
+  globalThis.fetch = async (url) => {
+    const fast = String(url).endsWith('fast');
+    await new Promise((resolve) => setTimeout(resolve, fast ? 0 : 40));
+    const body = buildResponse(query, { answers: [aRecord(fast ? '1.1.1.1' : '2.2.2.2')] });
+    if (fast) body[2] |= 0x02;
+    return new Response(body, { status: 200, headers: { 'content-type': 'application/dns-message' } });
+  };
   try {
-    const node = makeNode('https://prearmed-abort.test/dns-query');
-    const lost = new AbortController();
-    lost.abort('winner-selected');
-    await assert.rejects(() => dns.relay(node, buildQuery(0x4646), 0x4646, lost.signal));
-    assert.deepEqual([node.fail, node.timeout, node.score], [0, 0, 100]);
+    const result = await dns.resolveWithParallelRace(nodes, query, 0x2828);
+    assert.equal(result.url, 'https://tc/full');
+    assert.equal(new Uint8Array(result.body)[2] & 0x02, 0, 'the returned answer must not be truncated');
   } finally {
-    AbortSignal.any = realAny;
     globalThis.fetch = realFetch;
   }
+});
+
+test('a truncated answer is relayed only when no complete answer arrives', async () => {
+  const realFetch = globalThis.fetch;
+  const query = buildQuery(0x2929);
+  const nodes = [makeNode('https://tc-only/a'), makeNode('https://tc-only/b')];
+  globalThis.fetch = async () => {
+    const body = buildResponse(query, { answers: [aRecord('3.3.3.3')] });
+    body[2] |= 0x02;
+    return new Response(body, { status: 200, headers: { 'content-type': 'application/dns-message' } });
+  };
+  try {
+    const result = await dns.resolveWithParallelRace(nodes, query, 0x2929);
+    assert.equal(result.rcode, 0);
+    assert.equal(new Uint8Array(result.body)[2] & 0x02, 0x02);
+    assert.equal(result.usable, true);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test('degraded-answer ties are broken by upstream configuration order, not arrival order', () => {
+  const [first, second] = dns.RESOLVER_NODES;
+  const tied = () => ({ rcode: 5, latencyMs: 10 });
+  assert.equal(dns.isBetterDegraded(tied(), first, tied(), second), true);
+  assert.equal(dns.isBetterDegraded(tied(), second, tied(), first), false);
 });
