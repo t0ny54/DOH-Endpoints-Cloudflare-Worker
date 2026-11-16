@@ -1,4 +1,4 @@
-const VERSION = '0.4.33';
+const VERSION = '0.4.36';
 const MAX_DNS_MESSAGE_BYTES = 4096;
 const CONFIG = {
   DNS_PATH: '/dns-query',
@@ -62,12 +62,14 @@ export default {
       }
       return handleDNS(req, url, ctx);
     }
-    if (url.pathname === '/health') {
-      return jsonResponse(getHealthSnapshot(), 200, {
-        'cache-control': 'no-store'
-      });
-    }
-    if (url.pathname === '/' || url.pathname === '/index.html') {
+    if (url.pathname === '/health' || url.pathname === '/' || url.pathname === '/index.html') {
+      const methodError = validateReadMethod(req.method);
+      if (methodError) return methodError;
+      if (url.pathname === '/health') {
+        return jsonResponse(getHealthSnapshot(), {
+          'cache-control': 'no-store'
+        });
+      }
       return renderUI(url.origin);
     }
     return textResponse('Not found', 404, { 'cache-control': 'no-store' });
@@ -230,6 +232,16 @@ function validateMethod(method) {
   }
   return null;
 }
+// The dashboard and /health are read-only, so only GET and HEAD are accepted.
+function validateReadMethod(method) {
+  if (method !== 'GET' && method !== 'HEAD') {
+    return textResponse('Method not allowed', 405, {
+      allow: 'GET, HEAD',
+      'cache-control': 'no-store'
+    });
+  }
+  return null;
+}
 async function readDNSPayload(req, url) {
   if (req.method === 'GET') {
     const q = url.searchParams.get('dns');
@@ -267,7 +279,7 @@ async function readCappedBody(source, maxBytes, makeTooLarge) {
     while (true) {
       const { value, done } = await reader.read();
       if (done) break;
-      if (!value || value.byteLength === 0) continue;
+      if (value.byteLength === 0) continue;
       total += value.byteLength;
       if (total > maxBytes) {
         // Release the stream without waiting on it: cancel() on a shared (tee'd) body settles
@@ -517,24 +529,26 @@ function discardBody(res) {
 function isDNSMessageContentType(value) {
   return String(value || '').split(';', 1)[0].trim().toLowerCase() === 'application/dns-message';
 }
+// Single-pass DNS response validation and cache-TTL computation. Strict mode is entered when
+// either expectedID or queryBytes is given. A non-null expectedID pins the transaction ID, and
+// non-null queryBytes requires the question to match the query on the wire. Strict mode also
+// requires exactly one question and rejects trailing bytes. Lenient mode (both null) only walks
+// the wire format without checking the ID or question; the unit tests use it to exercise the TTL
+// rules in isolation. Every production caller (relay() and getEdgeCache()) passes both an expected
+// ID and the query, so production always runs strict. Either way the packet is parsed exactly once,
+// so relaying, L2 reads, and cache writes never re-parse a packet that was analyzed.
 function validateDNSResponse(responseBuffer, expectedID, queryBytes) {
-  return analyzeDNSResponse(new Uint8Array(responseBuffer), expectedID, queryBytes);
-}
-// Single-pass DNS response analysis shared by validation and cache-TTL computation.
-// Strict mode (a non-null expectedID or queryBytes) additionally pins the transaction
-// ID, requires exactly one question matching the query on the wire, and rejects
-// trailing bytes; lenient mode (both null) only walks the wire format, which is what
-// cache-TTL computation needs. Either way the packet is parsed exactly once, so
-// relaying, L2 reads, and cache writes never re-parse a packet that was analyzed.
-function analyzeDNSResponse(bytes, expectedID, queryBytes) {
+  const bytes = new Uint8Array(responseBuffer);
   const strict = expectedID !== null || queryBytes !== null;
+  const checkID = expectedID !== null;
+  const checkQuestion = queryBytes !== null;
   if (bytes.length < 12) {
     return { ok: false, error: 'Upstream returned short DNS response', rcode: 0, cacheTTL: 0 };
   }
   const id = (bytes[0] << 8) | bytes[1];
   const flags = (bytes[2] << 8) | bytes[3];
   const rcode = flags & 0x000f;
-  if (strict && id !== expectedID) {
+  if (checkID && id !== expectedID) {
     return { ok: false, error: 'Upstream response ID mismatch', rcode, cacheTTL: 0 };
   }
   if ((flags & 0x8000) === 0) {
@@ -557,7 +571,7 @@ function analyzeDNSResponse(bytes, expectedID, queryBytes) {
     if (offset < 0 || offset + 4 > bytes.length) {
       return { ok: false, error: 'Malformed question in upstream response', rcode, cacheTTL: 0 };
     }
-    if (strict && !questionMatchesQuery(bytes, offset, queryBytes)) {
+    if (checkQuestion && !questionMatchesQuery(bytes, offset, queryBytes)) {
       return { ok: false, error: 'Upstream response question does not match the query', rcode, cacheTTL: 0 };
     }
     offset += 4;
@@ -1149,7 +1163,7 @@ function dnsResponse(body, extraHeaders = {}) {
     }
   });
 }
-function textResponse(text, status = 200, headers = {}) {
+function textResponse(text, status, headers = {}) {
   return new Response(text, {
     status,
     headers: {
@@ -1159,9 +1173,9 @@ function textResponse(text, status = 200, headers = {}) {
     }
   });
 }
-function jsonResponse(data, status = 200, headers = {}) {
-  return new Response(JSON.stringify(data, null, 2), {
-    status,
+function jsonResponse(data, headers = {}) {
+  return new Response(JSON.stringify(data), {
+    status: 200,
     headers: {
       'content-type': 'application/json; charset=utf-8',
       'x-content-type-options': 'nosniff',

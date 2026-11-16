@@ -351,11 +351,42 @@ test('DNSSEC-heavy and IPv6/other-type responses remain valid and cacheable', ()
   assert.equal(validated.ok, true);
   assert.equal(cacheTTL(response.buffer), 120);
 });
-test('expanded compressed names are rejected when they exceed the DNS 255-octet name limit', () => {
+test('uncompressed names longer than the DNS 255-octet limit are rejected', () => {
   const labels = new Array(4).fill(null).map(() => 'a'.repeat(63));
   const longName = encodeName(labels.join('.'));
   const bytes = Uint8Array.from(longName);
   assert.equal(dns.skipDNSName(bytes, 0), -1);
+});
+
+test('compressed names are rejected when their expansion exceeds 255 octets', () => {
+  const label = (s) => [s.length, ...Buffer.from(s, 'ascii')];
+  // Labels start after a 12-byte header so every pointer targets a valid offset (>= 12).
+  const threeLabels = [...label('a'.repeat(63)), ...label('b'.repeat(63)), ...label('c'.repeat(63)), 0];
+  const bStart = 12 + threeLabels.length;
+  // Expands to 61 + 193 = 254 octets: within the limit.
+  const fits = [...label('d'.repeat(60)), 0xc0, 12];
+  const cStart = bStart + fits.length;
+  // Expands to 63 + 254 = 317 octets: must be rejected.
+  const overflows = [...label('e'.repeat(62)), 0xc0, bStart];
+  const bytes = Uint8Array.from([...new Array(12).fill(0), ...threeLabels, ...fits, ...overflows]);
+  const ctx = { nameOffsets: new Set() };
+  assert.equal(dns.skipDNSName(bytes, 12, ctx), bStart);
+  assert.equal(dns.skipDNSName(bytes, bStart, ctx), cStart);
+  assert.equal(dns.skipDNSName(bytes, cStart, ctx), -1);
+  assert.equal(dns.skipDNSName(bytes, cStart), -1, 'the length limit also applies without a context');
+});
+
+test('strict validation checks whichever of expected ID or query is given, without throwing', () => {
+  const query = buildQuery(0x3434, 'example.com');
+  const good = buildResponse(query, { answers: [aRecord('1.2.3.4')] });
+  // Expected ID alone: the ID is pinned, the question is not compared, trailing bytes still fail.
+  assert.equal(dns.validateDNSResponse(good.buffer, 0x3434, null).ok, true);
+  assert.match(dns.validateDNSResponse(good.buffer, 0x3435, null).error, /ID mismatch/);
+  assert.equal(dns.validateDNSResponse(Uint8Array.from([...good, 0]).buffer, 0x3434, null).ok, false);
+  // Query alone: the question is compared, the ID is not pinned.
+  assert.equal(dns.validateDNSResponse(good.buffer, null, query).ok, true);
+  const otherName = buildResponse(buildQuery(0x3434, 'other.org'));
+  assert.equal(dns.validateDNSResponse(otherName.buffer, null, query).ok, false);
 });
 test('L1 cache expires entries and evicts the least-recently-used item', () => {
   const previousMax = dns.CONFIG.MAX_CACHE_ENTRIES;

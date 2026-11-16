@@ -1,20 +1,15 @@
 # Changelog
 
-## 0.4.33
+## 0.4.36
 
 ### Fixed
 
-- A truncated (TC) upstream answer could win the parallel race and be returned to the client, even when another upstream returned the complete answer. DoH has no TCP retry, so the client received an incomplete response. A truncated answer is now used only if no complete answer arrives.
-- The degraded-answer tie-break returned whichever degraded answer arrived first when score and latency were equal, although the README describes that choice as deterministic. An exact tie now goes to the upstream listed first in `DOH_UPSTREAMS`, so arrival order never decides.
-
-### Changed
-
-- The `RESOLVER_NODES` list is exported through the internal test hook so the tie-break can be tested directly.
+- `/`, `/index.html` and `/health` accepted every HTTP method (a `POST` to `/health` returned the metrics). They now accept only `GET` and `HEAD`. Other methods get `405` with `Allow: GET, HEAD`, matching the method policy already used by `/dns-query`.
+- The comment on `validateDNSResponse()` said lenient mode is what cache-TTL computation needs. Every production caller passes an expected ID and the query, so production always runs in strict mode; lenient mode is exercised by the unit tests. The comment now says so.
+- The README's negative-caching rule now matches the code: a `NOERROR` answer that carries answer records is cached by its lowest answer TTL, with or without an SOA record. `NXDOMAIN` and `NODATA` are cached only when they carry an SOA record.
 
 ### Verified
 
-- Unit suite: 55 tests, all passing. Three tests were added: a truncated answer loses to a complete one, a truncated answer is relayed when nothing complete arrives, and degraded ties follow configuration order. Two of them fail against 0.4.32; the third guards existing fallback behavior and passes on both versions.
-- Integration suite passes.
-- Fuzzing of the parser, validator, TTL patcher and cache-key code: 200,000 random and mutated packets, no exceptions.
-- Hot-path microbenchmark: every DNS operation (key derivation, parsing, validation, TTL patching) takes under 1 µs, so no CPU optimization was pursued.
+- Unit suite: 57 tests, all passing.
+- Integration suite passes, including the new `405` and `HEAD` assertions. Those assertions fail against the 0.4.35 `Worker.js`.
 - Not run here: `npm run test:wrangler`, which needs Wrangler installed locally.

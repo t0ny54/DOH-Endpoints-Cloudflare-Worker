@@ -18,6 +18,13 @@ if (!existsSync(wrangler)) {
   console.error('Wrangler is not installed locally. Run `npm install` before `npm run test:wrangler`.');
   process.exit(1);
 }
+// Refuse to run against a server this script did not start. If the port already answers, the
+// probes below would test that other process and could pass without Wrangler ever running.
+const portInUse = await fetch(`${BASE}/health`).then(() => true, () => false);
+if (portInUse) {
+  console.error(`Port ${PORT} is already serving HTTP. Stop that process or set WRANGLER_SMOKE_PORT.`);
+  process.exit(1);
+}
 const child = spawn(wrangler, [
   'dev',
   '--local',

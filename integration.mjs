@@ -88,6 +88,14 @@ assert.match(rootHtml, /id="linkInp" value="https:\/\/dns\.example\.test\/dns-qu
 assert.match(await (await worker.fetch(new Request('http://127.0.0.1:8797/'))).text(), /id="linkInp" value="http:\/\/127\.0\.0\.1:8797\/dns-query"/);
 r = await worker.fetch(req('/health')); assert.equal(r.status,200); assert.equal((await r.json()).version,PKG_VERSION);
 r = await worker.fetch(req('/missing')); assert.equal(r.status,404);
+// Read-only endpoints reject every method except GET and HEAD, and advertise the allowed set.
+for (const [path, method] of [['/health','POST'],['/','PUT'],['/index.html','DELETE']]) {
+  r = await worker.fetch(req(path,{method})); assert.equal(r.status,405,`${method} ${path}`);
+  assert.equal(r.headers.get('allow'),'GET, HEAD',`${method} ${path}`);
+  assert.equal(r.headers.get('x-content-type-options'),'nosniff',`${method} ${path}`);
+}
+r = await worker.fetch(req('/health',{method:'HEAD'})); assert.equal(r.status,200);
+r = await worker.fetch(req('/',{method:'HEAD'})); assert.equal(r.status,200);
 r = await worker.fetch(req('/dns-query',{method:'PUT',headers:{'CF-Connecting-IP':'1'}}), rateOK); assert.equal(r.status,405);
 const q1 = query(0x1234,'example.com');
 r = await worker.fetch(req('/dns-query',{method:'POST',headers:{'CF-Connecting-IP':'2','content-type':'text/plain'},body:q1}), rateOK); assert.equal(r.status,415);
