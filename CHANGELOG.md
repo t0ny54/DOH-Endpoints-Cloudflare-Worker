@@ -1,15 +1,20 @@
 # Changelog
 
-## 0.4.36
+## 0.4.39
 
-### Fixed
+### Changed
 
-- `/`, `/index.html` and `/health` accepted every HTTP method (a `POST` to `/health` returned the metrics). They now accept only `GET` and `HEAD`. Other methods get `405` with `Allow: GET, HEAD`, matching the method policy already used by `/dns-query`.
-- The comment on `validateDNSResponse()` said lenient mode is what cache-TTL computation needs. Every production caller passes an expected ID and the query, so production always runs in strict mode; lenient mode is exercised by the unit tests. The comment now says so.
-- The README's negative-caching rule now matches the code: a `NOERROR` answer that carries answer records is cached by its lowest answer TTL, with or without an SOA record. `NXDOMAIN` and `NODATA` are cached only when they carry an SOA record.
+- Removed a redundant nested `try`/`catch` in `getEdgeCache()`. The enclosing `try` already returns `null` for any failure while reading an L2 entry, so behavior is unchanged.
+- Added `package-lock.json`, so `npm install` reproduces the exact dependency tree the test suites ran against (including Wrangler 4.143.0's transitive dependencies).
+
+### Added
+
+- `.gitignore` excluding `node_modules/`, Wrangler's local `.wrangler/` state, and `.dev.vars`, so local development artifacts are not committed.
 
 ### Verified
 
-- Unit suite: 57 tests, all passing.
-- Integration suite passes, including the new `405` and `HEAD` assertions. Those assertions fail against the 0.4.35 `Worker.js`.
-- Not run here: `npm run test:wrangler`, which needs Wrangler installed locally.
+- Unit suite: 59 tests, all passing.
+- Integration suite passes.
+- `npm run test:wrangler` passes against a local `wrangler dev` (Wrangler 4.143.0).
+- `wrangler deploy --dry-run` validates the `DNS_RATE_LIMITER` binding in `wrangler.toml`.
+- Parser fuzzing: 300,000 randomly mutated DNS messages through the parse, validate, and cache-aging paths raised no uncaught exceptions.

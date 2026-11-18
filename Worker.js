@@ -1,5 +1,8 @@
-const VERSION = '0.4.36';
+const VERSION = '0.4.39';
 const MAX_DNS_MESSAGE_BYTES = 4096;
+// Allowed methods per endpoint. The Allow header is derived from these lists, so it cannot drift.
+const DNS_METHODS = ['GET', 'POST'];
+const READ_METHODS = ['GET', 'HEAD'];
 const CONFIG = {
   DNS_PATH: '/dns-query',
   EDGE_CACHE_ENABLED: true,
@@ -54,6 +57,9 @@ export default {
     maybeSweepState();
     const url = new URL(req.url);
     if (url.pathname === CONFIG.DNS_PATH) {
+      // Reject disallowed methods before the rate-limit binding is consulted, so they cost nothing.
+      const methodError = validateMethod(req.method, DNS_METHODS);
+      if (methodError) return methodError;
       if (!(await allowDNSRequest(getClientIP(req), env))) {
         return textResponse('Rate limit exceeded', 429, {
           'cache-control': 'no-store',
@@ -63,7 +69,7 @@ export default {
       return handleDNS(req, url, ctx);
     }
     if (url.pathname === '/health' || url.pathname === '/' || url.pathname === '/index.html') {
-      const methodError = validateReadMethod(req.method);
+      const methodError = validateMethod(req.method, READ_METHODS);
       if (methodError) return methodError;
       if (url.pathname === '/health') {
         return jsonResponse(getHealthSnapshot(), {
@@ -76,8 +82,6 @@ export default {
   }
 };
 async function handleDNS(req, url, ctx) {
-  const methodError = validateMethod(req.method);
-  if (methodError) return methodError;
   let payload;
   try {
     payload = await readDNSPayload(req, url);
@@ -223,24 +227,13 @@ function coalescedDNSResponse(shared, parsed, queryBytes) {
     'x-upstreams': '0'
   }));
 }
-function validateMethod(method) {
-  if (method !== 'GET' && method !== 'POST') {
-    return textResponse('Method not allowed', 405, {
-      allow: 'GET, POST',
-      'cache-control': 'no-store'
-    });
-  }
-  return null;
-}
-// The dashboard and /health are read-only, so only GET and HEAD are accepted.
-function validateReadMethod(method) {
-  if (method !== 'GET' && method !== 'HEAD') {
-    return textResponse('Method not allowed', 405, {
-      allow: 'GET, HEAD',
-      'cache-control': 'no-store'
-    });
-  }
-  return null;
+// Returns a 405 response for any method outside `allowed`, or null when the method is accepted.
+function validateMethod(method, allowed) {
+  if (allowed.includes(method)) return null;
+  return textResponse('Method not allowed', 405, {
+    allow: allowed.join(', '),
+    'cache-control': 'no-store'
+  });
 }
 async function readDNSPayload(req, url) {
   if (req.method === 'GET') {
@@ -439,14 +432,10 @@ function isBetterDegraded(value, node, bestValue, bestNode) {
   return RESOLVER_NODES.indexOf(node) < RESOLVER_NODES.indexOf(bestNode);
 }
 function abortAttempts(controllers, active) {
-  for (const node of active.keys()) {
-    try { controllers.get(node)?.abort('winner-selected'); } catch (_) {}
-  }
+  for (const node of active.keys()) controllers.get(node)?.abort('winner-selected');
 }
 function upstreamError(message, kind) {
-  const err = new Error(message);
-  err.kind = kind;
-  return err;
+  return taggedError(message, { kind });
 }
 async function relay(node, packet, expectedID, signal) {
   const started = Date.now();
@@ -523,8 +512,9 @@ async function relay(node, packet, expectedID, signal) {
     clearTimeout(timeout);
   }
 }
+// cancel() reports failures through its promise, so a single catch covers every case.
 function discardBody(res) {
-  try { res.body?.cancel().catch(() => {}); } catch (_) {}
+  res.body?.cancel().catch(() => {});
 }
 function isDNSMessageContentType(value) {
   return String(value || '').split(';', 1)[0].trim().toLowerCase() === 'application/dns-message';
@@ -535,8 +525,8 @@ function isDNSMessageContentType(value) {
 // requires exactly one question and rejects trailing bytes. Lenient mode (both null) only walks
 // the wire format without checking the ID or question; the unit tests use it to exercise the TTL
 // rules in isolation. Every production caller (relay() and getEdgeCache()) passes both an expected
-// ID and the query, so production always runs strict. Either way the packet is parsed exactly once,
-// so relaying, L2 reads, and cache writes never re-parse a packet that was analyzed.
+// ID and the query, so production always runs strict. relay() analyses each upstream packet in
+// this one pass, and the cache TTL it computes is reused for the cache writes.
 function validateDNSResponse(responseBuffer, expectedID, queryBytes) {
   const bytes = new Uint8Array(responseBuffer);
   const strict = expectedID !== null || queryBytes !== null;
@@ -1006,16 +996,11 @@ async function getEdgeCache(key, queryID, origin, queryBytes) {
       discardBody(hit);
       return null;
     }
-    let body;
-    try {
-      body = (await readCappedBody(
-        hit,
-        CONFIG.MAX_UPSTREAM_DNS_MESSAGE_BYTES,
-        () => new Error('L2 cache entry too large')
-      )).buffer;
-    } catch (_) {
-      return null;
-    }
+    const body = (await readCappedBody(
+      hit,
+      CONFIG.MAX_UPSTREAM_DNS_MESSAGE_BYTES,
+      () => new Error('L2 cache entry too large')
+    )).buffer;
     // Cache values are stored with their DNS transaction ID zeroed. Recheck the full
     // DNS structure, matching question, and effective DNS TTL to avoid serving corrupt
     // or mismatched cache content even when its metadata looks plausible.
@@ -1184,9 +1169,10 @@ function jsonResponse(data, headers = {}) {
   });
 }
 function httpError(message, status) {
-  const err = new Error(message);
-  err.status = status;
-  return err;
+  return taggedError(message, { status });
+}
+function taggedError(message, props) {
+  return Object.assign(new Error(message), props);
 }
 function clamp(value, min, max) {
   return Math.max(min, Math.min(max, value));

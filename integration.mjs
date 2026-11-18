@@ -96,9 +96,16 @@ for (const [path, method] of [['/health','POST'],['/','PUT'],['/index.html','DEL
 }
 r = await worker.fetch(req('/health',{method:'HEAD'})); assert.equal(r.status,200);
 r = await worker.fetch(req('/',{method:'HEAD'})); assert.equal(r.status,200);
-r = await worker.fetch(req('/dns-query',{method:'PUT',headers:{'CF-Connecting-IP':'1'}}), rateOK); assert.equal(r.status,405);
+// Disallowed methods are rejected before the rate-limit binding is consulted; a parsed-but-invalid POST still is.
+{
+  let limiterCalls=0;
+  const countingEnv={DNS_RATE_LIMITER:{limit:async()=>{limiterCalls++; return {success:true};}}};
+  r=await worker.fetch(req('/dns-query',{method:'PUT',headers:{'CF-Connecting-IP':'method-first'}}),countingEnv);
+  assert.equal(r.status,405); assert.equal(limiterCalls,0);
+  r=await worker.fetch(req('/dns-query',{method:'POST',headers:{'CF-Connecting-IP':'method-first','content-type':'text/plain'},body:query(0x1234,'example.com')}),countingEnv);
+  assert.equal(r.status,415); assert.equal(limiterCalls,1);
+}
 const q1 = query(0x1234,'example.com');
-r = await worker.fetch(req('/dns-query',{method:'POST',headers:{'CF-Connecting-IP':'2','content-type':'text/plain'},body:q1}), rateOK); assert.equal(r.status,415);
 r = await worker.fetch(req('/dns-query',{method:'POST',headers:{'CF-Connecting-IP':'3','content-type':'application/dns-message'},body:new Uint8Array([1,2])}), rateOK); assert.equal(r.status,400);
 upstreamCalls=0; mode='ok';
 const ctx = { jobs: [], waitUntil(p){ this.jobs.push(p); } };

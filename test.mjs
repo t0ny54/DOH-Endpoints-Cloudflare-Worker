@@ -984,3 +984,20 @@ test('degraded-answer ties are broken by upstream configuration order, not arriv
   assert.equal(dns.isBetterDegraded(tied(), first, tied(), second), true);
   assert.equal(dns.isBetterDegraded(tied(), second, tied(), first), false);
 });
+
+// Negative-caching rules as documented in README ("Two-level DNS cache").
+test('a NOERROR answer with records and no SOA ignores authority NS TTLs (positive answers keep their answer TTL)', () => {
+  const query = buildQuery(7);
+  const nsAuthority = rr(compressedOwner(), 2, [0xc0, 0x0c], 10);
+  const positive = buildResponse(query, { answers: [aRecord('1.2.3.4', 300)], authority: [nsAuthority] });
+  assert.equal(cacheTTL(positive.buffer), 300);
+  // NODATA without an SOA record cannot be negatively cached, whatever its authority TTLs are.
+  const nodataNoSoa = buildResponse(query, { authority: [nsAuthority] });
+  assert.equal(cacheTTL(nodataNoSoa.buffer), 0);
+});
+
+test('a NOERROR answer that also carries an SOA is capped by the SOA negative TTL', () => {
+  const query = buildQuery(7);
+  const withSoa = buildResponse(query, { answers: [aRecord('1.2.3.4', 300)], authority: [soaRecord(60, 30)] });
+  assert.equal(cacheTTL(withSoa.buffer), 30);
+});
