@@ -4,6 +4,10 @@ import worker, { __internals as dns } from './Worker.js';
 const localKey = (packet) => dns.localKeyFromNormalized(dns.normalizeQueryForKey(packet));
 const edgeKey = (packet) => dns.edgeKeyFromNormalized(dns.normalizeQueryForKey(packet));
 const PKG_VERSION = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8')).version;
+// package-lock.json repeats the version at the top level and on its root package entry; a release must bump both.
+const LOCK = JSON.parse(readFileSync(new URL('./package-lock.json', import.meta.url), 'utf8'));
+assert.equal(LOCK.version, PKG_VERSION, 'package-lock.json top-level version must match package.json');
+assert.equal(LOCK.packages[''].version, PKG_VERSION, 'package-lock.json root package version must match package.json');
 function encodeName(name) {
   return [...name.split('.').flatMap(x => [x.length, ...Buffer.from(x)]), 0];
 }
@@ -316,25 +320,31 @@ const uiHtml = await r.text();
 assert.match(uiHtml,/document\.documentElement\.lang = c;/);
 // A combining mark glued onto a Latin word is a typo (it corrupted "DNS" in the Persian copy).
 assert.doesNotMatch(uiHtml, /[A-Za-z][\u064B-\u065F\u0670]/);
-// The English copy exists twice (static HTML and I18N.en); they must not drift apart.
-const norm = (h) => h.replace(/>\s+</g,'><').replace(/&gt;/g,'>').trim();
-for (const [id, tag] of [['cH','h3'],['cL','div'],['fH','h3'],['fL','div'],['mH','h3'],['mD','p'],['mL','div'],['whyH','span'],['whyT','div']]) {
-  const stat = uiHtml.match(new RegExp(`id="${id}"[^>]*>([\\s\\S]*?)</${tag}>`));
-  const dyn = uiHtml.match(new RegExp(`\\b${id}: '((?:[^'\\\\]|\\\\.)*)'`));
-  assert.ok(stat && dyn, `dashboard copy for ${id} not found`);
-  assert.equal(norm(dyn[1]), norm(stat[1]), `static and I18N.en text differ for ${id}`);
+// The copy has one source: the language table is sent to the script as JSON, and the static English
+// markup is rendered from it. Every language must define the same keys, and the first paint must
+// contain the English copy exactly as the table holds it.
+assert.doesNotMatch(uiHtml, /\$\{/, 'no template placeholder may leak into the page');
+const uiScript = uiHtml.match(/<script>([\s\S]*?)<\/script>/)[1];
+const table = JSON.parse(uiScript.match(/^const I18N = (.*);$/m)[1]);
+const en = table.en;
+for (const lang of ['fa', 'zh']) {
+  assert.deepEqual(Object.keys(table[lang]).sort(), Object.keys(en).sort(), `${lang} must define exactly the English keys`);
 }
-for (const [id, key, tag] of [
-  ['currentLang','curL','span'],
-  ['mainTitle','main','h1'],
-  ['subTag','sub','p'],
-  ['labelUrl','urlL','span'],
-  ['txtCopy','cpT','span']
-]) {
-  const stat = uiHtml.match(new RegExp(`id="${id}"[^>]*>([\\s\\S]*?)</${tag}>`));
-  const dyn = uiHtml.match(new RegExp(`\\b${key}: '((?:[^'\\\\]|\\\\.)*)'`));
-  assert.ok(stat && dyn, `dashboard copy for ${key} not found`);
-  assert.equal(norm(dyn[1]), norm(stat[1]), `static and I18N.en text differ for ${key}`);
+for (const [lang, copy] of Object.entries(table)) {
+  for (const [key, value] of Object.entries(copy)) {
+    assert.equal(typeof value, 'string', `${lang}.${key}`);
+    assert.ok(value.length > 0, `${lang}.${key} must not be empty`);
+  }
+}
+const escapeText = (v) => v.replace(/[&<>"']/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]));
+for (const key of ['main', 'sub', 'urlL', 'cpT', 'tabC', 'tabF', 'tabM', 'cH', 'fH', 'mH', 'mD', 'whyH', 'curL']) {
+  assert.ok(uiHtml.includes(escapeText(en[key])), `static markup must render the English ${key}`);
+}
+// The language menu is generated from the same table, so its labels match the button text for each language.
+const menuLabels = [...uiHtml.matchAll(/data-lang="([a-z]+)"[^>]*>([^<]*)<\/button>/g)].map((m) => [m[1], m[2]]);
+assert.deepEqual(menuLabels, Object.keys(table).map((lang) => [lang, escapeText(table[lang].curL)]), 'language menu labels must come from the table');
+for (const key of ['cL', 'fL', 'mL', 'whyT']) {
+  assert.ok(uiHtml.includes(en[key]), `static markup must render the English ${key} HTML`);
 }
 // Rate-limit rejections advertise the configured window.
 dns.APP_STATE.throttle.clear();

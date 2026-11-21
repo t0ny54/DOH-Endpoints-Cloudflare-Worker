@@ -1,4 +1,4 @@
-const VERSION = '0.4.39';
+const VERSION = '0.4.43';
 const MAX_DNS_MESSAGE_BYTES = 4096;
 // Allowed methods per endpoint. The Allow header is derived from these lists, so it cannot drift.
 const DNS_METHODS = ['GET', 'POST'];
@@ -1289,55 +1289,70 @@ button:focus-visible,a:focus-visible{outline:2px solid #22d3ee;outline-offset:2p
 .footer-links a:hover{color:#22d3ee}
 @keyframes fadeInUp{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
 `;
+
+// Serialises a value as JSON that is safe inside an inline <script>. Only "</" (which could close
+// the tag early) and "<!--" (which opens a script comment) need escaping; both stay valid JSON.
+function serializeForScript(value) {
+  return JSON.stringify(value)
+    .replace(/<\//g, '<\\/')
+    .replace(/<!--/g, '\\u003c!--');
+}
+
+const DASHBOARD_I18N = {
+    en: {
+        main: 'Secure DNS over HTTPS', sub: 'Edge Resolve Network • Parallel DoH Resolution',
+        urlL: 'Endpoint URL', cpT: 'COPY ENDPOINT', copied: 'LINK CAPTURED!', tabC: 'Chrome / Brave / Edge', tabF: 'Firefox', tabM: 'Android / iOS',
+        cH: 'Setup for Chromium Browsers', cL: '<p>1. Open Browser <b>Settings</b> and type "DNS" in the search box.</p><p>2. Select <b>Security</b> &gt; Scroll to <b>Use Secure DNS</b>.</p><p>3. Choose <b>"With Custom"</b> provider.</p><p>4. Paste your DoH endpoint URL from the copy-box above.</p><p>5. Test by visiting a DNS-restricted website.</p>',
+        fH: 'Setup for Firefox', fL: '<p>1. Open Firefox <code>Settings</code> and scroll down to <b>Network Settings</b>.</p><p>2. Click <b>Settings...</b> and check <b>"Enable DNS over HTTPS"</b> at the bottom.</p><p>3. Set provider to <b>Custom</b> and paste your unique URL.</p><p>4. Select <b>"Max Protection"</b> for stronger browser-level DNS privacy.</p>',
+        mH: 'Android / iOS Logic', mD: 'This resolver is a DoH (HTTPS-based) service, which modern phones handle differently than system-wide settings.',
+        mL: '<p><b>A) For Mobile Browsers:</b> Open Browser settings (Chrome/Firefox/Edge) on your phone and follow the desktop steps. <b>This is the best and fastest way.</b></p><p><b>B) For System-wide Apps:</b> We recommend using <b>RethinkDNS</b> or <b>Intra</b> apps. In these apps, set the DNS type to DoH and provide your unique DoH endpoint link.</p>',
+        whyH: 'Why ONLY Browser-level DoH? (Crucial Tip)',
+        whyT: '<p>Most operating systems (Windows settings, Android "Private DNS", or Apple Profiles) natively expect <b>DNS-over-TLS (DoT)</b> which runs on Port 853. Since this worker is built on <code>https://</code> and Port 443, it is not directly usable in these native settings.</p><p><b>The Issue:</b> You <u>cannot</u> paste an <code>https://</code> link into many native DNS settings. It will usually result in an "Invalid Hostname" error. Systems there expect a hostname or DoT endpoint, not a full HTTPS resolver URL.</p><p><b>The Solution:</b> Browsers (Chrome, Edge, Firefox) have their own independent DoH clients. They are compatible with Port 443 workers and provide browser-level encrypted DNS. DoH is therefore best configured directly in the browser.</p>',
+        curL: 'ENGLISH'
+    },
+    fa: {
+        main: 'سرویس امن DNS بر روی HTTPS', sub: 'پاسخگویی همزمان با سه سرور DNS و انتخاب اولین پاسخ معتبر',
+        urlL: 'آدرس مستقیم سرور شما (DoH)', cpT: 'کپی آدرس هوشمند', copied: 'لینک کپی شد!', tabC: 'خانواده کروم', tabF: 'فایرفاکس', tabM: 'اندروید / آیفون',
+        cH: 'تنظیمات در کروم، اج و بریو', cL: '<p>۱. در تنظیمات مرورگر کلمه DNS را جستجو کنید.</p><p>۲. وارد بخش Security شوید.</p><p>۳. گزینه «Use Secure DNS» را انتخاب کنید.</p><p>۴. آدرس سرور را در فیلد Custom وارد کنید.</p><p>۵. با جستجوی یک سایت محدود، نتیجه را تست کنید.</p>',
+        fH: 'تنظیمات در مرورگر فایرفاکس', fL: '<p>۱. در فایرفاکس وارد Settings شوید و DNS over HTTPS را جستجو کنید.</p><p>۲. گزینه Custom را انتخاب کنید.</p><p>۳. URL سرویس DoH را وارد کنید.</p><p>۴. برای حداکثر محافظت، گزینه Max Protection را فعال کنید.</p>',
+        mH: 'استراتژی راه‌اندازی در موبایل', mD: 'گوشی‌ها معمولاً در تنظیمات سیستمی به دنبال hostname برای DoT هستند؛ برای این سرویس DoH، بهترین روش در مرورگر است:',
+        mL: '<p><b>داخل مرورگر:</b> بهترین راه تنظیم مستقیم در بخش Secure DNS کروم یا فایرفاکس است.</p><p><b>برای اپ‌ها:</b> از اپ‌های <b>Intra</b> یا <b>RethinkDNS</b> کمک بگیرید و نوع DNS را DoH تنظیم کنید.</p>',
+        whyH: 'چرا معمولاً فقط در مرورگر؟',
+        whyT: '<p>بسیاری از تنظیمات سیستمی ویندوز یا اندروید، معمولاً <b>DoT (پورت ۸۵۳)</b> یا فرمت hostname را می‌خواهند و URL کامل HTTPS را نمی‌پذیرند.</p><p>این سرویس برای مرورگرها و Port 443 طراحی شده است و بهترین مکان استفاده از آن در داخل مرورگر است.</p>',
+        curL: 'فارسی (FA)'
+    },
+    zh: {
+        main: 'Secure DoH 安全加密中心', sub: '基于边缘节点的三路并行 DNS 解析',
+        urlL: 'DoH 配置终端', cpT: '复制配置地址', copied: '已复制!', tabC: 'Chromium 引擎', tabF: 'Firefox 火狐', tabM: '安卓与 iOS',
+        cH: 'Chromium 浏览器设置', cL: '<p>1. 进入浏览器“设置”，搜索“安全 DNS”。</p><p>2. 进入“使用安全 DNS”选项。</p><p>3. 选择“自定义 (Custom)”。</p><p>4. 把当前 Worker 的 URL 粘贴进去。</p><p>5. 访问被拦截的网站做功能验证。</p>',
+        fH: '火狐浏览器配置指南', fL: '<p>1. 在火狐“设置”中搜索 DNS over HTTPS。</p><p>2. 选择“自定义提供商”。</p><p>3. 输入 DoH 服务地址。</p><p>4. 选择“Max Protection”提升增强隐私。</p>',
+        mH: '移动端解析说明', mD: '移动操作系统通常默认系统级 DoT 格式；若要使用此 DoH 服务器:',
+        mL: '<p><b>浏览器设置:</b> 直接在安卓或苹果手机的浏览器中配置最稳定。</p><p><b>应用设置:</b> 推荐使用 <b>Intra</b> 或 <b>RethinkDNS</b>，并将 DNS 类型切换为 DoH。</p>',
+        whyH: '为什么通常建议在浏览器配置?',
+        whyT: '<p>Windows 或安卓系统的 Private DNS 设置项通常需要 <b>DoT / 853 端口</b> 或主机名格式，而不一定接受完整 HTTPS URL。</p><p>本项目基于 <b>Port 443</b> 的 Worker 架构，因此浏览器端配置最符合实际运行方式。</p>',
+        curL: '简体中文'
+    }
+};
+
 const UI_SCRIPT = `
-        const I18N = {
-            en: {
-                main: 'Secure DNS over HTTPS', sub: 'Edge Resolve Network • Parallel DoH Resolution',
-                urlL: 'Endpoint URL', cpT: 'COPY ENDPOINT', copied: 'LINK CAPTURED!', tabC: 'Chrome / Brave / Edge', tabF: 'Firefox', tabM: 'Android / iOS',
-                cH: 'Setup for Chromium Browsers', cL: '<p>1. Open Browser <b>Settings</b> and type "DNS" in the search box.</p><p>2. Select <b>Security</b> &gt; Scroll to <b>Use Secure DNS</b>.</p><p>3. Choose <b>"With Custom"</b> provider.</p><p>4. Paste your DoH endpoint URL from the copy-box above.</p><p>5. Test by visiting a DNS-restricted website.</p>',
-                fH: 'Setup for Firefox', fL: '<p>1. Open Firefox <code>Settings</code> and scroll down to <b>Network Settings</b>.</p><p>2. Click <b>Settings...</b> and check <b>"Enable DNS over HTTPS"</b> at the bottom.</p><p>3. Set provider to <b>Custom</b> and paste your unique URL.</p><p>4. Select <b>"Max Protection"</b> for stronger browser-level DNS privacy.</p>',
-                mH: 'Android / iOS Logic', mD: 'This resolver is a DoH (HTTPS-based) service, which modern phones handle differently than system-wide settings.',
-                mL: '<p><b>A) For Mobile Browsers:</b> Open Browser settings (Chrome/Firefox/Edge) on your phone and follow the desktop steps. <b>This is the best and fastest way.</b></p><p><b>B) For System-wide Apps:</b> We recommend using <b>RethinkDNS</b> or <b>Intra</b> apps. In these apps, set the DNS type to DoH and provide your unique DoH endpoint link.</p>',
-                whyH: 'Why ONLY Browser-level DoH? (Crucial Tip)',
-                whyT: '<p>Most operating systems (Windows settings, Android "Private DNS", or Apple Profiles) natively expect <b>DNS-over-TLS (DoT)</b> which runs on Port 853. Since this worker is built on <code>https://</code> and Port 443, it is not directly usable in these native settings.</p><p><b>The Issue:</b> You <u>cannot</u> paste an <code>https://</code> link into many native DNS settings. It will usually result in an "Invalid Hostname" error. Systems there expect a hostname or DoT endpoint, not a full HTTPS resolver URL.</p><p><b>The Solution:</b> Browsers (Chrome, Edge, Firefox) have their own independent DoH clients. They are compatible with Port 443 workers and provide browser-level encrypted DNS. DoH is therefore best configured directly in the browser.</p>',
-                curL: 'ENGLISH'
-            },
-            fa: {
-                main: 'سرویس امن DNS بر روی HTTPS', sub: 'پاسخگویی همزمان با سه سرور DNS و انتخاب اولین پاسخ معتبر',
-                urlL: 'آدرس مستقیم سرور شما (DoH)', cpT: 'کپی آدرس هوشمند', copied: 'لینک کپی شد!', tabC: 'خانواده کروم', tabF: 'فایرفاکس', tabM: 'اندروید / آیفون',
-                cH: 'تنظیمات در کروم، اج و بریو', cL: '<p>۱. در تنظیمات مرورگر کلمه DNS را جستجو کنید.</p><p>۲. وارد بخش Security شوید.</p><p>۳. گزینه «Use Secure DNS» را انتخاب کنید.</p><p>۴. آدرس سرور را در فیلد Custom وارد کنید.</p><p>۵. با جستجوی یک سایت محدود، نتیجه را تست کنید.</p>',
-                fH: 'تنظیمات در مرورگر فایرفاکس', fL: '<p>۱. در فایرفاکس وارد Settings شوید و DNS over HTTPS را جستجو کنید.</p><p>۲. گزینه Custom را انتخاب کنید.</p><p>۳. URL سرویس DoH را وارد کنید.</p><p>۴. برای حداکثر محافظت، گزینه Max Protection را فعال کنید.</p>',
-                mH: 'استراتژی راه‌اندازی در موبایل', mD: 'گوشی‌ها معمولاً در تنظیمات سیستمی به دنبال hostname برای DoT هستند؛ برای این سرویس DoH، بهترین روش در مرورگر است:',
-                mL: '<p><b>داخل مرورگر:</b> بهترین راه تنظیم مستقیم در بخش Secure DNS کروم یا فایرفاکس است.</p><p><b>برای اپ‌ها:</b> از اپ‌های <b>Intra</b> یا <b>RethinkDNS</b> کمک بگیرید و نوع DNS را DoH تنظیم کنید.</p>',
-                whyH: 'چرا معمولاً فقط در مرورگر؟',
-                whyT: '<p>بسیاری از تنظیمات سیستمی ویندوز یا اندروید، معمولاً <b>DoT (پورت ۸۵۳)</b> یا فرمت hostname را می‌خواهند و URL کامل HTTPS را نمی‌پذیرند.</p><p>این سرویس برای مرورگرها و Port 443 طراحی شده است و بهترین مکان استفاده از آن در داخل مرورگر است.</p>',
-                curL: 'فارسی (FA)'
-            },
-            zh: {
-                main: 'Secure DoH 安全加密中心', sub: '基于边缘节点的三路并行 DNS 解析',
-                urlL: 'DoH 配置终端', cpT: '复制配置地址', copied: '已复制!', tabC: 'Chromium 引擎', tabF: 'Firefox 火狐', tabM: '安卓与 iOS',
-                cH: 'Chromium 浏览器设置', cL: '<p>1. 进入浏览器“设置”，搜索“安全 DNS”。</p><p>2. 进入“使用安全 DNS”选项。</p><p>3. 选择“自定义 (Custom)”。</p><p>4. 把当前 Worker 的 URL 粘贴进去。</p><p>5. 访问被拦截的网站做功能验证。</p>',
-                fH: '火狐浏览器配置指南', fL: '<p>1. 在火狐“设置”中搜索 DNS over HTTPS。</p><p>2. 选择“自定义提供商”。</p><p>3. 输入 DoH 服务地址。</p><p>4. 选择“Max Protection”提升增强隐私。</p>',
-                mH: '移动端解析说明', mD: '移动操作系统通常默认系统级 DoT 格式；若要使用此 DoH 服务器:',
-                mL: '<p><b>浏览器设置:</b> 直接在安卓或苹果手机的浏览器中配置最稳定。</p><p><b>应用设置:</b> 推荐使用 <b>Intra</b> 或 <b>RethinkDNS</b>，并将 DNS 类型切换为 DoH。</p>',
-                whyH: '为什么通常建议在浏览器配置?',
-                whyT: '<p>Windows 或安卓系统的 Private DNS 设置项通常需要 <b>DoT / 853 端口</b> 或主机名格式，而不一定接受完整 HTTPS URL。</p><p>本项目基于 <b>Port 443</b> 的 Worker 架构，因此浏览器端配置最符合实际运行方式。</p>',
-                curL: '简体中文'
-            }
-        };
+const I18N = ${serializeForScript(DASHBOARD_I18N)};
 const LANG_KEY = 'doc_v6';
 const $ = (id) => document.getElementById(id);
+// Own properties only: a stored value such as "constructor" must not resolve to an inherited member.
+const isLanguage = (code) => Object.prototype.hasOwnProperty.call(I18N, code);
+let activeLang = 'en';
 function getStoredLanguage() {
     let stored = 'en';
     try { stored = localStorage.getItem(LANG_KEY) || 'en'; } catch (_) {}
-    return I18N[stored] ? stored : 'en';
+    return isLanguage(stored) ? stored : 'en';
 }
 function setLangMenu(open) {
     $('langMenu').hidden = !open;
     $('langToggle').setAttribute('aria-expanded', String(open));
 }
 function changeLang(c) {
-    if (!I18N[c]) c = 'en';
+    if (!isLanguage(c)) c = 'en';
+    activeLang = c;
     try { localStorage.setItem(LANG_KEY, c); } catch (_) {}
     const l = I18N[c];
     document.documentElement.lang = c;
@@ -1380,9 +1395,9 @@ async function copyURL() {
         ok = document.execCommand('copy');
     }
     if (!ok) return;
-    $('txtCopy').innerText = I18N[getStoredLanguage()].copied;
+    $('txtCopy').innerText = I18N[activeLang].copied;
     clearTimeout(copyTimer);
-    copyTimer = setTimeout(() => { $('txtCopy').innerText = I18N[getStoredLanguage()].cpT; }, 2000);
+    copyTimer = setTimeout(() => { $('txtCopy').innerText = I18N[activeLang].cpT; }, 2000);
 }
 document.querySelectorAll('.tab-btn').forEach((btn) => {
     btn.addEventListener('click', () => tab(btn.dataset.tab, btn));
@@ -1438,6 +1453,9 @@ async function renderUI(origin) {
 }
 function buildUIHtml(origin) {
   const endpoint = `${escapeHtml(origin)}${CONFIG.DNS_PATH}`;
+  // The static markup is the English row of the language table, so the first paint matches the
+  // copy the script writes on load, and the English text exists in exactly one place.
+  const en = DASHBOARD_I18N.en;
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1450,69 +1468,49 @@ function buildUIHtml(origin) {
 <body>
     <div class="lang-switch">
         <button type="button" id="langToggle" class="glass lang-btn" aria-haspopup="true" aria-expanded="false">
-            🌐 <span id="currentLang">ENGLISH</span>
+            🌐 <span id="currentLang">${escapeHtml(en.curL)}</span>
         </button>
         <div id="langMenu" class="glass lang-menu" hidden>
-            <button type="button" class="lang-option" data-lang="en">ENGLISH</button>
-            <button type="button" class="lang-option" data-lang="fa" lang="fa">فارسی</button>
-            <button type="button" class="lang-option" data-lang="zh">简体中文</button>
+            ${Object.keys(DASHBOARD_I18N).map((lang) => `<button type="button" class="lang-option" data-lang="${lang}"${lang === 'fa' ? ' lang="fa"' : ''}>${escapeHtml(DASHBOARD_I18N[lang].curL)}</button>`).join('\n            ')}
         </div>
     </div>
     <div class="wrap">
         <header class="hero">
-            <h1 id="mainTitle">Secure DNS over HTTPS</h1>
-            <p id="subTag" class="tagline">Edge Resolve Network • Parallel DoH Resolution</p>
+            <h1 id="mainTitle">${escapeHtml(en.main)}</h1>
+            <p id="subTag" class="tagline">${escapeHtml(en.sub)}</p>
         </header>
         <section class="glass card">
             <div class="endpoint-field">
-                <span class="label" id="labelUrl">Endpoint URL</span>
+                <span class="label" id="labelUrl">${escapeHtml(en.urlL)}</span>
                 <input id="linkInp" value="${endpoint}" readonly class="endpoint-input">
             </div>
-            <button type="button" id="copyBtn" class="copy-btn"><span id="txtCopy">COPY ENDPOINT</span></button>
+            <button type="button" id="copyBtn" class="copy-btn"><span id="txtCopy">${escapeHtml(en.cpT)}</span></button>
         </section>
         <div class="tabs-wrap">
             <nav class="tabs" role="tablist">
-                <button type="button" id="btnC" class="tab-btn is-active" role="tab" aria-selected="true" aria-controls="chrome" data-tab="chrome">Chrome / Brave / Edge</button>
-                <button type="button" id="btnF" class="tab-btn" role="tab" aria-selected="false" aria-controls="firefox" data-tab="firefox">Firefox</button>
-                <button type="button" id="btnM" class="tab-btn" role="tab" aria-selected="false" aria-controls="mobile" data-tab="mobile">Android / iOS</button>
+                <button type="button" id="btnC" class="tab-btn is-active" role="tab" aria-selected="true" aria-controls="chrome" data-tab="chrome">${escapeHtml(en.tabC)}</button>
+                <button type="button" id="btnF" class="tab-btn" role="tab" aria-selected="false" aria-controls="firefox" data-tab="firefox">${escapeHtml(en.tabF)}</button>
+                <button type="button" id="btnM" class="tab-btn" role="tab" aria-selected="false" aria-controls="mobile" data-tab="mobile">${escapeHtml(en.tabM)}</button>
             </nav>
             <section class="panels">
                 <div id="chrome" class="glass panel" role="tabpanel" aria-labelledby="btnC">
-                    <h3 id="cH" class="panel-title t-cyan">Setup for Chromium Browsers</h3>
-                    <div id="cL" class="body-text stack">
-                        <p>1. Open Browser <b>Settings</b> and type "DNS" in the search box.</p>
-                        <p>2. Select <b>Security</b> &gt; Scroll to <b>Use Secure DNS</b>.</p>
-                        <p>3. Choose <b>"With Custom"</b> provider.</p>
-                        <p>4. Paste your DoH endpoint URL from the copy-box above.</p>
-                        <p>5. Test by visiting a DNS-restricted website.</p>
-                    </div>
+                    <h3 id="cH" class="panel-title t-cyan">${escapeHtml(en.cH)}</h3>
+                    <div id="cL" class="body-text stack">${en.cL}</div>
                 </div>
                 <div id="firefox" class="glass panel" role="tabpanel" aria-labelledby="btnF" hidden>
-                    <h3 id="fH" class="panel-title t-emerald">Setup for Firefox</h3>
-                    <div id="fL" class="body-text stack">
-                        <p>1. Open Firefox <code>Settings</code> and scroll down to <b>Network Settings</b>.</p>
-                        <p>2. Click <b>Settings...</b> and check <b>"Enable DNS over HTTPS"</b> at the bottom.</p>
-                        <p>3. Set provider to <b>Custom</b> and paste your unique URL.</p>
-                        <p>4. Select <b>"Max Protection"</b> for stronger browser-level DNS privacy.</p>
-                    </div>
+                    <h3 id="fH" class="panel-title t-emerald">${escapeHtml(en.fH)}</h3>
+                    <div id="fL" class="body-text stack">${en.fL}</div>
                 </div>
                 <div id="mobile" class="glass panel" role="tabpanel" aria-labelledby="btnM" hidden>
-                    <h3 id="mH" class="panel-title t-teal">Android / iOS Logic</h3>
-                    <p id="mD" class="panel-desc">This resolver is a DoH (HTTPS-based) service, which modern phones handle differently than system-wide settings.</p>
-                    <div id="mL" class="body-text stack">
-                        <p><b>A) For Mobile Browsers:</b> Open Browser settings (Chrome/Firefox/Edge) on your phone and follow the desktop steps. <b>This is the best and fastest way.</b></p>
-                        <p><b>B) For System-wide Apps:</b> We recommend using <b>RethinkDNS</b> or <b>Intra</b> apps. In these apps, set the DNS type to DoH and provide your unique DoH endpoint link.</p>
-                    </div>
+                    <h3 id="mH" class="panel-title t-teal">${escapeHtml(en.mH)}</h3>
+                    <p id="mD" class="panel-desc">${escapeHtml(en.mD)}</p>
+                    <div id="mL" class="body-text stack">${en.mL}</div>
                 </div>
             </section>
         </div>
         <div class="glass card-why">
-            <h4 class="why-title">⭐ <span id="whyH">Why ONLY Browser-level DoH? (Crucial Tip)</span></h4>
-            <div id="whyT" class="why-body stack">
-                <p>Most operating systems (Windows settings, Android "Private DNS", or Apple Profiles) natively expect <b>DNS-over-TLS (DoT)</b> which runs on Port 853. Since this worker is built on <code>https://</code> and Port 443, it is not directly usable in these native settings.</p>
-                <p><b>The Issue:</b> You <u>cannot</u> paste an <code>https://</code> link into many native DNS settings. It will usually result in an "Invalid Hostname" error. Systems there expect a hostname or DoT endpoint, not a full HTTPS resolver URL.</p>
-                <p><b>The Solution:</b> Browsers (Chrome, Edge, Firefox) have their own independent DoH clients. They are compatible with Port 443 workers and provide browser-level encrypted DNS. DoH is therefore best configured directly in the browser.</p>
-            </div>
+            <h4 class="why-title">⭐ <span id="whyH">${escapeHtml(en.whyH)}</span></h4>
+            <div id="whyT" class="why-body stack">${en.whyT}</div>
         </div>
         <footer class="footer">
             <div>
