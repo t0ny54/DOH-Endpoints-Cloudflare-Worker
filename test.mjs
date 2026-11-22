@@ -1001,3 +1001,56 @@ test('a NOERROR answer that also carries an SOA is capped by the SOA negative TT
   const withSoa = buildResponse(query, { answers: [aRecord('1.2.3.4', 300)], authority: [soaRecord(60, 30)] });
   assert.equal(cacheTTL(withSoa.buffer), 30);
 });
+
+// ---- 0.4.47: equivalence of the rewritten hot-path helpers, and the script-escaping round trip ----
+
+function seededBytes(seed, length) {
+  let x = seed >>> 0;
+  return Uint8Array.from({ length }, () => {
+    x = (Math.imul(x, 1664525) + 1013904223) >>> 0;
+    return x >>> 24;
+  });
+}
+
+test('localKeyFromNormalized is byte-for-byte the same key as String.fromCharCode.apply', () => {
+  for (const length of [0, 1, 7, 8, 9, 15, 16, 17, 40, 255, 1000, 4096]) {
+    const bytes = seededBytes(length + 1, length);
+    assert.equal(dns.localKeyFromNormalized(bytes), String.fromCharCode.apply(null, bytes), `length ${length}`);
+  }
+});
+
+test('edgeKeyFromNormalized is the first 128 bits of SHA-256 as lower-case hex', async () => {
+  const { createHash } = await import('node:crypto');
+  for (const length of [12, 33, 4096]) {
+    const bytes = seededBytes(7 * length + 3, length);
+    const expected = createHash('sha256').update(bytes).digest('hex').slice(0, 32);
+    assert.equal(await dns.edgeKeyFromNormalized(bytes), expected, `length ${length}`);
+  }
+});
+
+test('serializeForScript round-trips text that could close or open an inline script', () => {
+  const value = {
+    s: 'a</script><script>alert(1)</script>',
+    c: 'x<!--y-->z',
+    q: 'quote " and \' and \\ backslash',
+    u: 'emoji 🛡️ and فارسی and 中文'
+  };
+  const text = dns.serializeForScript(value);
+  assert.doesNotMatch(text, /<\//, 'no raw closing-tag sequence may reach the page');
+  assert.doesNotMatch(text, /<!--/, 'no raw script-comment opener may reach the page');
+  assert.deepEqual(JSON.parse(text), value);
+});
+
+test('the dashboard script still embeds the language table so that it parses back unchanged', async () => {
+  const { default: worker } = await import('./Worker.js');
+  const html = await (await worker.fetch(new Request('https://dns.example.test/'))).text();
+  const json = html.match(/^const I18N = (.*);$/m)[1];
+  assert.deepEqual(Object.keys(JSON.parse(json)), ['en', 'fa', 'zh']);
+});
+
+test('the URI record validator still requires its 4-byte fixed header and accepts a valid record', () => {
+  assert.equal(answerAccepted(256, [0, 1, 0, 2, ...Buffer.from('ftp://x')]), true);
+  assert.equal(answerAccepted(256, [0, 1]), false);
+  assert.equal(answerAccepted(43, [0x12, 0x34, 0x08, 0x02, 0xaa, 0xbb]), true);
+  assert.equal(answerAccepted(43, [0x12, 0x34, 0x08]), false);
+});

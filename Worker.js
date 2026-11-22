@@ -1,8 +1,12 @@
-const VERSION = '0.4.43';
+const VERSION = '0.4.47';
 const MAX_DNS_MESSAGE_BYTES = 4096;
 // Allowed methods per endpoint. The Allow header is derived from these lists, so it cannot drift.
 const DNS_METHODS = ['GET', 'POST'];
 const READ_METHODS = ['GET', 'HEAD'];
+// Response header sets shared by every route, so each header is written once.
+const NO_STORE = { 'cache-control': 'no-store' };
+const NOSNIFF = { 'x-content-type-options': 'nosniff' };
+const DNS_MEDIA_TYPE = 'application/dns-message';
 const CONFIG = {
   DNS_PATH: '/dns-query',
   EDGE_CACHE_ENABLED: true,
@@ -62,7 +66,7 @@ export default {
       if (methodError) return methodError;
       if (!(await allowDNSRequest(getClientIP(req), env))) {
         return textResponse('Rate limit exceeded', 429, {
-          'cache-control': 'no-store',
+          ...NO_STORE,
           'retry-after': String(Math.ceil(CONFIG.RATE_LIMIT_WINDOW_MS / 1000))
         });
       }
@@ -73,12 +77,12 @@ export default {
       if (methodError) return methodError;
       if (url.pathname === '/health') {
         return jsonResponse(getHealthSnapshot(), {
-          'cache-control': 'no-store'
+          ...NO_STORE
         });
       }
       return renderUI(url.origin);
     }
-    return textResponse('Not found', 404, { 'cache-control': 'no-store' });
+    return textResponse('Not found', 404, NO_STORE);
   }
 };
 async function handleDNS(req, url, ctx) {
@@ -89,12 +93,12 @@ async function handleDNS(req, url, ctx) {
     // Only deliberate httpError() messages are client-safe; anything else (for example a
     // body-stream failure) must not leak internal error text.
     return textResponse(err?.status ? err.message : 'Invalid DNS query', err?.status || 400, {
-      'cache-control': 'no-store'
+      ...NO_STORE
     });
   }
   const parsed = parseDNSQuestion(payload);
   if (!parsed.ok) {
-    return textResponse(parsed.error, 400, { 'cache-control': 'no-store' });
+    return textResponse(parsed.error, 400, NO_STORE);
   }
   // L1 and in-flight state use the exact normalized query bytes (no hash on the hot path, and
   // distinct questions can never share an entry). The L2 Cache API key is derived from the same
@@ -135,7 +139,7 @@ async function handleDNS(req, url, ctx) {
   }
   if (APP_STATE.inflight.size >= CONFIG.MAX_INFLIGHT_ENTRIES) {
     return textResponse('Resolver busy, please retry', 503, {
-      'cache-control': 'no-store',
+      ...NO_STORE,
       'retry-after': '1'
     });
   }
@@ -196,8 +200,12 @@ function winnerHeaders(result, headers) {
   if (result.degraded) headers['x-dns-degraded'] = '1';
   return headers;
 }
+// Whole seconds since storedAt. A backwards clock step gives 0, never a negative age.
+function ageSecondsSince(storedAt) {
+  return Math.max(0, Math.floor((Date.now() - storedAt) / 1000));
+}
 function l1HitResponse(hit, parsed, queryBytes) {
-  const ageSeconds = Math.max(0, Math.floor((Date.now() - hit.storedAt) / 1000));
+  const ageSeconds = ageSecondsSince(hit.storedAt);
   return dnsResponse(patchDNSResponseForAge(hit.body, parsed.id, ageSeconds, queryBytes), {
     'x-cache': 'L1-HIT',
     'x-edge-cache': 'SKIP',
@@ -214,12 +222,12 @@ async function joinInflight(job, parsed, queryBytes) {
 }
 function upstreamFailureResponse(err) {
   return textResponse('Global resolving failed', 502, {
-    'cache-control': 'no-store',
+    ...NO_STORE,
     'x-upstreams': String(err?.attempts ?? RESOLVER_NODES.length)
   });
 }
 function coalescedDNSResponse(shared, parsed, queryBytes) {
-  const ageSeconds = Math.max(0, Math.floor((Date.now() - shared.storedAt) / 1000));
+  const ageSeconds = ageSecondsSince(shared.storedAt);
   const responseBody = patchDNSResponseForAge(shared.body, parsed.id, ageSeconds, queryBytes);
   return dnsResponse(responseBody, winnerHeaders(shared, {
     'x-cache': 'COALESCED',
@@ -232,7 +240,7 @@ function validateMethod(method, allowed) {
   if (allowed.includes(method)) return null;
   return textResponse('Method not allowed', 405, {
     allow: allowed.join(', '),
-    'cache-control': 'no-store'
+    ...NO_STORE
   });
 }
 async function readDNSPayload(req, url) {
@@ -303,20 +311,17 @@ async function readCappedBody(source, maxBytes, makeTooLarge) {
 // Callers cap the input at CONFIG.MAX_GET_DNS_CHARS first, which bounds the decoded length at
 // MAX_DNS_MESSAGE_BYTES, so no separate size check is needed here.
 function decodeBase64Url(input) {
-  if (!input || !/^[A-Za-z0-9_-]+$/.test(input)) {
+  if (!/^[A-Za-z0-9_-]+$/.test(input)) {
     throw httpError('Invalid base64url DNS query', 400);
   }
   let normalized = input.replace(/-/g, '+').replace(/_/g, '/');
   normalized += '='.repeat((4 - (normalized.length % 4)) % 4);
-  let decoded;
   try {
-    decoded = atob(normalized);
+    // atob() returns a binary string whose char codes are the byte values.
+    return Uint8Array.from(atob(normalized), (ch) => ch.charCodeAt(0));
   } catch (_) {
     throw httpError('Invalid base64url DNS query', 400);
   }
-  const bytes = new Uint8Array(decoded.length);
-  for (let i = 0; i < decoded.length; i++) bytes[i] = decoded.charCodeAt(i);
-  return bytes;
 }
 function parseDNSQuestion(bytes) {
   if (bytes.byteLength < 12) {
@@ -446,8 +451,8 @@ async function relay(node, packet, expectedID, signal) {
     const res = await fetch(node.url, {
       method: 'POST',
       headers: {
-        accept: 'application/dns-message',
-        'content-type': 'application/dns-message'
+        accept: DNS_MEDIA_TYPE,
+        'content-type': DNS_MEDIA_TYPE
       },
       body: packet,
       signal: combinedSignal
@@ -456,8 +461,7 @@ async function relay(node, packet, expectedID, signal) {
       discardBody(res);
       throw upstreamError(`Upstream HTTP ${res.status}`, 'http');
     }
-    const contentType = res.headers.get('content-type') || '';
-    if (!isDNSMessageContentType(contentType)) {
+    if (!isDNSMessageContentType(res.headers.get('content-type'))) {
       discardBody(res);
       throw upstreamError('Upstream returned an invalid content type', 'content-type');
     }
@@ -517,7 +521,7 @@ function discardBody(res) {
   res.body?.cancel().catch(() => {});
 }
 function isDNSMessageContentType(value) {
-  return String(value || '').split(';', 1)[0].trim().toLowerCase() === 'application/dns-message';
+  return String(value || '').split(';', 1)[0].trim().toLowerCase() === DNS_MEDIA_TYPE;
 }
 // Single-pass DNS response validation and cache-TTL computation. Strict mode is entered when
 // either expectedID or queryBytes is given. A non-null expectedID pins the transaction ID, and
@@ -676,7 +680,7 @@ function questionMatchesQuery(responseBytes, responseNameEnd, queryBytes) {
   }
   return true;
 }
-// AbortSignal.any is native in Workers and in Node >= 20.3 (see package.json engines).
+// AbortSignal.any is native in Workers and in Node >= 20.3; this project requires Node >= 22 (see package.json engines).
 function combineSignals(signal, timeoutSignal) {
   if (!signal) return timeoutSignal;
   return AbortSignal.any([signal, timeoutSignal]);
@@ -724,15 +728,28 @@ function normalizeQueryForKey(packet) {
 // Exact key for the isolate-local maps (L1 cache and in-flight jobs): the normalized bytes
 // themselves. Two different questions can never collide, and no async digest is needed.
 function localKeyFromNormalized(normalized) {
-  return String.fromCharCode.apply(null, normalized);
+  // Chunked: one fromCharCode call per 8 bytes, with no argument list as long as the message.
+  // The result equals String.fromCharCode.apply(null, normalized) for every input.
+  let key = '';
+  let i = 0;
+  const bulkEnd = normalized.length - (normalized.length % 8);
+  for (; i < bulkEnd; i += 8) {
+    key += String.fromCharCode(
+      normalized[i], normalized[i + 1], normalized[i + 2], normalized[i + 3],
+      normalized[i + 4], normalized[i + 5], normalized[i + 6], normalized[i + 7]
+    );
+  }
+  for (; i < normalized.length; i++) key += String.fromCharCode(normalized[i]);
+  return key;
 }
+const HEX_BYTE = Array.from({ length: 256 }, (_, n) => n.toString(16).padStart(2, '0'));
 // Key for the data-center-local L2 Cache API entry: the first 128 bits of SHA-256 over the
 // normalized bytes, rendered as 32 hex characters.
 async function edgeKeyFromNormalized(normalized) {
   const digest = await crypto.subtle.digest('SHA-256', normalized);
   const view = new Uint8Array(digest, 0, 16);
   let out = '';
-  for (let i = 0; i < view.length; i++) out += view[i].toString(16).padStart(2, '0');
+  for (let i = 0; i < 16; i++) out += HEX_BYTE[view[i]];
   return out;
 }
 function getCache(key) {
@@ -832,7 +849,8 @@ function validateRData(bytes, type, rrClass, rdataOffset, rdEnd, context) {
     const end = readName(signerStart);
     return end >= 0 && end < rdEnd;
   }
-  if (type === 25 || type === 43 || type === 48) {
+  // KEY (25), DS (43), DNSKEY (48) and URI (256) all need at least their 4-byte fixed header.
+  if (type === 25 || type === 43 || type === 48 || type === 256) {
     return rdEnd - rdataOffset >= 4;
   }
   if (type === 47) {
@@ -880,9 +898,6 @@ function validateRData(bytes, type, rrClass, rdataOffset, rdEnd, context) {
   }
   if (type === 52 || type === 53) {
     return rdEnd - rdataOffset >= 3;
-  }
-  if (type === 256) {
-    return rdEnd - rdataOffset >= 4;
   }
   return true;
 }
@@ -1027,7 +1042,7 @@ async function putEdgeCache(key, body, ttlSeconds, storedAt, origin) {
     const response = new Response(body, {
       status: 200,
       headers: {
-        'content-type': 'application/dns-message',
+        'content-type': DNS_MEDIA_TYPE,
         'cache-control': `public, s-maxage=${ttlSeconds}`,
         'x-doh-stored-at': String(storedAt),
         'x-doh-ttl': String(ttlSeconds)
@@ -1141,9 +1156,9 @@ function dnsResponse(body, extraHeaders = {}) {
   return new Response(body, {
     status: 200,
     headers: {
-      'content-type': 'application/dns-message',
-      'cache-control': 'no-store',
-      'x-content-type-options': 'nosniff',
+      'content-type': DNS_MEDIA_TYPE,
+      ...NO_STORE,
+      ...NOSNIFF,
       ...extraHeaders
     }
   });
@@ -1153,7 +1168,7 @@ function textResponse(text, status, headers = {}) {
     status,
     headers: {
       'content-type': 'text/plain; charset=utf-8',
-      'x-content-type-options': 'nosniff',
+      ...NOSNIFF,
       ...headers
     }
   });
@@ -1163,7 +1178,7 @@ function jsonResponse(data, headers = {}) {
     status: 200,
     headers: {
       'content-type': 'application/json; charset=utf-8',
-      'x-content-type-options': 'nosniff',
+      ...NOSNIFF,
       ...headers
     }
   });
@@ -1198,6 +1213,7 @@ export const __internals = {
   normalizeQueryForKey,
   localKeyFromNormalized,
   edgeKeyFromNormalized,
+  serializeForScript,
   patchDNSResponseForAge,
   localRateLimit,
   rateLimitKey,
@@ -1214,7 +1230,7 @@ const UI_RESPONSE_CACHE_MAX_ENTRIES = 16;
 const UI_STATIC_HEADERS = {
   'content-type': 'text/html; charset=utf-8',
   'cache-control': 'public, max-age=300',
-  'x-content-type-options': 'nosniff',
+  ...NOSNIFF,
   'referrer-policy': 'no-referrer'
 };
 // The dashboard is fully self-contained: its only script and style are the inline blocks below.
@@ -1481,7 +1497,7 @@ function buildUIHtml(origin) {
         </header>
         <section class="glass card">
             <div class="endpoint-field">
-                <span class="label" id="labelUrl">${escapeHtml(en.urlL)}</span>
+                <label class="label" id="labelUrl" for="linkInp">${escapeHtml(en.urlL)}</label>
                 <input id="linkInp" value="${endpoint}" readonly class="endpoint-input">
             </div>
             <button type="button" id="copyBtn" class="copy-btn"><span id="txtCopy">${escapeHtml(en.cpT)}</span></button>

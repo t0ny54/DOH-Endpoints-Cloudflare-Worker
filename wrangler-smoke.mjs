@@ -20,7 +20,7 @@ if (!existsSync(wrangler)) {
 }
 // Refuse to run against a server this script did not start. If the port already answers, the
 // probes below would test that other process and could pass without Wrangler ever running.
-const portInUse = await fetch(`${BASE}/health`).then(() => true, () => false);
+const portInUse = await fetch(`${BASE}/health`, { signal: AbortSignal.timeout(2_000) }).then(() => true, () => false);
 if (portInUse) {
   console.error(`Port ${PORT} is already serving HTTP. Stop that process or set WRANGLER_SMOKE_PORT.`);
   process.exit(1);
@@ -51,7 +51,7 @@ async function waitForServer(timeoutMs = 20_000) {
   while (Date.now() < deadline) {
     if (earlyExit) throw new Error(`${earlyExit}\n${logs}`);
     try {
-      const res = await fetch(`${BASE}/health`);
+      const res = await fetch(`${BASE}/health`, { signal: AbortSignal.timeout(2_000) });
       if (res.ok) return res;
       lastError = new Error(`health returned ${res.status}`);
     } catch (err) {
@@ -86,18 +86,20 @@ try {
   assert.equal(health.version, PKG_VERSION);
   assert.equal(health.maxSimultaneousUpstreams, 3);
   assert.equal(health.upstreamStrategy, 'parallel-race');
-  const root = await fetch(`${BASE}/`);
+  const root = await fetch(`${BASE}/`, { signal: AbortSignal.timeout(5_000) });
   assert.equal(root.status, 200);
   assert.match(root.headers.get('content-type') || '', /^text\/html/i);
   // Served over plain HTTP by wrangler dev: the advertised endpoint must use the same scheme.
   assert.ok((await root.text()).includes(`value="${BASE}/dns-query"`), 'dashboard endpoint must match the served origin');
   const badDNS = await fetch(`${BASE}/dns-query?dns=not_base64!`, {
-    headers: { 'CF-Connecting-IP': 'wrangler-smoke' }
+    headers: { 'CF-Connecting-IP': 'wrangler-smoke' },
+    signal: AbortSignal.timeout(5_000)
   });
   assert.equal(badDNS.status, 400);
   const wrongMethod = await fetch(`${BASE}/dns-query`, {
     method: 'PUT',
-    headers: { 'CF-Connecting-IP': 'wrangler-smoke-2' }
+    headers: { 'CF-Connecting-IP': 'wrangler-smoke-2' },
+    signal: AbortSignal.timeout(5_000)
   });
   assert.equal(wrongMethod.status, 405);
   console.log('WRANGLER DEV SMOKE TEST: PASS');
