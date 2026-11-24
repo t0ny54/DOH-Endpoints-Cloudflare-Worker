@@ -90,7 +90,8 @@ let r = await worker.fetch(req('/')); assert.equal(r.status,200); const rootHtml
 assert.match(rootHtml, /id="linkInp" value="https:\/\/dns\.example\.test\/dns-query"/);
 // Plain-HTTP origins (wrangler dev) must advertise http, not a broken https URL.
 assert.match(await (await worker.fetch(new Request('http://127.0.0.1:8797/'))).text(), /id="linkInp" value="http:\/\/127\.0\.0\.1:8797\/dns-query"/);
-r = await worker.fetch(req('/health')); assert.equal(r.status,200); assert.equal((await r.json()).version,PKG_VERSION);
+r = await worker.fetch(req('/health')); assert.equal(r.status,200); const healthBody = await r.json(); assert.equal(healthBody.version,PKG_VERSION);
+assert.equal(typeof healthBody.cacheBytes,'number'); assert.ok(healthBody.cacheBytes<=healthBody.cache.localMaxBytes);
 r = await worker.fetch(req('/missing')); assert.equal(r.status,404);
 // Read-only endpoints reject every method except GET and HEAD, and advertise the allowed set.
 for (const [path, method] of [['/health','POST'],['/','PUT'],['/index.html','DELETE']]) {
@@ -271,6 +272,10 @@ r=await worker.fetch(req('/dns-query',{method:'POST',headers:{'CF-Connecting-IP'
 assert.equal(r.status,413);
 r=await worker.fetch(req('/dns-query',{method:'POST',headers:{'CF-Connecting-IP':'client-empty','content-type':'application/dns-message'}}),rateOK);
 assert.equal(r.status,400); assert.equal(upstreamCalls,0);
+// A message shorter than the DNS header is refused before any cache lookup or upstream work.
+upstreamCalls=0;
+r=await worker.fetch(req('/dns-query',{method:'POST',headers:{'CF-Connecting-IP':'short-packet','content-type':'application/dns-message'},body:new Uint8Array(11)}),rateOK);
+assert.equal(r.status,400); assert.equal(await r.text(),'DNS message too short'); assert.equal(upstreamCalls,0);
 const malformedL2Q=query(0x778a,'malformed-l2.example');
 const malformedL2Key=await edgeKey(malformedL2Q);
 cacheStore.set(`https://dns.example.test/__doh-cache/v1/${malformedL2Key}`, new Response(answerFor(malformedL2Q,'8.8.4.4',60),{status:200,headers:{'content-type':'application/dns-message'}}));
@@ -431,6 +436,26 @@ assert.equal(r.status,200);
 for(let waited=0; cacheStore.size===0 && waited<200; waited+=5) await new Promise(resolve=>setTimeout(resolve,5));
 assert.equal(cacheStore.size,1);
 dns.APP_STATE.cache.clear(); cacheStore.clear();
+// The L1 lookup runs before the full parse. A response packet or a truncated copy of a cached
+// question must still be rejected, while the same question with a different ID and letter case hits.
+{
+  dns.APP_STATE.cache.clear(); cacheStore.clear(); mode='ok'; upstreamCalls=0;
+  const cachedQ=query(0x7795,'fast-path.example');
+  const warmCtx={jobs:[],waitUntil(p){this.jobs.push(p);}};
+  r=await worker.fetch(req('/dns-query',{method:'POST',headers:{'CF-Connecting-IP':'fast-path-warm','content-type':'application/dns-message'},body:cachedQ}),rateOK,warmCtx);
+  await Promise.all(warmCtx.jobs); assert.equal(r.status,200);
+  const responsePacket=Uint8Array.from(cachedQ); responsePacket[2]|=0x80;
+  r=await worker.fetch(req('/dns-query',{method:'POST',headers:{'CF-Connecting-IP':'fast-path-response','content-type':'application/dns-message'},body:responsePacket}),rateOK);
+  assert.equal(r.status,400); assert.equal(await r.text(),'DNS query expected, got response');
+  const truncatedPacket=cachedQ.slice(0,cachedQ.length-2);
+  r=await worker.fetch(req('/dns-query',{method:'POST',headers:{'CF-Connecting-IP':'fast-path-truncated','content-type':'application/dns-message'},body:truncatedPacket}),rateOK);
+  assert.equal(r.status,400); assert.equal(await r.text(),'Incomplete DNS question');
+  const callsBefore=upstreamCalls;
+  r=await worker.fetch(req('/dns-query',{method:'POST',headers:{'CF-Connecting-IP':'fast-path-case','content-type':'application/dns-message'},body:query(0x7796,'FAST-PATH.example')}),rateOK);
+  assert.equal(r.status,200); assert.equal(r.headers.get('x-cache'),'L1-HIT'); assert.equal(upstreamCalls,callsBefore);
+  out=new Uint8Array(await r.arrayBuffer()); assert.equal((out[0]<<8)|out[1],0x7796);
+  dns.APP_STATE.cache.clear(); cacheStore.clear();
+}
 // ---- Dashboard: self-contained, hash-pinned CSP, and every element the script reaches exists ----
 {
   const page = await worker.fetch(req('/'));

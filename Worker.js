@@ -1,5 +1,7 @@
-const VERSION = '0.4.47';
+const VERSION = '0.4.49';
 const MAX_DNS_MESSAGE_BYTES = 4096;
+const DNS_HEADER_BYTES = 12;
+const DNS_TOO_SHORT = 'DNS message too short';
 // Allowed methods per endpoint. The Allow header is derived from these lists, so it cannot drift.
 const DNS_METHODS = ['GET', 'POST'];
 const READ_METHODS = ['GET', 'HEAD'];
@@ -15,6 +17,8 @@ const CONFIG = {
   EDGE_CACHE_MAX_TTL_SECONDS: 86_400,
   EDGE_CACHE_MIN_TTL_SECONDS: 1,
   MAX_CACHE_ENTRIES: 512,
+  // Total response bytes the L1 cache may hold. Entry count alone allowed 512 x 64 KiB (about 32 MiB).
+  MAX_CACHE_BYTES: 8_388_608,
   MAX_INFLIGHT_ENTRIES: 128,
   RATE_LIMIT_WINDOW_MS: 60_000,
   RATE_LIMIT_MAX_REQUESTS: 100,
@@ -52,6 +56,7 @@ const RESOLVER_NODES = DOH_UPSTREAMS.map((url) => ({
 }));
 const APP_STATE = {
   cache: new Map(),
+  cacheBytes: 0,
   throttle: new Map(),
   inflight: new Map(),
   lastSweepAt: 0
@@ -90,23 +95,29 @@ async function handleDNS(req, url, ctx) {
   try {
     payload = await readDNSPayload(req, url);
   } catch (err) {
-    // Only deliberate httpError() messages are client-safe; anything else (for example a
+    // Only deliberate messages carrying an HTTP status (taggedError with { status }) are client-safe; anything else (for example a
     // body-stream failure) must not leak internal error text.
     return textResponse(err?.status ? err.message : 'Invalid DNS query', err?.status || 400, {
       ...NO_STORE
     });
   }
+  // L1 and in-flight state use the exact normalized query bytes (no hash on the hot path, and
+  // distinct questions can never share an entry). The L2 Cache API key is derived from the same
+  // normalized buffer, so the query is normalized once per request.
+  // A key is only ever stored for a packet that passed parseDNSQuestion(). Normalization keeps
+  // the flags, counts and structure and changes only the ID and ASCII letter case, so a malformed
+  // or response packet can never produce the same key. A hit therefore needs no full parse.
+  // Shorter than the header: no valid query can match, so skip key derivation and cache lookups.
+  if (payload.byteLength < DNS_HEADER_BYTES) return textResponse(DNS_TOO_SHORT, 400, NO_STORE);
+  const normalized = normalizeQueryForKey(payload);
+  const localKey = localKeyFromNormalized(normalized);
+  const id = (payload[0] << 8) | payload[1];
+  const local = serveLocal(localKey, id, payload);
+  if (local) return local;
   const parsed = parseDNSQuestion(payload);
   if (!parsed.ok) {
     return textResponse(parsed.error, 400, NO_STORE);
   }
-  // L1 and in-flight state use the exact normalized query bytes (no hash on the hot path, and
-  // distinct questions can never share an entry). The L2 Cache API key is derived from the same
-  // normalized buffer, so the query is normalized once per request.
-  const normalized = normalizeQueryForKey(payload);
-  const localKey = localKeyFromNormalized(normalized);
-  const local = serveLocal(localKey, parsed, payload);
-  if (local) return local;
   let edgeKey = null;
   if (CONFIG.EDGE_CACHE_ENABLED) {
     edgeKey = await edgeKeyFromNormalized(normalized);
@@ -134,7 +145,7 @@ async function handleDNS(req, url, ctx) {
     }
     // The L2 lookup above is asynchronous: another request may have finished (L1 filled,
     // in-flight entry removed) or started a lookup in the meantime.
-    const raced = serveLocal(localKey, parsed, payload);
+    const raced = serveLocal(localKey, id, payload);
     if (raced) return raced;
   }
   if (APP_STATE.inflight.size >= CONFIG.MAX_INFLIGHT_ENTRIES) {
@@ -188,11 +199,11 @@ async function handleDNS(req, url, ctx) {
     if (APP_STATE.inflight.get(localKey) === job) APP_STATE.inflight.delete(localKey);
   }
 }
-function serveLocal(key, parsed, queryBytes) {
+function serveLocal(key, id, queryBytes) {
   const hit = getCache(key);
-  if (hit) return l1HitResponse(hit, parsed, queryBytes);
+  if (hit) return l1HitResponse(hit, id, queryBytes);
   const job = APP_STATE.inflight.get(key);
-  return job ? joinInflight(job, parsed, queryBytes) : null;
+  return job ? joinInflight(job, id, queryBytes) : null;
 }
 function winnerHeaders(result, headers) {
   headers['x-winner'] = sanitizeHeaderValue(result.url);
@@ -204,18 +215,18 @@ function winnerHeaders(result, headers) {
 function ageSecondsSince(storedAt) {
   return Math.max(0, Math.floor((Date.now() - storedAt) / 1000));
 }
-function l1HitResponse(hit, parsed, queryBytes) {
+function l1HitResponse(hit, id, queryBytes) {
   const ageSeconds = ageSecondsSince(hit.storedAt);
-  return dnsResponse(patchDNSResponseForAge(hit.body, parsed.id, ageSeconds, queryBytes), {
+  return dnsResponse(patchDNSResponseForAge(hit.body, id, ageSeconds, queryBytes), {
     'x-cache': 'L1-HIT',
     'x-edge-cache': 'SKIP',
     'x-upstreams': '0'
   });
 }
-async function joinInflight(job, parsed, queryBytes) {
+async function joinInflight(job, id, queryBytes) {
   try {
     const shared = await job;
-    return coalescedDNSResponse(shared, parsed, queryBytes);
+    return coalescedDNSResponse(shared, id, queryBytes);
   } catch (err) {
     return upstreamFailureResponse(err);
   }
@@ -226,9 +237,9 @@ function upstreamFailureResponse(err) {
     'x-upstreams': String(err?.attempts ?? RESOLVER_NODES.length)
   });
 }
-function coalescedDNSResponse(shared, parsed, queryBytes) {
+function coalescedDNSResponse(shared, id, queryBytes) {
   const ageSeconds = ageSecondsSince(shared.storedAt);
-  const responseBody = patchDNSResponseForAge(shared.body, parsed.id, ageSeconds, queryBytes);
+  const responseBody = patchDNSResponseForAge(shared.body, id, ageSeconds, queryBytes);
   return dnsResponse(responseBody, winnerHeaders(shared, {
     'x-cache': 'COALESCED',
     'x-edge-cache': 'SKIP',
@@ -246,26 +257,26 @@ function validateMethod(method, allowed) {
 async function readDNSPayload(req, url) {
   if (req.method === 'GET') {
     const q = url.searchParams.get('dns');
-    if (!q) throw httpError('Missing dns query parameter', 400);
+    if (!q) throw taggedError('Missing dns query parameter', { status: 400 });
     if (q.length > CONFIG.MAX_GET_DNS_CHARS) {
-      throw httpError('DNS query too large', 413);
+      throw taggedError('DNS query too large', { status: 413 });
     }
     return decodeBase64Url(q);
   }
   if (!isDNSMessageContentType(req.headers.get('content-type'))) {
-    throw httpError('POST requires content-type: application/dns-message', 415);
+    throw taggedError('POST requires content-type: application/dns-message', { status: 415 });
   }
   const contentLength = req.headers.get('content-length');
   if (contentLength !== null) {
     const n = Number(contentLength);
     if (Number.isFinite(n) && n > CONFIG.MAX_DNS_MESSAGE_BYTES) {
-      throw httpError('DNS message too large', 413);
+      throw taggedError('DNS message too large', { status: 413 });
     }
   }
   return readCappedBody(
     req,
     CONFIG.MAX_DNS_MESSAGE_BYTES,
-    () => httpError('DNS message too large', 413)
+    () => taggedError('DNS message too large', { status: 413 })
   );
 }
 // makeTooLarge() supplies the error to throw when the body exceeds maxBytes, so each caller
@@ -312,7 +323,7 @@ async function readCappedBody(source, maxBytes, makeTooLarge) {
 // MAX_DNS_MESSAGE_BYTES, so no separate size check is needed here.
 function decodeBase64Url(input) {
   if (!/^[A-Za-z0-9_-]+$/.test(input)) {
-    throw httpError('Invalid base64url DNS query', 400);
+    throw taggedError('Invalid base64url DNS query', { status: 400 });
   }
   let normalized = input.replace(/-/g, '+').replace(/_/g, '/');
   normalized += '='.repeat((4 - (normalized.length % 4)) % 4);
@@ -320,12 +331,12 @@ function decodeBase64Url(input) {
     // atob() returns a binary string whose char codes are the byte values.
     return Uint8Array.from(atob(normalized), (ch) => ch.charCodeAt(0));
   } catch (_) {
-    throw httpError('Invalid base64url DNS query', 400);
+    throw taggedError('Invalid base64url DNS query', { status: 400 });
   }
 }
 function parseDNSQuestion(bytes) {
-  if (bytes.byteLength < 12) {
-    return { ok: false, error: 'DNS message too short' };
+  if (bytes.byteLength < DNS_HEADER_BYTES) {
+    return { ok: false, error: DNS_TOO_SHORT };
   }
   const id = (bytes[0] << 8) | bytes[1];
   const flags = (bytes[2] << 8) | bytes[3];
@@ -439,9 +450,6 @@ function isBetterDegraded(value, node, bestValue, bestNode) {
 function abortAttempts(controllers, active) {
   for (const node of active.keys()) controllers.get(node)?.abort('winner-selected');
 }
-function upstreamError(message, kind) {
-  return taggedError(message, { kind });
-}
 async function relay(node, packet, expectedID, signal) {
   const started = Date.now();
   const timeoutController = new AbortController();
@@ -459,11 +467,11 @@ async function relay(node, packet, expectedID, signal) {
     });
     if (!res.ok) {
       discardBody(res);
-      throw upstreamError(`Upstream HTTP ${res.status}`, 'http');
+      throw taggedError(`Upstream HTTP ${res.status}`, { kind: 'http' });
     }
     if (!isDNSMessageContentType(res.headers.get('content-type'))) {
       discardBody(res);
-      throw upstreamError('Upstream returned an invalid content type', 'content-type');
+      throw taggedError('Upstream returned an invalid content type', { kind: 'content-type' });
     }
     const declaredLength = Number(res.headers.get('content-length'));
     if (
@@ -471,17 +479,17 @@ async function relay(node, packet, expectedID, signal) {
       && declaredLength > CONFIG.MAX_UPSTREAM_DNS_MESSAGE_BYTES
     ) {
       discardBody(res);
-      throw upstreamError('Upstream DNS response too large', 'response-too-large');
+      throw taggedError('Upstream DNS response too large', { kind: 'response-too-large' });
     }
     const bodyBytes = await readCappedBody(
       res,
       CONFIG.MAX_UPSTREAM_DNS_MESSAGE_BYTES,
-      () => upstreamError('Upstream DNS response too large', 'response-too-large')
+      () => taggedError('Upstream DNS response too large', { kind: 'response-too-large' })
     );
     const body = bodyBytes.buffer;
     const validation = validateDNSResponse(body, expectedID, packet);
     if (!validation.ok) {
-      throw upstreamError(validation.error, 'dns-invalid');
+      throw taggedError(validation.error, { kind: 'dns-invalid' });
     }
     const latencyMs = Date.now() - started;
     const rcode = validation.rcode;
@@ -756,7 +764,7 @@ function getCache(key) {
   const item = APP_STATE.cache.get(key);
   if (!item) return null;
   if (Date.now() >= item.expiresAt) {
-    APP_STATE.cache.delete(key);
+    removeCacheEntry(key);
     return null;
   }
   APP_STATE.cache.delete(key);
@@ -765,13 +773,35 @@ function getCache(key) {
 }
 function setCache(key, body, ttlSeconds, storedAt = Date.now(), expiresAtMs = null) {
   const ttl = Math.max(1, Math.floor(ttlSeconds));
-  APP_STATE.cache.delete(key);
+  const bytes = body.byteLength;
+  removeCacheEntry(key);
+  // An answer larger than the whole byte budget is never admitted, so it cannot flush every other entry.
+  if (bytes > CONFIG.MAX_CACHE_BYTES) return;
   APP_STATE.cache.set(key, {
     body,
+    bytes,
     storedAt,
     expiresAt: expiresAtMs ?? storedAt + ttl * 1000
   });
-  trimMap(APP_STATE.cache, CONFIG.MAX_CACHE_ENTRIES);
+  APP_STATE.cacheBytes += bytes;
+  trimCache();
+}
+// Removes one L1 entry and releases its bytes from the budget. Missing keys are a no-op.
+function removeCacheEntry(key) {
+  const item = APP_STATE.cache.get(key);
+  if (!item) return;
+  APP_STATE.cache.delete(key);
+  APP_STATE.cacheBytes -= item.bytes ?? 0;
+}
+// Evicts least-recently-used entries until both the entry count and the byte budget are within limits.
+function trimCache() {
+  while (APP_STATE.cache.size > CONFIG.MAX_CACHE_ENTRIES || APP_STATE.cacheBytes > CONFIG.MAX_CACHE_BYTES) {
+    if (APP_STATE.cache.size === 0) {
+      APP_STATE.cacheBytes = 0; // self-heal if an external write left the counter stale
+      break;
+    }
+    removeCacheEntry(APP_STATE.cache.keys().next().value);
+  }
 }
 function cappedTTL(ttlSeconds, maxSeconds) {
   if (!Number.isFinite(ttlSeconds)) return 0;
@@ -1022,7 +1052,7 @@ async function getEdgeCache(key, queryID, origin, queryBytes) {
     const analysis = validateDNSResponse(body, 0, queryBytes);
     if (!analysis.ok) return null;
     if (analysis.cacheTTL <= 0 || ttlSeconds > analysis.cacheTTL) return null;
-    const ageSeconds = Math.floor((now - storedAt) / 1000);
+    const ageSeconds = ageSecondsSince(storedAt);
     if (ageSeconds >= ttlSeconds) return null;
     return {
       body,
@@ -1057,7 +1087,7 @@ function maybeSweepState() {
   const now = Date.now();
   if (now - APP_STATE.lastSweepAt < CONFIG.STATE_SWEEP_INTERVAL_MS) return;
   for (const [key, item] of APP_STATE.cache) {
-    if (now >= item.expiresAt) APP_STATE.cache.delete(key);
+    if (now >= item.expiresAt) removeCacheEntry(key);
   }
   for (const [ip, stats] of APP_STATE.throttle) {
     if (now >= stats.resetAt) APP_STATE.throttle.delete(ip);
@@ -1132,6 +1162,7 @@ function getHealthSnapshot() {
       lastErrorKind: node.lastErrorKind
     })),
     cacheEntries: APP_STATE.cache.size,
+    cacheBytes: APP_STATE.cacheBytes,
     inflightEntries: APP_STATE.inflight.size,
     throttleEntries: APP_STATE.throttle.size,
     rateLimit: {
@@ -1147,6 +1178,8 @@ function getHealthSnapshot() {
     cache: {
       l1: 'in-memory LRU',
       l2: CONFIG.EDGE_CACHE_ENABLED ? 'Cloudflare Cache API (data-center-local)' : 'disabled',
+      localMaxEntries: CONFIG.MAX_CACHE_ENTRIES,
+      localMaxBytes: CONFIG.MAX_CACHE_BYTES,
       localMaxTTLSeconds: CONFIG.LOCAL_CACHE_MAX_TTL_SECONDS,
       edgeMaxTTLSeconds: CONFIG.EDGE_CACHE_MAX_TTL_SECONDS
     }
@@ -1182,9 +1215,6 @@ function jsonResponse(data, headers = {}) {
       ...headers
     }
   });
-}
-function httpError(message, status) {
-  return taggedError(message, { status });
 }
 function taggedError(message, props) {
   return Object.assign(new Error(message), props);

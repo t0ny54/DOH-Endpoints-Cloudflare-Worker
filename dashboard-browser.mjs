@@ -17,24 +17,37 @@ try {
 const { default: worker } = await import('./Worker.js');
 
 const server = http.createServer(async (req, res) => {
-  const chunks = [];
-  for await (const chunk of req) chunks.push(chunk);
-  const origin = `http://127.0.0.1:${server.address().port}`;
-  const response = await worker.fetch(new Request(origin + req.url, {
-    method: req.method,
-    headers: req.headers,
-    body: chunks.length ? Buffer.concat(chunks) : undefined
-  }));
-  res.writeHead(response.status, Object.fromEntries(response.headers));
-  res.end(Buffer.from(await response.arrayBuffer()));
+  try {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    const origin = `http://127.0.0.1:${server.address().port}`;
+    const response = await worker.fetch(new Request(origin + req.url, {
+      method: req.method,
+      headers: req.headers,
+      body: chunks.length ? Buffer.concat(chunks) : undefined
+    }));
+    res.writeHead(response.status, Object.fromEntries(response.headers));
+    res.end(Buffer.from(await response.arrayBuffer()));
+  } catch (err) {
+    // A thrown handler must fail this one request, not leave the browser waiting on it.
+    res.writeHead(500, { 'content-type': 'text/plain; charset=utf-8' });
+    res.end(`handler error: ${err?.message || err}`);
+  }
 });
 server.listen(0, '127.0.0.1');
 await once(server, 'listening');
 const base = `http://127.0.0.1:${server.address().port}`;
 
 const problems = [];
-const browser = await chromium.launch();
+let browser = null;
 try {
+  try {
+    browser = await chromium.launch();
+  } catch (err) {
+    console.error(`Chromium could not start: ${err.message}\nInstall it with: npx playwright install chromium`);
+    server.close();
+    process.exit(1);
+  }
   const page = await browser.newPage();
   page.on('pageerror', (err) => problems.push(`pageerror: ${err.message}`));
   // Chromium reports CSP violations as console errors.
@@ -83,7 +96,7 @@ try {
     assert.equal(await page.innerText('#currentLang'), 'ENGLISH', stored);
   }
 } finally {
-  await browser.close();
+  await browser?.close();
   server.close();
 }
 assert.deepEqual(problems, [], `page errors or CSP violations:\n${problems.join('\n')}`);

@@ -1,6 +1,6 @@
 {
   "name": "doh-endpoints-cloudflare-worker",
-  "version": "0.4.47",
+  "version": "0.4.49",
   "private": true,
   "license": "MIT",
   "type": "module",

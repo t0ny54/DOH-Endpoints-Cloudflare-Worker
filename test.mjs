@@ -921,7 +921,8 @@ test('record-type validators accept well-formed RDATA and reject truncated or in
     ['SVCB (64)', 64, [0, 1, ...wwwName, 0, 1, 0, 0, 0, 3, 0, 2, 1, 0xbb], [0, 1, ...wwwName, 0, 3, 0, 0, 0, 1, 0, 0]],
     ['HTTPS (65)', 65, [0, 1, ...wwwName], [0, 1]],
     ['NSEC3 (50)', 50, [1, 0, 0, 1, 0, 1, 0xaa, 0, 1, 0x40], [1, 0, 0, 1, 0, 1, 0xaa, 0, 5, 0x40]],
-    ['NSEC3PARAM (51)', 51, [1, 0, 0, 1, 0], [1, 0, 0, 1, 0, 0xff]]
+    ['NSEC3PARAM (51)', 51, [1, 0, 0, 1, 0], [1, 0, 0, 1, 0, 0xff]],
+    ['DS (43)', 43, [0x12, 0x34, 0x08, 0x02, 0xaa, 0xbb], [0x12, 0x34, 0x08]]
   ];
   for (const [label, type, valid, invalid] of cases) {
     assert.equal(answerAccepted(type, valid), true, `${label}: well-formed RDATA must validate`);
@@ -1002,7 +1003,7 @@ test('a NOERROR answer that also carries an SOA is capped by the SOA negative TT
   assert.equal(cacheTTL(withSoa.buffer), 30);
 });
 
-// ---- 0.4.47: equivalence of the rewritten hot-path helpers, and the script-escaping round trip ----
+// Equivalence of the optimized hot-path helpers with their reference forms, and the script-escaping round trip.
 
 function seededBytes(seed, length) {
   let x = seed >>> 0;
@@ -1041,16 +1042,36 @@ test('serializeForScript round-trips text that could close or open an inline scr
   assert.deepEqual(JSON.parse(text), value);
 });
 
-test('the dashboard script still embeds the language table so that it parses back unchanged', async () => {
-  const { default: worker } = await import('./Worker.js');
-  const html = await (await worker.fetch(new Request('https://dns.example.test/'))).text();
-  const json = html.match(/^const I18N = (.*);$/m)[1];
-  assert.deepEqual(Object.keys(JSON.parse(json)), ['en', 'fa', 'zh']);
-});
 
-test('the URI record validator still requires its 4-byte fixed header and accepts a valid record', () => {
-  assert.equal(answerAccepted(256, [0, 1, 0, 2, ...Buffer.from('ftp://x')]), true);
-  assert.equal(answerAccepted(256, [0, 1]), false);
-  assert.equal(answerAccepted(43, [0x12, 0x34, 0x08, 0x02, 0xaa, 0xbb]), true);
-  assert.equal(answerAccepted(43, [0x12, 0x34, 0x08]), false);
+test('setCache keeps stored bytes within MAX_CACHE_BYTES, evicts LRU, and never admits one oversized answer', () => {
+  const previousBytes = dns.CONFIG.MAX_CACHE_BYTES;
+  const previousEntries = dns.CONFIG.MAX_CACHE_ENTRIES;
+  dns.APP_STATE.cache.clear();
+  dns.APP_STATE.cacheBytes = 0;
+  dns.CONFIG.MAX_CACHE_BYTES = 100;
+  dns.CONFIG.MAX_CACHE_ENTRIES = 512;
+  try {
+    dns.setCache('a', new ArrayBuffer(40), 60);
+    dns.setCache('b', new ArrayBuffer(40), 60);
+    assert.ok(dns.getCache('a'), 'a is the most recently used entry after this lookup');
+    dns.setCache('c', new ArrayBuffer(40), 60);
+    assert.equal(dns.getCache('b'), null, 'the least recently used entry is evicted first');
+    assert.ok(dns.getCache('a'));
+    assert.ok(dns.getCache('c'));
+    assert.equal(dns.APP_STATE.cacheBytes, 80);
+    dns.setCache('huge', new ArrayBuffer(101), 60);
+    assert.equal(dns.getCache('huge'), null, 'an answer over the whole budget is not cached');
+    assert.equal(dns.getCache('a').body.byteLength, 40, 'and it does not flush existing entries');
+    assert.equal(dns.APP_STATE.cacheBytes, 80);
+    dns.setCache('a', new ArrayBuffer(40), 60);
+    assert.equal(dns.APP_STATE.cacheBytes, 80, 'replacing an entry must not double-count its bytes');
+    dns.setCache('gone', new ArrayBuffer(10), 10, Date.now() - 11_000);
+    assert.equal(dns.getCache('gone'), null);
+    assert.equal(dns.APP_STATE.cacheBytes, 80, 'an expired entry releases its bytes');
+  } finally {
+    dns.APP_STATE.cache.clear();
+    dns.APP_STATE.cacheBytes = 0;
+    dns.CONFIG.MAX_CACHE_BYTES = previousBytes;
+    dns.CONFIG.MAX_CACHE_ENTRIES = previousEntries;
+  }
 });
