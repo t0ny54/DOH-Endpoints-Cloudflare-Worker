@@ -1,29 +1,26 @@
 # Changelog
 
-## 0.4.49
+## 0.4.52
 
 ### Fixed
 
-- **L1 memory was bounded by entry count, not by bytes.** The cache held up to 512 entries and each could be an upstream answer of up to 65,535 bytes, so one isolate could hold about 32 MiB of response data. Measured with 512 maximum-size answers: 33,553,920 bytes before this release, 8,388,480 bytes after. The L1 cache now also has an 8 MiB byte budget (`MAX_CACHE_BYTES`), evicts least-recently-used entries until both limits hold, and never admits a single answer larger than the whole budget. Typical DNS answers are far smaller than the budget, so the entry limit still governs ordinary traffic.
+- **A stalled Cache API lookup could hold a request indefinitely.** The L2 read (`caches.default.match()` and the body read) had no time limit. A lookup that threw already fell through to upstream resolution, but one that never settled blocked the cold request until the platform stopped it, contrary to the documented fall-through behavior. Each L2 read is now bounded by `CONFIG.EDGE_CACHE_LOOKUP_TIMEOUT_MS` (250 ms). A lookup that exceeds it is abandoned and the query resolves upstream. Reproduced before the fix (request still pending after 3 s) and verified after it (completes within the bound, `x-cache: MISS`, all three upstreams queried). A regression test covers it in `integration.mjs`.
 
 ### Changed
 
-- **Packets shorter than the DNS header are refused first.** A message under 12 bytes is rejected with `400 DNS message too short` before key derivation, the L1 lookup and the in-flight lookup. The response is the same as before; the rejection now happens earlier and costs less.
-- **`/health` reports byte usage.** It adds `cacheBytes` at the top level and `localMaxEntries` / `localMaxBytes` under `cache`.
+- Removed a redundant second normalization of the cache age in `patchDNSResponseForAge()`. Its callers already pass a whole, non-negative age, so the clamp was dead code.
+- `handleDNS()` now uses the transaction ID it already reads from the wire (`id`) for upstream racing, the L2 lookup and the response, instead of also reading `parsed.id`. The two values are always equal, so behavior is unchanged.
 
-### Removed
+### Review
 
-- **Two one-line wrappers.** `httpError()` and `upstreamError()` only forwarded to `taggedError()`. Their call sites now call `taggedError()` directly with `{ status }` or `{ kind }`. Behaviour is unchanged.
-
-### Tests
-
-- Unit suite: 63 tests (was 62). New: the byte budget is respected, the least-recently-used entry is evicted first, an oversized answer is not admitted, replacing an entry does not double-count its bytes, and expiry releases bytes.
-- `integration.mjs`: a short POST is refused with `400` and triggers no upstream work; `/health` reports byte usage within its configured maximum.
+- Read every project file in full (`Worker.js`, `integration.mjs`, `test.mjs`, `dashboard-browser.mjs`, `wrangler-smoke.mjs`, `README.md`, `CHANGELOG.md`, `package.json`, `package-lock.json`, `wrangler.toml`, `.gitignore`).
+- Dead code: a scripted check found every top-level function, every `CONFIG` key, every dashboard CSS selector and every test-only export referenced. No unused code was removed beyond the redundancy above.
+- Conflicts: README statements on cache keying, TTL rules, rate-limit keys, RCODE handling, scoring and `/health` were checked against the code. The only mismatch was the L2 fall-through claim, fixed above.
+- Property probes (20,000 random base64url decodes against the reference decoder, 20,000 random IPv6 keys, 5,000 random cache-age patches) found no crashes or wrong results.
 
 ### Verified
 
-- Unit suite: 63 of 63 passing (Node 22.23.5).
-- Integration suite: passing.
-- Randomised check (not part of the repository): 200,000 mutated DNS responses were run through response validation and TTL aging. No exception was raised and every accepted packet kept its length after aging.
-- Version 0.4.49 is set in `Worker.js`, `package.json`, both fields of `package-lock.json`, and the README.
-- Not run: `npm run test:wrangler` (Wrangler is not installed and the network is disabled) and `npm run test:dashboard` (Playwright and a Chromium binary are not installed). The dashboard markup and script were not changed in this release.
+- Unit suite: 66 of 66 passing (Node 22.23.5).
+- Integration suite: passing, including the new stalled-lookup regression test.
+- Version 0.4.52 is set in `Worker.js`, `package.json`, both fields of `package-lock.json`, and the README.
+- Not run: `npm run test:wrangler` (Wrangler is not installed and the network is disabled) and `npm run test:dashboard` (Playwright and Chromium are not installed).

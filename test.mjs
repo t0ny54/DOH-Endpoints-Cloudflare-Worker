@@ -391,7 +391,7 @@ test('strict validation checks whichever of expected ID or query is given, witho
 test('L1 cache expires entries and evicts the least-recently-used item', () => {
   const previousMax = dns.CONFIG.MAX_CACHE_ENTRIES;
   dns.CONFIG.MAX_CACHE_ENTRIES = 2;
-  dns.APP_STATE.cache.clear();
+  dns.clearLocalCache();
   dns.setCache('expired', new ArrayBuffer(0), 10, Date.now() - 11_000);
   assert.equal(dns.getCache('expired'), null);
   dns.setCache('a', new ArrayBuffer(1), 60);
@@ -401,7 +401,7 @@ test('L1 cache expires entries and evicts the least-recently-used item', () => {
   assert.ok(dns.getCache('a'));
   assert.equal(dns.getCache('b'), null);
   assert.ok(dns.getCache('c'));
-  dns.APP_STATE.cache.clear();
+  dns.clearLocalCache();
   dns.CONFIG.MAX_CACHE_ENTRIES = previousMax;
 });
 test('HTTP errors and content-type failures are classified distinctly from DNS-invalid payloads', async () => {
@@ -538,13 +538,13 @@ test('NXDOMAIN vs NOERROR race timing respects the grace window', async () => {
   }
 });
 test('setCache honors an explicit expiry independent of storedAt (L2 -> L1 promotion)', () => {
-  dns.APP_STATE.cache.clear();
+  dns.clearLocalCache();
   const storedAt = Date.now() - 3_600_000;
   dns.setCache('promoted', new ArrayBuffer(1), 300, storedAt, Date.now() + 60_000);
   const hit = dns.getCache('promoted');
   assert.ok(hit, 'promoted entry must be served from L1');
   assert.equal(hit.storedAt, storedAt);
-  dns.APP_STATE.cache.clear();
+  dns.clearLocalCache();
 });
 test('skipDNSName returns the end offset of a mixed-case name, with or without a compression context', () => {
   const query = buildQuery(1, 'ExAmPle.COM');
@@ -1046,8 +1046,7 @@ test('serializeForScript round-trips text that could close or open an inline scr
 test('setCache keeps stored bytes within MAX_CACHE_BYTES, evicts LRU, and never admits one oversized answer', () => {
   const previousBytes = dns.CONFIG.MAX_CACHE_BYTES;
   const previousEntries = dns.CONFIG.MAX_CACHE_ENTRIES;
-  dns.APP_STATE.cache.clear();
-  dns.APP_STATE.cacheBytes = 0;
+  dns.clearLocalCache();
   dns.CONFIG.MAX_CACHE_BYTES = 100;
   dns.CONFIG.MAX_CACHE_ENTRIES = 512;
   try {
@@ -1069,9 +1068,41 @@ test('setCache keeps stored bytes within MAX_CACHE_BYTES, evicts LRU, and never 
     assert.equal(dns.getCache('gone'), null);
     assert.equal(dns.APP_STATE.cacheBytes, 80, 'an expired entry releases its bytes');
   } finally {
-    dns.APP_STATE.cache.clear();
+    dns.clearLocalCache();
     dns.APP_STATE.cacheBytes = 0;
     dns.CONFIG.MAX_CACHE_BYTES = previousBytes;
     dns.CONFIG.MAX_CACHE_ENTRIES = previousEntries;
+  }
+});
+
+// Regression tests for the 0.4.50 changes: the counter stays in step with the cache, and the faster
+// base64url decoder returns exactly the bytes the reference decoder returns.
+
+test('clearLocalCache empties the L1 cache and resets its byte counter together', () => {
+  dns.clearLocalCache();
+  dns.setCache('one', new ArrayBuffer(300), 60);
+  dns.setCache('two', new ArrayBuffer(200), 60);
+  assert.equal(dns.APP_STATE.cacheBytes, 500);
+  dns.clearLocalCache();
+  assert.equal(dns.APP_STATE.cache.size, 0);
+  assert.equal(dns.APP_STATE.cacheBytes, 0, 'clearing must release the byte budget too');
+});
+
+test('decodeBase64Url returns the same bytes as the reference decoder for every length up to 4096 bytes', () => {
+  for (let length = 1; length <= 4096; length++) {
+    const bytes = seededBytes(length * 31 + 5, length);
+    const encoded = Buffer.from(bytes).toString('base64url');
+    const decoded = dns.decodeBase64Url(encoded);
+    assert.equal(decoded.length, length, `length ${length}`);
+    assert.deepEqual(decoded, bytes, `length ${length}`);
+  }
+});
+
+test('decodeBase64Url rejects padding, impossible lengths and foreign characters with 400', () => {
+  for (const bad of ['A', 'AB=', 'AAAA=', 'AB+/', 'A B', 'AAA*', 'A===']) {
+    let caught = null;
+    try { dns.decodeBase64Url(bad); } catch (err) { caught = err; }
+    assert.ok(caught, `${JSON.stringify(bad)} must be rejected`);
+    assert.equal(caught.status, 400, `${JSON.stringify(bad)} must carry status 400`);
   }
 });

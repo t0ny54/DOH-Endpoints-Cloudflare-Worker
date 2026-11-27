@@ -140,7 +140,7 @@ r=await worker.fetch(req('/dns-query?dns=%%%',{method:'GET',headers:{'CF-Connect
 // GET size boundary: the longest accepted payload is 4,096 bytes (5,462 characters); one byte more is rejected.
 {
   // Run the accepted case against a healthy upstream so it proves a full resolve, not just the absence of 413/400.
-  mode='ok'; upstreamCalls=0; dns.APP_STATE.cache.clear(); cacheStore.clear();
+  mode='ok'; upstreamCalls=0; dns.clearLocalCache(); cacheStore.clear();
   const maxB64 = Buffer.from(paddedQuery(0x7790, 'boundary.example', 4096)).toString('base64url');
   assert.equal(maxB64.length, 5462);
   r = await worker.fetch(req('/dns-query?dns='+maxB64,{method:'GET',headers:{'CF-Connecting-IP':'max-get'}}), rateOK);
@@ -188,7 +188,7 @@ r=await worker.fetch(req('/dns-query',{method:'POST',headers:{'CF-Connecting-IP'
 assert.equal(r.status,502); assert.equal(r.headers.get('x-upstreams'),'3');
 assert.ok(dns.APP_STATE.inflight.size === 0);
 dns.CONFIG.UPSTREAM_TIMEOUT_MS=previousTimeout;
-mode='ok'; dns.APP_STATE.cache.clear(); cacheStore.clear(); upstreamCalls=0;
+mode='ok'; dns.clearLocalCache(); cacheStore.clear(); upstreamCalls=0;
 const expiredQuery=query(0x7781,'expired-l2.example');
 const expiredKey=await edgeKey(expiredQuery);
 const expiredBody = answerFor(expiredQuery,'8.8.8.8',60);
@@ -211,7 +211,7 @@ globalThis.caches={default:{
   async match(){throw new Error('Cache match failed');},
   async put(){throw new Error('Cache put failed');}
 }};
-dns.APP_STATE.cache.clear(); upstreamCalls=0; mode='ok';
+dns.clearLocalCache(); upstreamCalls=0; mode='ok';
 const cacheFailQ=query(0x7782,'cache-failure.example');
 const cacheFailCtx={jobs:[],waitUntil(p){this.jobs.push(p)}};
 r=await worker.fetch(req('/dns-query',{method:'POST',headers:{'CF-Connecting-IP':'cache-failure','content-type':'application/dns-message'},body:cacheFailQ}),rateOK,cacheFailCtx);
@@ -235,7 +235,7 @@ dns.CONFIG.RATE_LIMIT_MAX_REQUESTS=previousRateMax;
 dns.APP_STATE.throttle.clear();
 const previousInflightMax=dns.CONFIG.MAX_INFLIGHT_ENTRIES;
 dns.CONFIG.MAX_INFLIGHT_ENTRIES=1;
-dns.APP_STATE.cache.clear(); cacheStore.clear(); upstreamCalls=0; mode='slow';
+dns.clearLocalCache(); cacheStore.clear(); upstreamCalls=0; mode='slow';
 const inflightQ=query(0x7787,'inflight-full-a.example');
 const firstP=worker.fetch(req('/dns-query',{method:'POST',headers:{'CF-Connecting-IP':'inflight-a','content-type':'application/dns-message'},body:inflightQ}),rateOK);
 for(let waited=0;waited<2000 && dns.APP_STATE.inflight.size===0;waited+=5) await new Promise(resolve=>setTimeout(resolve,5));
@@ -246,7 +246,7 @@ const firstResult=await firstP;
 assert.equal(firstResult.status,200);
 assert.equal(dns.APP_STATE.inflight.size,0);
 dns.CONFIG.MAX_INFLIGHT_ENTRIES=previousInflightMax;
-dns.APP_STATE.cache.clear(); cacheStore.clear(); upstreamCalls=0; mode='servfail';
+dns.clearLocalCache(); cacheStore.clear(); upstreamCalls=0; mode='servfail';
 const degradedQ=query(0x7789,'degraded.example');
 for (const run of [1,2]) {
   const degradedCtx={jobs:[],waitUntil(p){this.jobs.push(p)}};
@@ -264,7 +264,7 @@ for (const run of [1,2]) {
 assert.equal(dns.APP_STATE.cache.size,0);
 assert.equal(cacheStore.size,0);
 assert.equal(dns.APP_STATE.inflight.size,0);
-mode='ok'; dns.APP_STATE.cache.clear(); cacheStore.clear(); upstreamCalls=0;
+mode='ok'; dns.clearLocalCache(); cacheStore.clear(); upstreamCalls=0;
 const chunkedBody=new ReadableStream({start(controller){controller.enqueue(new Uint8Array(3000));controller.enqueue(new Uint8Array(3000));controller.close();}});
 r=await worker.fetch(req('/dns-query',{method:'POST',headers:{'CF-Connecting-IP':'client-chunked','content-type':'application/dns-message'},body:chunkedBody,duplex:'half'}),rateOK);
 assert.equal(r.status,413);
@@ -282,7 +282,7 @@ cacheStore.set(`https://dns.example.test/__doh-cache/v1/${malformedL2Key}`, new 
 r=await worker.fetch(req('/dns-query',{method:'POST',headers:{'CF-Connecting-IP':'malformed-l2','content-type':'application/dns-message'},body:malformedL2Q}),rateOK);
 assert.equal(r.status,200); assert.equal(r.headers.get('x-cache'),'MISS'); assert.equal(upstreamCalls,3);
 // Valid-looking L2 metadata must not make a response for another question cacheable.
-dns.APP_STATE.cache.clear(); cacheStore.clear(); upstreamCalls=0; mode='ok';
+dns.clearLocalCache(); cacheStore.clear(); upstreamCalls=0; mode='ok';
 const expectedL2Q=query(0x778d,'expected-l2.example');
 const wrongQuestion= query(0,'wrong-question.example');
 const wrongQuestionBody=answerFor(wrongQuestion,'8.8.4.4',60);
@@ -300,7 +300,7 @@ r=await worker.fetch(req('/dns-query',{method:'POST',headers:{'CF-Connecting-IP'
 assert.equal(r.status,200); assert.equal(r.headers.get('x-cache'),'MISS'); assert.equal(upstreamCalls,3);
 out=new Uint8Array(await r.arrayBuffer());
 assert.equal(dns.validateDNSResponse(out.buffer,(out[0]<<8)|out[1],expectedL2Q).ok,true);
-dns.APP_STATE.cache.clear(); cacheStore.clear(); upstreamCalls=0; mode='slow';
+dns.clearLocalCache(); cacheStore.clear(); upstreamCalls=0; mode='slow';
 const sharedQ=query(0x778b,'coalesced-headers.example');
 const sharedCalls=[0,1].map((n)=>worker.fetch(req('/dns-query',{method:'POST',headers:{'CF-Connecting-IP':'shared'+n,'content-type':'application/dns-message'},body:sharedQ}),rateOK));
 const sharedResponses=await Promise.all(sharedCalls);
@@ -310,7 +310,7 @@ assert.equal(coalesced.headers.get('x-upstreams'),'0');
 assert.equal(coalesced.headers.get('x-edge-cache'),'SKIP');
 assert.ok(coalesced.headers.get('x-winner'));
 assert.match(coalesced.headers.get('x-winner-lat'),/^\d+ms$/);
-mode='ok'; dns.APP_STATE.cache.clear(); cacheStore.clear();
+mode='ok'; dns.clearLocalCache(); cacheStore.clear();
 dns.APP_STATE.cache.set('sweep-expired',{body:new ArrayBuffer(0),storedAt:0,expiresAt:1});
 dns.APP_STATE.cache.set('sweep-live',{body:new ArrayBuffer(0),storedAt:Date.now(),expiresAt:Date.now()+60_000});
 dns.APP_STATE.throttle.set('sweep-expired-ip',{count:1,resetAt:1});
@@ -319,7 +319,7 @@ dns.APP_STATE.lastSweepAt=0;
 await worker.fetch(req('/health'));
 assert.equal(dns.APP_STATE.cache.has('sweep-expired'),false); assert.equal(dns.APP_STATE.cache.has('sweep-live'),true);
 assert.equal(dns.APP_STATE.throttle.has('sweep-expired-ip'),false); assert.equal(dns.APP_STATE.throttle.has('sweep-live-ip'),true);
-dns.APP_STATE.cache.clear(); dns.APP_STATE.throttle.clear();
+dns.clearLocalCache(); dns.APP_STATE.throttle.clear();
 r=await worker.fetch(req('/index.html')); assert.equal(r.status,200);
 const uiHtml = await r.text();
 assert.match(uiHtml,/document\.documentElement\.lang = c;/);
@@ -356,7 +356,7 @@ dns.APP_STATE.throttle.clear();
 r=await worker.fetch(req('/dns-query',{method:'POST',headers:{'CF-Connecting-IP':'retry','content-type':'application/dns-message'},body:q1}),{DNS_RATE_LIMITER:{limit:async()=>({success:false})}});
 assert.equal(r.status,429); assert.equal(r.headers.get('retry-after'),String(dns.CONFIG.RATE_LIMIT_WINDOW_MS/1000));
 // L1 filled by another request while this one waits for the (asynchronous) L2 lookup: no upstream work.
-dns.APP_STATE.cache.clear(); cacheStore.clear(); upstreamCalls=0; mode='ok';
+dns.clearLocalCache(); cacheStore.clear(); upstreamCalls=0; mode='ok';
 const lateQ=query(0x778c,'late-l1.example');
 const lateKey=localKey(lateQ);
 const lateBody=answerFor(lateQ,'5.6.7.8',60); lateBody[0]=0; lateBody[1]=0;
@@ -369,7 +369,7 @@ r=await worker.fetch(req('/dns-query',{method:'POST',headers:{'CF-Connecting-IP'
 globalThis.caches=realCaches;
 assert.equal(r.status,200); assert.equal(r.headers.get('x-cache'),'L1-HIT'); assert.equal(upstreamCalls,0);
 out=new Uint8Array(await r.arrayBuffer()); assert.equal((out[0]<<8)|out[1],0x778c);
-dns.APP_STATE.cache.clear();
+dns.clearLocalCache();
 // A failing client body stream must not leak its internal error text.
 const brokenBody=new ReadableStream({start(controller){controller.error(new Error('internal-secret-boom'));}});
 r=await worker.fetch(req('/dns-query',{method:'POST',headers:{'CF-Connecting-IP':'broken-body','content-type':'application/dns-message'},body:brokenBody,duplex:'half'}),rateOK);
@@ -388,13 +388,13 @@ assert.equal((await v6(1)).status,200); assert.equal((await v6(2)).status,200); 
 assert.equal(dns.APP_STATE.throttle.size,1);
 r=await worker.fetch(req('/dns-query',{method:'POST',headers:{'CF-Connecting-IP':'2001:db8:9:a::1','content-type':'application/dns-message'},body:q1}));
 assert.equal(r.status,200);
-dns.CONFIG.RATE_LIMIT_MAX_REQUESTS=prevMax; dns.APP_STATE.throttle.clear(); dns.APP_STATE.cache.clear();
+dns.CONFIG.RATE_LIMIT_MAX_REQUESTS=prevMax; dns.APP_STATE.throttle.clear(); dns.clearLocalCache();
 // ---- Paths the earlier scenarios did not reach ----
 // A base64url value of an impossible length is a client error, not a crash.
 r = await worker.fetch(req('/dns-query?dns=A',{method:'GET',headers:{'CF-Connecting-IP':'b64-length'}}), rateOK);
 assert.equal(r.status,400); assert.equal(await r.text(),'Invalid base64url DNS query');
 // A POST split into several chunks (still under the limit) is reassembled before parsing.
-mode='ok'; upstreamCalls=0; dns.APP_STATE.cache.clear(); cacheStore.clear();
+mode='ok'; upstreamCalls=0; dns.clearLocalCache(); cacheStore.clear();
 const splitQ=query(0x7790,'split-body.example');
 const splitBody=new ReadableStream({start(controller){ for (const part of [splitQ.slice(0,5),splitQ.slice(5,20),splitQ.slice(20)]) controller.enqueue(part); controller.close(); }});
 r=await worker.fetch(req('/dns-query',{method:'POST',headers:{'CF-Connecting-IP':'split-body','content-type':'application/dns-message'},body:splitBody,duplex:'half'}),rateOK);
@@ -404,7 +404,7 @@ assert.equal(r.status,200); out=new Uint8Array(await r.arrayBuffer()); assert.eq
   const integrationUpstream=globalThis.fetch;
   let slowFailures=0;
   globalThis.fetch=async()=>{ slowFailures++; await new Promise(resolve=>setTimeout(resolve,30)); throw new Error('down'); };
-  dns.APP_STATE.cache.clear(); cacheStore.clear();
+  dns.clearLocalCache(); cacheStore.clear();
   const joinQ=query(0x7791,'joiner-failure.example');
   const joinPost=(ip)=>worker.fetch(req('/dns-query',{method:'POST',headers:{'CF-Connecting-IP':ip,'content-type':'application/dns-message'},body:joinQ}),rateOK);
   const [j1,j2]=await Promise.all([joinPost('join-a'),joinPost('join-b')]);
@@ -418,7 +418,7 @@ for (const [label, entry, ttlHeaders] of [
   ['oversized', new Uint8Array(70_000), { 'content-type':'application/dns-message' }],
   ['mistyped', null, { 'content-type':'text/html' }]
 ]) {
-  dns.APP_STATE.cache.clear(); cacheStore.clear(); mode='ok'; upstreamCalls=0;
+  dns.clearLocalCache(); cacheStore.clear(); mode='ok'; upstreamCalls=0;
   const badQ=query(0x7792,`${label}-l2.example`);
   const badKey=await edgeKey(badQ);
   const badBody=entry ?? answerFor(badQ,'8.8.8.8',60);
@@ -430,16 +430,16 @@ for (const [label, entry, ttlHeaders] of [
   assert.equal(r.status,200, label); assert.equal(r.headers.get('x-cache'),'MISS', label); assert.equal(upstreamCalls,3, label);
 }
 // L2 writes are attempted even when the handler runs without an execution context.
-dns.APP_STATE.cache.clear(); cacheStore.clear(); mode='ok'; upstreamCalls=0;
+dns.clearLocalCache(); cacheStore.clear(); mode='ok'; upstreamCalls=0;
 r=await worker.fetch(req('/dns-query',{method:'POST',headers:{'CF-Connecting-IP':'no-ctx','content-type':'application/dns-message'},body:query(0x7794,'no-context-write.example')}),rateOK);
 assert.equal(r.status,200);
 for(let waited=0; cacheStore.size===0 && waited<200; waited+=5) await new Promise(resolve=>setTimeout(resolve,5));
 assert.equal(cacheStore.size,1);
-dns.APP_STATE.cache.clear(); cacheStore.clear();
+dns.clearLocalCache(); cacheStore.clear();
 // The L1 lookup runs before the full parse. A response packet or a truncated copy of a cached
 // question must still be rejected, while the same question with a different ID and letter case hits.
 {
-  dns.APP_STATE.cache.clear(); cacheStore.clear(); mode='ok'; upstreamCalls=0;
+  dns.clearLocalCache(); cacheStore.clear(); mode='ok'; upstreamCalls=0;
   const cachedQ=query(0x7795,'fast-path.example');
   const warmCtx={jobs:[],waitUntil(p){this.jobs.push(p);}};
   r=await worker.fetch(req('/dns-query',{method:'POST',headers:{'CF-Connecting-IP':'fast-path-warm','content-type':'application/dns-message'},body:cachedQ}),rateOK,warmCtx);
@@ -454,7 +454,26 @@ dns.APP_STATE.cache.clear(); cacheStore.clear();
   r=await worker.fetch(req('/dns-query',{method:'POST',headers:{'CF-Connecting-IP':'fast-path-case','content-type':'application/dns-message'},body:query(0x7796,'FAST-PATH.example')}),rateOK);
   assert.equal(r.status,200); assert.equal(r.headers.get('x-cache'),'L1-HIT'); assert.equal(upstreamCalls,callsBefore);
   out=new Uint8Array(await r.arrayBuffer()); assert.equal((out[0]<<8)|out[1],0x7796);
-  dns.APP_STATE.cache.clear(); cacheStore.clear();
+  dns.clearLocalCache(); cacheStore.clear();
+}
+// A Cache API lookup that never settles is abandoned after EDGE_CACHE_LOOKUP_TIMEOUT_MS, and the query resolves upstream.
+{
+  dns.clearLocalCache(); cacheStore.clear(); mode='ok'; upstreamCalls=0;
+  const previousLookupTimeout=dns.CONFIG.EDGE_CACHE_LOOKUP_TIMEOUT_MS;
+  const realCachesForHang=globalThis.caches;
+  dns.CONFIG.EDGE_CACHE_LOOKUP_TIMEOUT_MS=20;
+  globalThis.caches={default:{ match(){ return new Promise(()=>{}); }, async put(){} }};
+  try {
+    const started=Date.now();
+    r=await worker.fetch(req('/dns-query',{method:'POST',headers:{'CF-Connecting-IP':'hung-l2','content-type':'application/dns-message'},body:query(0x779a,'hung-l2.example')}),rateOK);
+    assert.ok(Date.now()-started<1000,'a stalled L2 lookup must not hold the request');
+    assert.equal(r.status,200); assert.equal(r.headers.get('x-cache'),'MISS'); assert.equal(upstreamCalls,3);
+    out=new Uint8Array(await r.arrayBuffer()); assert.equal((out[0]<<8)|out[1],0x779a);
+  } finally {
+    globalThis.caches=realCachesForHang;
+    dns.CONFIG.EDGE_CACHE_LOOKUP_TIMEOUT_MS=previousLookupTimeout;
+  }
+  dns.clearLocalCache(); cacheStore.clear();
 }
 // ---- Dashboard: self-contained, hash-pinned CSP, and every element the script reaches exists ----
 {
